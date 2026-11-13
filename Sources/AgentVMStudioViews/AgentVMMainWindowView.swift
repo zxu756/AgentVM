@@ -7,6 +7,7 @@ import SwiftUI
 
 public struct AgentVMMainWindowView: View {
     @ObservedObject public var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     public init(viewModel: AgentVMStudioViewModel) {
         self.viewModel = viewModel
@@ -129,7 +130,7 @@ public struct AgentVMMainWindowView: View {
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
 
-                Text(viewModel.manifest.title)
+                Text(viewModel.localizedWorkspaceTitle)
                     .font(RackTheme.labelFont)
                     .foregroundStyle(RackTheme.inkSecondary)
                     .lineLimit(1)
@@ -137,7 +138,7 @@ public struct AgentVMMainWindowView: View {
 
                 if let vm = viewModel.selectedVM {
                     RackStatusPill(
-                        label: "\(vm.spec.name) · \(vm.telemetry.state.badgeLabel)",
+                        label: "\(vm.spec.name) · \(vm.telemetry.state.localizedBadge)",
                         color: RackTheme.signalColor(for: vm.telemetry.state),
                         monospaced: true
                     )
@@ -151,20 +152,20 @@ public struct AgentVMMainWindowView: View {
                 Button {
                     viewModel.performUndo()
                 } label: {
-                    Label("Undo", systemImage: "arrow.uturn.backward")
+                    Label(localizer.L("Undo", "撤销"), systemImage: "arrow.uturn.backward")
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                 .disabled(!viewModel.canUndo)
-                .help("Undo last reversible topology or firewall mutation (⌘Z)")
+                .help(localizer.L("Undo last reversible topology or firewall mutation (⌘Z)", "撤销上一次可逆拓扑或防火墙变更 (⌘Z)"))
 
                 Button {
                     viewModel.performRedo()
                 } label: {
-                    Label("Redo", systemImage: "arrow.uturn.forward")
+                    Label(localizer.L("Redo", "重做"), systemImage: "arrow.uturn.forward")
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                 .disabled(!viewModel.canRedo)
-                .help("Redo reverted workspace mutation (⇧⌘Z)")
+                .help(localizer.L("Redo reverted workspace mutation (⇧⌘Z)", "重做已撤销的工作区变更 (⇧⌘Z)"))
             }
 
             toolbarDivider
@@ -179,7 +180,7 @@ public struct AgentVMMainWindowView: View {
                         .foregroundStyle(viewModel.docking.showLeftNavigator ? RackTheme.amberAccent : RackTheme.inkSecondary)
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
-                .help("Toggle Left Sandbox Fleet Navigator")
+                .help(localizer.L("Toggle Left Sandbox Fleet Navigator", "显示或隐藏左侧沙盒集群导航栏"))
 
                 Button {
                     if viewModel.docking.splitMode == .singlePane {
@@ -189,12 +190,14 @@ public struct AgentVMMainWindowView: View {
                     }
                 } label: {
                     Label(
-                        viewModel.docking.splitMode == .singlePane ? "Split" : "Single",
+                        viewModel.docking.splitMode == .singlePane
+                            ? localizer.L("Split", "分屏")
+                            : localizer.L("Single", "单栏"),
                         systemImage: viewModel.docking.splitMode == .singlePane ? "rectangle.split.2x1" : "rectangle"
                     )
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
-                .help("Toggle Side-by-Side Split Workbench (⌘\\)")
+                .help(localizer.L("Toggle Side-by-Side Split Workbench (⌘\\)", "切换双栏分屏工作台 (⌘\\)"))
 
                 Button {
                     viewModel.docking.showBottomDrawer.toggle()
@@ -204,7 +207,7 @@ public struct AgentVMMainWindowView: View {
                         .foregroundStyle(viewModel.docking.showBottomDrawer ? RackTheme.amberAccent : RackTheme.inkSecondary)
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
-                .help("Toggle Bottom Diagnostics & TTY Drawer")
+                .help(localizer.L("Toggle Bottom Diagnostics & TTY Drawer", "显示或隐藏底部诊断与终端抽屉"))
 
                 Button {
                     viewModel.docking.showRightInspector.toggle()
@@ -214,7 +217,7 @@ public struct AgentVMMainWindowView: View {
                         .foregroundStyle(viewModel.docking.showRightInspector ? RackTheme.amberAccent : RackTheme.inkSecondary)
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
-                .help("Toggle Right Blade Hardware Inspector")
+                .help(localizer.L("Toggle Right Blade Hardware Inspector", "显示或隐藏右侧刀片硬件检查器"))
             }
 
             toolbarDivider
@@ -227,14 +230,21 @@ public struct AgentVMMainWindowView: View {
                     Label(".pcapng", systemImage: "waveform.path.ecg")
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
+                .help(localizer.L("Export Captured Traffic as Wireshark .pcapng (⇧⌘E)", "导出 Wireshark .pcapng 抓包归档 (⇧⌘E)"))
 
                 Button {
                     viewModel.exportHTMLSecurityReportDefault()
                 } label: {
-                    Label("HTML Audit", systemImage: "doc.richtext")
+                    Label(localizer.L("HTML Audit", "HTML 审计"), systemImage: "doc.richtext")
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
+                .help(localizer.L("Export Standalone Bilingual HTML Security Dossier", "导出独立双语 HTML 安全审计报告"))
             }
+
+            toolbarDivider
+
+            // Live Bilingual Interface Toggle Pill (`中文 | EN`)
+            RackLanguageTogglePill(localizer: localizer)
 
             toolbarDivider
 
@@ -246,11 +256,12 @@ public struct AgentVMMainWindowView: View {
                     Image(systemName: "command")
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(RackTheme.amberAccent)
-                    Text("Palette")
+                    Text(localizer.L("Palette", "命令"))
                     RackKeyCapBadge("⌘K")
                 }
             }
             .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
+            .help(localizer.L("Open Instant Fuzzy Command Palette (⌘K)", "打开模糊检索命令面板 (⌘K)"))
         }
         .padding(.horizontal, 12)
         .frame(height: 42)
@@ -407,39 +418,40 @@ public struct AgentVMMainWindowView: View {
 
 private struct FleetRackMatrixOverviewPane: View {
     @ObservedObject var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 RackMetricTile(
-                    label: "Active Blades",
+                    label: localizer.L("Active Blades", "活跃刀片"),
                     value: "\(viewModel.runningVMCount) / \(viewModel.vms.count)",
                     detail: "Apple Virtualization.framework",
                     accent: RackTheme.linkGreen
                 )
                 RackMetricTile(
-                    label: "Virtual Pool",
+                    label: localizer.L("Virtual Pool", "虚拟存储池"),
                     value: ByteMetricsFormatter.formatBytes(viewModel.totalVirtualPoolBytes),
-                    detail: "Dirty CoW \(ByteMetricsFormatter.formatBytes(viewModel.totalDirtyCoWBytes))",
+                    detail: localizer.L("Dirty CoW \(ByteMetricsFormatter.formatBytes(viewModel.totalDirtyCoWBytes))", "CoW 脏块 \(ByteMetricsFormatter.formatBytes(viewModel.totalDirtyCoWBytes))"),
                     accent: RackTheme.amberAccent
                 )
                 RackMetricTile(
-                    label: "L2 Wiretap",
-                    value: "\(viewModel.allPackets.count) pkts",
-                    detail: "\(viewModel.droppedPacketCount) blocked frames",
+                    label: localizer.L("L2 Wiretap", "二层抓包"),
+                    value: localizer.L("\(viewModel.allPackets.count) pkts", "\(viewModel.allPackets.count) 帧"),
+                    detail: localizer.L("\(viewModel.droppedPacketCount) blocked frames", "已拦截 \(viewModel.droppedPacketCount) 帧"),
                     accent: RackTheme.vsockBlue
                 )
             }
 
             RackPanelContainer(
-                title: "Fleet Rack Blade Matrix",
-                subtitle: "Live hypervisor blades, guest NICs, and APFS CoW deltas",
+                title: localizer.L("Fleet Rack Blade Matrix", "集群机架刀片矩阵"),
+                subtitle: localizer.L("Live hypervisor blades, guest NICs, and APFS CoW deltas", "实时虚拟机刀片、客户机网卡与 APFS CoW 增量状态"),
                 symbolName: "server.rack",
                 headerTrailing: {
                     Button {
                         viewModel.createNewSandboxBlade()
                     } label: {
-                        Label("Provision Blade", systemImage: "plus")
+                        Label(localizer.L("Provision Blade", "新建刀片"), systemImage: "plus")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
                 },
@@ -449,7 +461,7 @@ private struct FleetRackMatrixOverviewPane: View {
                             ForEach(viewModel.vms) { vm in
                                 HStack(spacing: 12) {
                                     RackStatusPill(
-                                        label: vm.telemetry.state.badgeLabel,
+                                        label: vm.telemetry.state.localizedBadge,
                                         color: RackTheme.signalColor(for: vm.telemetry.state),
                                         monospaced: true
                                     )
@@ -459,7 +471,7 @@ private struct FleetRackMatrixOverviewPane: View {
                                             .font(RackTheme.sectionHeaderFont)
                                             .foregroundStyle(RackTheme.inkPrimary)
                                             .lineLimit(1)
-                                        Text("@\(vm.spec.agentOwnerTag) · \(vm.spec.guestOS.displayName)")
+                                        Text("@\(vm.spec.agentOwnerTag) · \(vm.spec.guestOS.localizedDisplayName)")
                                             .font(RackTheme.captionFont)
                                             .foregroundStyle(RackTheme.inkSecondary)
                                             .lineLimit(1)
@@ -487,12 +499,12 @@ private struct FleetRackMatrixOverviewPane: View {
                                         .lineLimit(1)
                                         .fixedSize(horizontal: true, vertical: false)
 
-                                    Button("Fork CoW") {
+                                    Button(localizer.L("Fork CoW", "分叉 CoW")) {
                                         viewModel.forkCoWBranch(from: vm.id)
                                     }
                                     .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
 
-                                    Button(vm.telemetry.state == .running ? "Pause" : "Boot") {
+                                    Button(vm.telemetry.state == .running ? localizer.L("Pause", "暂停") : localizer.L("Boot", "启动")) {
                                         viewModel.toggleRunState(for: vm.id)
                                     }
                                     .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
@@ -523,19 +535,20 @@ private struct FleetRackMatrixOverviewPane: View {
 
 private struct TransactionalAuditLedgerPane: View {
     @ObservedObject var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     var body: some View {
         HStack(spacing: 12) {
             RackPanelContainer(
-                title: "SQLite Reversible Undo Journal",
-                subtitle: "\(viewModel.persistedJournal.count) recorded commands",
+                title: localizer.L("SQLite Reversible Undo Journal", "SQLite 可逆撤销事务账本"),
+                subtitle: localizer.L("\(viewModel.persistedJournal.count) recorded commands", "已记录 \(viewModel.persistedJournal.count) 条可逆命令"),
                 symbolName: "arrow.uturn.backward.circle.fill",
                 headerTrailing: {
                     HStack(spacing: 6) {
-                        Button("Undo") { viewModel.performUndo() }
+                        Button(localizer.L("Undo", "撤销")) { viewModel.performUndo() }
                             .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                             .disabled(!viewModel.canUndo)
-                        Button("Redo") { viewModel.performRedo() }
+                        Button(localizer.L("Redo", "重做")) { viewModel.performRedo() }
                             .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                             .disabled(!viewModel.canRedo)
                     }
@@ -544,7 +557,10 @@ private struct TransactionalAuditLedgerPane: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 6) {
                             if viewModel.persistedJournal.isEmpty {
-                                Text("No workspace mutations recorded yet. Fork a CoW branch, capture a snapshot, or toggle a firewall rule to append a reversible journal entry.")
+                                Text(localizer.L(
+                                    "No workspace mutations recorded yet. Fork a CoW branch, capture a snapshot, or toggle a firewall rule to append a reversible journal entry.",
+                                    "尚无工作区事务记录。分叉 CoW 分支、捕获快照或切换防火墙规则后将自动追加可逆账本条目。"
+                                ))
                                     .font(RackTheme.captionFont)
                                     .foregroundStyle(RackTheme.inkMuted)
                                     .padding(8)
@@ -559,7 +575,7 @@ private struct TransactionalAuditLedgerPane: View {
                                             .fixedSize(horizontal: true, vertical: false)
 
                                         RackStatusPill(
-                                            label: entry.state.rawValue.uppercased(),
+                                            label: entry.state == .applied ? localizer.L("APPLIED", "已应用") : localizer.L("UNDONE", "已撤销"),
                                             color: entry.state == .applied ? RackTheme.linkGreen : RackTheme.checkpointGold,
                                             monospaced: true
                                         )
@@ -591,8 +607,8 @@ private struct TransactionalAuditLedgerPane: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             RackPanelContainer(
-                title: "Diagnostic & Security Telemetry Feed",
-                subtitle: "\(viewModel.diagnostics.count) events",
+                title: localizer.L("Diagnostic & Security Telemetry Feed", "诊断与安全遥测事件流"),
+                subtitle: localizer.L("\(viewModel.diagnostics.count) events", "\(viewModel.diagnostics.count) 条事件"),
                 symbolName: "exclamationmark.shield.fill",
                 content: {
                     ScrollView {
@@ -600,7 +616,7 @@ private struct TransactionalAuditLedgerPane: View {
                             ForEach(viewModel.diagnostics) { diag in
                                 HStack(alignment: .top, spacing: 8) {
                                     RackStatusPill(
-                                        label: diag.severity.rawValue.uppercased(),
+                                        label: diag.severity.localizedBadge,
                                         color: RackTheme.severityColor(for: diag.severity),
                                         monospaced: true
                                     )
@@ -609,7 +625,7 @@ private struct TransactionalAuditLedgerPane: View {
                                             .font(RackTheme.monoSmallFont)
                                             .foregroundStyle(RackTheme.amberAccent)
                                             .lineLimit(1)
-                                        Text(diag.message)
+                                        Text(diag.localizedMessage)
                                             .font(RackTheme.captionFont)
                                             .foregroundStyle(RackTheme.inkPrimary)
                                     }
@@ -637,6 +653,7 @@ private struct TransactionalAuditLedgerPane: View {
 
 public struct AgentVMCommands: Commands {
     @ObservedObject public var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     public init(viewModel: AgentVMStudioViewModel) {
         self.viewModel = viewModel
@@ -644,28 +661,28 @@ public struct AgentVMCommands: Commands {
 
     public var body: some Commands {
         CommandGroup(replacing: .undoRedo) {
-            Button("Undo Workspace Mutation") {
+            Button(localizer.L("Undo Workspace Mutation", "撤销工作区变更")) {
                 viewModel.performUndo()
             }
             .keyboardShortcut("z", modifiers: [.command])
             .disabled(!viewModel.canUndo)
 
-            Button("Redo Workspace Mutation") {
+            Button(localizer.L("Redo Workspace Mutation", "重做工作区变更")) {
                 viewModel.performRedo()
             }
             .keyboardShortcut("z", modifiers: [.command, .shift])
             .disabled(!viewModel.canRedo)
         }
 
-        CommandMenu("Virtual Machine") {
-            Button("Provision New Sandbox Blade") {
+        CommandMenu(localizer.L("Virtual Machine", "虚拟机")) {
+            Button(localizer.L("Provision New Sandbox Blade", "新建沙盒刀片")) {
                 viewModel.createNewSandboxBlade()
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
 
             Divider()
 
-            Button("Boot / Resume Selected VM") {
+            Button(localizer.L("Boot / Resume Selected VM", "启动或恢复所选虚拟机")) {
                 if let id = viewModel.selectedVM?.id {
                     viewModel.bootVM(id)
                 }
@@ -673,7 +690,7 @@ public struct AgentVMCommands: Commands {
             .keyboardShortcut("r", modifiers: [.command])
             .disabled(viewModel.selectedVM == nil)
 
-            Button("Pause Selected VM") {
+            Button(localizer.L("Pause Selected VM", "暂停所选虚拟机")) {
                 if let id = viewModel.selectedVM?.id {
                     viewModel.pauseVM(id)
                 }
@@ -681,7 +698,7 @@ public struct AgentVMCommands: Commands {
             .keyboardShortcut("p", modifiers: [.command])
             .disabled(viewModel.selectedVM == nil)
 
-            Button("Halt Selected VM") {
+            Button(localizer.L("Halt Selected VM", "停止所选虚拟机")) {
                 if let id = viewModel.selectedVM?.id {
                     viewModel.haltVM(id)
                 }
@@ -689,18 +706,18 @@ public struct AgentVMCommands: Commands {
             .disabled(viewModel.selectedVM == nil)
         }
 
-        CommandMenu("Snapshots & CoW") {
-            Button("Fork Instant APFS CoW Branch") {
+        CommandMenu(localizer.L("Snapshots & CoW", "快照与 CoW")) {
+            Button(localizer.L("Fork Instant APFS CoW Branch", "即时分叉 APFS CoW 分支")) {
                 viewModel.forkCoWBranch()
             }
             .keyboardShortcut("b", modifiers: [.command])
 
-            Button("Capture Live RAM + CoW Checkpoint") {
+            Button(localizer.L("Capture Live RAM + CoW Checkpoint", "捕获实时内存 + CoW 快照")) {
                 viewModel.captureCheckpoint()
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
 
-            Button("Restore Selected Snapshot") {
+            Button(localizer.L("Restore Selected Snapshot", "恢复到所选快照")) {
                 if let snapID = viewModel.selectedSnapshot?.id {
                     viewModel.restoreSnapshot(snapID)
                 }
@@ -709,97 +726,102 @@ public struct AgentVMCommands: Commands {
 
             Divider()
 
-            Button("Punch APFS Sparse Zero Holes (F_PUNCHHOLE)") {
+            Button(localizer.L("Punch APFS Sparse Zero Holes (F_PUNCHHOLE)", "回收 APFS 零字节稀疏块 (F_PUNCHHOLE)")) {
                 viewModel.compactSelectedVMDiskZeroBlocks()
             }
 
-            Button("Rebuild NoCloud 'cidata' ISO-9660") {
+            Button(localizer.L("Rebuild NoCloud 'cidata' ISO-9660", "重构 NoCloud 'cidata' ISO-9660 镜像")) {
                 viewModel.rebuildCloudInitISOForSelectedVM()
             }
         }
 
-        CommandMenu("Network & DPI") {
-            Button("Apply Strict Coding-Agent Allowlist") {
+        CommandMenu(localizer.L("Network & DPI", "网络与 DPI")) {
+            Button(localizer.L("Apply Strict Coding-Agent Allowlist", "启用编程智能体严格白名单")) {
                 viewModel.applyFirewallPreset(.strictAgentAllowlistPreset())
             }
 
-            Button("Engage Total Air-Gap Mode") {
+            Button(localizer.L("Engage Total Air-Gap Mode", "启用全气隙隔离模式")) {
                 viewModel.applyFirewallPreset(.airgappedPreset())
             }
 
             Divider()
 
-            Button("Inject GitHub TLS 1.3 ClientHello Probe") {
+            Button(localizer.L("Inject GitHub TLS 1.3 ClientHello Probe", "注入 GitHub TLS 1.3 ClientHello 探测包")) {
                 viewModel.injectSyntheticProbePacket(.githubTLS)
             }
 
-            Button("Inject Cloud Metadata SSRF 169.254.169.254 Probe") {
+            Button(localizer.L("Inject Cloud Metadata SSRF 169.254.169.254 Probe", "注入云元数据 SSRF 169.254.169.254 探测包")) {
                 viewModel.injectSyntheticProbePacket(.cloudMetadataSSRF)
             }
 
             Divider()
 
-            Button("Export Captured Traffic as .pcapng") {
+            Button(localizer.L("Export Captured Traffic as .pcapng", "导出抓包流量为 .pcapng")) {
                 viewModel.exportPCAPNGDefault()
             }
             .keyboardShortcut("e", modifiers: [.command, .shift])
 
-            Button("Export Standalone HTML Security Report") {
+            Button(localizer.L("Export Standalone HTML Security Report", "导出独立 HTML 安全审计报告")) {
                 viewModel.exportHTMLSecurityReportDefault()
             }
         }
 
-        CommandMenu("Workbench") {
-            Button("Toggle Command Palette") {
+        CommandMenu(localizer.L("Workbench", "工作台")) {
+            Button(localizer.L("Toggle Command Palette", "打开或关闭命令面板")) {
                 viewModel.commandPalette.toggleInstant()
             }
             .keyboardShortcut("k", modifiers: [.command])
 
+            Button(localizer.L("切换语言 / Toggle Language (中文 | EN)", "切换语言 / Toggle Language (中文 | EN)")) {
+                viewModel.executeCommandPaletteAction("app.language.toggle")
+            }
+            .keyboardShortcut("l", modifiers: [.command, .shift])
+
             Divider()
 
-            Button("1 · Snapshot & CoW Lineage DAG") {
+            Button(localizer.L("1 · Snapshot & CoW Lineage DAG", "1 · 快照与 CoW 血缘拓扑")) {
                 viewModel.docking.openOrFocus(kind: .snapshotBranchDAG)
             }
             .keyboardShortcut("1", modifiers: [.command])
 
-            Button("2 · L2 Packet Wiretap & Dissector") {
+            Button(localizer.L("2 · L2 Packet Wiretap & Dissector", "2 · 二层抓包与协议解析")) {
                 viewModel.docking.openOrFocus(kind: .packetWiretap)
             }
             .keyboardShortcut("2", modifiers: [.command])
 
-            Button("3 · Vsock & VT100 Serial Console") {
+            Button(localizer.L("3 · Vsock & VT100 Serial Console", "3 · Vsock 与 VT100 终端")) {
                 viewModel.docking.openOrFocus(kind: .vt100SerialConsole)
             }
             .keyboardShortcut("3", modifiers: [.command])
 
-            Button("4 · Firewall Policy Studio") {
+            Button(localizer.L("4 · Firewall Policy Studio", "4 · 防火墙策略工坊")) {
                 viewModel.docking.openOrFocus(kind: .firewallPolicyStudio)
             }
             .keyboardShortcut("4", modifiers: [.command])
 
-            Button("5 · APFS CoW Extents & Cloud-Init ISO") {
+            Button(localizer.L("5 · APFS CoW Extents & Cloud-Init ISO", "5 · APFS 存储区间与 Cloud-Init")) {
                 viewModel.docking.openOrFocus(kind: .storageAndCloudInit)
             }
             .keyboardShortcut("5", modifiers: [.command])
 
-            Button("6 · JavaScriptCore Plugin Host & HCL") {
+            Button(localizer.L("6 · JavaScriptCore Plugin Host & HCL", "6 · JS 插件沙盒与 HCL")) {
                 viewModel.docking.openOrFocus(kind: .pluginExtensionStudio)
             }
             .keyboardShortcut("6", modifiers: [.command])
 
-            Button("7 · Fleet Rack Matrix Overview") {
+            Button(localizer.L("7 · Fleet Rack Matrix Overview", "7 · 集群机架矩阵总览")) {
                 viewModel.docking.openOrFocus(kind: .fleetRackOverview)
             }
             .keyboardShortcut("7", modifiers: [.command])
 
-            Button("8 · SQLite Undo & Audit Ledger") {
+            Button(localizer.L("8 · SQLite Undo & Audit Ledger", "8 · SQLite 撤销与审计账本")) {
                 viewModel.docking.openOrFocus(kind: .auditJournalLedger)
             }
             .keyboardShortcut("8", modifiers: [.command])
 
             Divider()
 
-            Button("Toggle Side-by-Side Split View") {
+            Button(localizer.L("Toggle Side-by-Side Split View", "切换左右双栏分屏视图")) {
                 if viewModel.docking.splitMode == .singlePane {
                     viewModel.docking.splitCurrentTabRight()
                 } else {
@@ -808,15 +830,15 @@ public struct AgentVMCommands: Commands {
             }
             .keyboardShortcut("\\", modifiers: [.command])
 
-            Button("Toggle Left Fleet Navigator") {
+            Button(localizer.L("Toggle Left Fleet Navigator", "显示或隐藏左侧集群导航栏")) {
                 viewModel.docking.showLeftNavigator.toggle()
             }
 
-            Button("Toggle Right Blade Inspector") {
+            Button(localizer.L("Toggle Right Blade Inspector", "显示或隐藏右侧刀片检查器")) {
                 viewModel.docking.showRightInspector.toggle()
             }
 
-            Button("Toggle Bottom Telemetry Drawer") {
+            Button(localizer.L("Toggle Bottom Telemetry Drawer", "显示或隐藏底部日志抽屉")) {
                 viewModel.docking.showBottomDrawer.toggle()
             }
         }

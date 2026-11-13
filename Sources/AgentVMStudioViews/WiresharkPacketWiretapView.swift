@@ -7,6 +7,7 @@ import SwiftUI
 
 public struct WiresharkPacketWiretapView: View {
     @ObservedObject public var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     @State private var newestFirst: Bool = true
     @State private var collapsedLayerIDs: Set<String> = []
@@ -51,7 +52,10 @@ public struct WiresharkPacketWiretapView: View {
                         .foregroundStyle( filterStatusColor )
 
                     TextField(
-                        "Boolean wiretap filter (e.g. proto == TLS || verdict == DROP)",
+                        localizer.L(
+                            "Boolean wiretap filter (e.g. proto == TLS || verdict == DROP)",
+                            "布尔过滤表达式 (例如 proto == TLS || verdict == DROP)"
+                        ),
                         text: Binding(
                             get: { viewModel.wiretapFilterText },
                             set: { viewModel.applyWiretapFilter($0) }
@@ -73,7 +77,9 @@ public struct WiresharkPacketWiretapView: View {
                     }
 
                     RackStatusPill(
-                        label: viewModel.parsedFilterQuery.usedSubstringFallback ? "SUBSTR" : "AST OK",
+                        label: viewModel.parsedFilterQuery.usedSubstringFallback
+                            ? localizer.L("SUBSTR", "子串匹配")
+                            : localizer.L("AST OK", "语法就绪"),
                         color: filterStatusColor,
                         monospaced: true
                     )
@@ -95,7 +101,7 @@ public struct WiresharkPacketWiretapView: View {
                     Button {
                         viewModel.selectQuickWiretapPreset(preset)
                     } label: {
-                        Text(preset.rawValue)
+                        Text(preset.localizedLabel)
                     }
                     .buttonStyle(
                         RackActionButtonStyle(
@@ -107,12 +113,12 @@ public struct WiresharkPacketWiretapView: View {
 
                 Menu {
                     ForEach(SyntheticPacketProbeKind.allCases) { probe in
-                        Button(probe.rawValue) {
+                        Button(probe.localizedLabel) {
                             viewModel.injectSyntheticProbePacket(probe)
                         }
                     }
                 } label: {
-                    Label("Probe", systemImage: "bolt.horizontal.circle")
+                    Label(localizer.L("Probe", "注入探测"), systemImage: "bolt.horizontal.circle")
                         .font(RackTheme.labelFont)
                         .foregroundStyle(RackTheme.inkPrimary)
                         .lineLimit(1)
@@ -134,35 +140,38 @@ public struct WiresharkPacketWiretapView: View {
                 Button {
                     viewModel.exportPCAPNGDefault()
                 } label: {
-                    Label("Export .pcapng", systemImage: "square.and.arrow.up")
+                    Label(localizer.L("Export .pcapng", "导出 .pcapng"), systemImage: "square.and.arrow.up")
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
             }
 
             HStack(spacing: 14) {
                 telemetryStatBadge(
-                    label: "Captured",
-                    value: "\(viewModel.filteredPackets.count) / \(viewModel.allPackets.count) frames",
+                    label: localizer.L("Captured", "已捕获"),
+                    value: localizer.L(
+                        "\(viewModel.filteredPackets.count) / \(viewModel.allPackets.count) frames",
+                        "\(viewModel.filteredPackets.count) / \(viewModel.allPackets.count) 帧"
+                    ),
                     color: RackTheme.vsockBlue
                 )
                 telemetryStatBadge(
-                    label: "Blocked",
-                    value: "\(viewModel.droppedPacketCount) drops",
+                    label: localizer.L("Blocked", "已拦截"),
+                    value: localizer.L("\(viewModel.droppedPacketCount) drops", "\(viewModel.droppedPacketCount) 次丢弃"),
                     color: viewModel.droppedPacketCount > 0 ? RackTheme.dropCrimson : RackTheme.inkMuted
                 )
                 telemetryStatBadge(
-                    label: "Active TCP Flows",
+                    label: localizer.L("Active TCP Flows", "活跃 TCP 流"),
                     value: "\(viewModel.activeFlows.count)",
                     color: RackTheme.linkGreen
                 )
                 telemetryStatBadge(
-                    label: "DHCP Leases",
+                    label: localizer.L("DHCP Leases", "DHCP 租约"),
                     value: "\(viewModel.dhcpLeases.count)",
                     color: RackTheme.amberAccent
                 )
                 if let stats = viewModel.switchStatistics {
                     telemetryStatBadge(
-                        label: "Switch Subnet",
+                        label: localizer.L("Switch Subnet", "交换网段"),
                         value: stats.subnetCIDR,
                         color: RackTheme.inkSecondary
                     )
@@ -176,7 +185,10 @@ public struct WiresharkPacketWiretapView: View {
                     HStack(spacing: 4) {
                         Image(systemName: newestFirst ? "arrow.down.to.line.compact" : "arrow.up.to.line.compact")
                             .font(.system(size: 10, weight: .bold))
-                        Text(newestFirst ? "Order: Latest First" : "Order: Chronological")
+                        Text(newestFirst
+                            ? localizer.L("Order: Latest First", "排序: 最新优先")
+                            : localizer.L("Order: Chronological", "排序: 时间顺序")
+                        )
                             .font(RackTheme.monoSmallFont)
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
@@ -224,7 +236,10 @@ public struct WiresharkPacketWiretapView: View {
                     Image(systemName: "waveform.slash")
                         .font(.system(size: 18))
                         .foregroundStyle(RackTheme.inkMuted)
-                    Text("No captured Ethernet frames match '\(viewModel.wiretapFilterText)'.")
+                    Text(localizer.L(
+                        "No captured Ethernet frames match '\(viewModel.wiretapFilterText)'.",
+                        "没有匹配过滤条件「\(viewModel.wiretapFilterText)」的以太网数据帧。"
+                    ))
                         .font(RackTheme.labelFont)
                         .foregroundStyle(RackTheme.inkMuted)
                 }
@@ -250,14 +265,14 @@ public struct WiresharkPacketWiretapView: View {
 
     private var packetTableHeaderRow: some View {
         HStack(spacing: 8) {
-            colHeader("Seq", width: 46, alignment: .trailing)
-            colHeader("Proto", width: 58, alignment: .leading)
-            colHeader("Dir", width: 44, alignment: .leading)
-            colHeader("Source", width: 138, alignment: .leading)
-            colHeader("Destination", width: 142, alignment: .leading)
-            colHeader("Len", width: 50, alignment: .trailing)
-            colHeader("Verdict", width: 106, alignment: .leading)
-            Text("Summary / TLS SNI")
+            colHeader(localizer.L("Seq", "序号"), width: 46, alignment: .trailing)
+            colHeader(localizer.L("Proto", "协议"), width: 58, alignment: .leading)
+            colHeader(localizer.L("Dir", "方向"), width: 44, alignment: .leading)
+            colHeader(localizer.L("Source", "源地址"), width: 138, alignment: .leading)
+            colHeader(localizer.L("Destination", "目的地址"), width: 142, alignment: .leading)
+            colHeader(localizer.L("Len", "长度"), width: 50, alignment: .trailing)
+            colHeader(localizer.L("Verdict", "判定"), width: 106, alignment: .leading)
+            Text(localizer.L("Summary / TLS SNI", "报文摘要 / TLS SNI"))
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(RackTheme.inkMuted)
                 .lineLimit(1)
@@ -331,7 +346,7 @@ public struct WiresharkPacketWiretapView: View {
                 .frame(width: 50, alignment: .trailing)
 
             RackStatusPill(
-                label: pkt.verdict.rawValue,
+                label: pkt.verdict.localizedBadge,
                 color: verdictColor,
                 monospaced: true
             )
@@ -396,13 +411,16 @@ public struct WiresharkPacketWiretapView: View {
 
     private var protocolDissectionTreePane: some View {
         RackPanelContainer(
-            title: "Protocol Layer & Field Tree",
+            title: localizer.L("Protocol Layer & Field Tree", "协议分层与字段解析树"),
             subtitle: selectedPacketSubtitle,
             symbolName: "list.bullet.indent",
             headerTrailing: {
                 if let range = viewModel.highlightedByteRange {
                     RackStatusPill(
-                        label: "BYTES [\(range.lowerBound)..<\(range.upperBound)]",
+                        label: localizer.L(
+                            "BYTES [\(range.lowerBound)..<\(range.upperBound)]",
+                            "字节 [\(range.lowerBound)..<\(range.upperBound)]"
+                        ),
                         color: RackTheme.amberAccent,
                         monospaced: true
                     )
@@ -429,7 +447,10 @@ public struct WiresharkPacketWiretapView: View {
                             .strokeBorder(RackTheme.hairline, lineWidth: 1)
                     )
                 } else {
-                    Text("Select a captured packet above to inspect Ethernet, IPv4, TCP/UDP, DNS, HTTP, and TLS 1.3 layers.")
+                    Text(localizer.L(
+                        "Select a captured packet above to inspect Ethernet, IPv4, TCP/UDP, DNS, HTTP, and TLS 1.3 layers.",
+                        "在上方列表中选择任意数据帧，即可检视 Ethernet、IPv4、TCP/UDP、DNS、HTTP 与 TLS 1.3 分层字段。"
+                    ))
                         .font(RackTheme.captionFont)
                         .foregroundStyle(RackTheme.inkMuted)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -439,8 +460,11 @@ public struct WiresharkPacketWiretapView: View {
     }
 
     private var selectedPacketSubtitle: String {
-        guard let pkt = viewModel.selectedPacket else { return "No frame" }
-        return "#\(pkt.sequenceNumber) · \(pkt.frameLength) B · \(pkt.dissectedLayers.count)L"
+        guard let pkt = viewModel.selectedPacket else { return localizer.L("No frame", "未选择帧") }
+        return localizer.L(
+            "#\(pkt.sequenceNumber) · \(pkt.frameLength) B · \(pkt.dissectedLayers.count)L",
+            "#\(pkt.sequenceNumber) · \(pkt.frameLength) B · \(pkt.dissectedLayers.count) 层"
+        )
     }
 
     private func verdictBannerRow(for pkt: CapturedPacket) -> some View {
@@ -449,7 +473,7 @@ public struct WiresharkPacketWiretapView: View {
             Image(systemName: pkt.verdict.isPermitted ? "checkmark.shield.fill" : "xmark.shield.fill")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(color)
-            Text(pkt.verdict.rawValue)
+            Text(pkt.verdict.localizedBadge)
                 .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                 .foregroundStyle(color)
                 .lineLimit(1)
@@ -568,7 +592,7 @@ public struct WiresharkPacketWiretapView: View {
                             .padding(.horizontal, 3)
                     }
 
-                    Text("\(field.label):")
+                    Text("\(localizedFieldLabel(field.label)):")
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(isHighlighted ? RackTheme.amberAccent : RackTheme.inkSecondary)
                         .lineLimit(1)
@@ -615,12 +639,12 @@ public struct WiresharkPacketWiretapView: View {
 
     private var synchronizedHexAsciiDumpPane: some View {
         RackPanelContainer(
-            title: "16-Byte Hex + ASCII Dump",
+            title: localizer.L("16-Byte Hex + ASCII Dump", "16 字节十六进制与 ASCII 视图"),
             subtitle: hexSubtitleText,
             symbolName: "number.square",
             headerTrailing: {
                 if viewModel.highlightedByteRange != nil {
-                    Button("Clear") {
+                    Button(localizer.L("Clear", "清除")) {
                         viewModel.highlightBytes(nil)
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .subtleGhost, compact: true))
@@ -646,7 +670,7 @@ public struct WiresharkPacketWiretapView: View {
                             .strokeBorder(RackTheme.hairline, lineWidth: 1)
                     )
                 } else {
-                    Text("No frame bytes loaded.")
+                    Text(localizer.L("No frame bytes loaded.", "暂无数据帧字节载荷。"))
                         .font(RackTheme.captionFont)
                         .foregroundStyle(RackTheme.inkMuted)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -657,9 +681,12 @@ public struct WiresharkPacketWiretapView: View {
 
     private var hexSubtitleText: String {
         if let r = viewModel.highlightedByteRange {
-            return "Highlighted \(r.count) B @ 0x\(String(format: "%04X", r.lowerBound))"
+            return localizer.L(
+                "Highlighted \(r.count) B @ 0x\(String(format: "%04X", r.lowerBound))",
+                "高亮 \(r.count) B @ 0x\(String(format: "%04X", r.lowerBound))"
+            )
         }
-        return "Click any layer, field, or octet"
+        return localizer.L("Click any layer, field, or octet", "点击任意协议层、字段或字节定位")
     }
 
     private struct HexDumpRow: Identifiable {
@@ -784,9 +811,9 @@ public struct WiresharkPacketWiretapView: View {
 
     private func shortDirectionTag(_ dir: NetworkDirection) -> String {
         switch dir {
-        case .egress: return "OUT"
-        case .ingress: return "IN"
-        case .lateralVMToVM: return "VM2VM"
+        case .egress: return localizer.L("OUT", "出站")
+        case .ingress: return localizer.L("IN", "入站")
+        case .lateralVMToVM: return localizer.L("VM2VM", "横向")
         }
     }
 
@@ -807,9 +834,13 @@ public struct WiresharkPacketWiretapView: View {
         }
         if pkt.dnsQueryName != nil {
             if pkt.verdict == .dnsSinkhole {
-                return pkt.direction == .ingress ? "Sinkhole Reply 0.0.0.0" : "Query A (Sinkholed)"
+                return pkt.direction == .ingress
+                    ? localizer.L("Sinkhole Reply 0.0.0.0", "黑洞应答 0.0.0.0")
+                    : localizer.L("Query A (Sinkholed)", "A 记录查询 (已黑洞拦截)")
             }
-            return pkt.direction == .ingress ? "DNS Reply A 140.82.121.4" : "DNS Standard Query A"
+            return pkt.direction == .ingress
+                ? localizer.L("DNS Reply A 140.82.121.4", "DNS 应答 A 140.82.121.4")
+                : localizer.L("DNS Standard Query A", "DNS 标准查询 A")
         }
         if let req = pkt.httpRequestLine, !req.isEmpty {
             return req
@@ -820,18 +851,105 @@ public struct WiresharkPacketWiretapView: View {
 
     private func compactVerdictReason(_ reason: String) -> String {
         if reason.contains("Allow GitHub TLS") {
-            return "Matched rule 'Allow GitHub TLS (*.github.com)'"
+            return localizer.L(
+                "Matched rule 'Allow GitHub TLS (*.github.com)'",
+                "命中规则「允许 GitHub TLS (*.github.com)」"
+            )
         }
         if reason.contains("169.254.169.254") {
-            return "Matched rule 'Block Cloud Instance Metadata SSRF'"
+            return localizer.L(
+                "Matched rule 'Block Cloud Instance Metadata SSRF'",
+                "命中规则「阻断云实例元数据 SSRF (169.254.169.254)」"
+            )
+        }
+        if reason.contains("Sinkhole") || reason.contains("Webhook") {
+            return localizer.L(
+                "Matched rule 'Sinkhole Exfiltration Pastebins & Webhook Sinks'",
+                "命中规则「DNS 黑洞拦截外泄站点与 Webhook」"
+            )
+        }
+        if reason.contains("secret-leak-guard") || reason.contains("Credential leak") {
+            return localizer.L(
+                reason,
+                "secret-leak-guard: 已拦截出站凭据密钥外泄"
+            )
         }
         if reason.count <= 56 { return reason }
         return String(reason.prefix(56))
     }
 
     private func compactLayerTitle(_ layer: DissectedLayer) -> String {
+        if localizer.isChinese {
+            switch layer.protocolKind {
+            case .ethernet:
+                return "Ethernet II 以太网数据链路层"
+            case .arp:
+                return "ARP 地址解析协议"
+            case .ipv4:
+                return "IPv4 互联网协议头"
+            case .icmp:
+                return "ICMP 控制报文协议"
+            case .tcp:
+                return "TCP 传输控制协议段"
+            case .udp:
+                return "UDP 用户数据报协议"
+            case .dhcp:
+                return "DHCP 动态主机配置协议"
+            case .dns:
+                return "DNS 域名解析报文"
+            case .http:
+                return "HTTP 明文应用层请求"
+            case .tls:
+                return "TLS 1.3 加密握手层 (ClientHello)"
+            case .ssh:
+                return "SSH 加密会话层"
+            case .unknown:
+                return "原始二进制载荷"
+            }
+        }
         if layer.title.count <= 44 { return layer.title }
         return String(layer.title.prefix(44))
+    }
+
+    private func localizedFieldLabel(_ raw: String) -> String {
+        guard localizer.isChinese else { return raw }
+        switch raw {
+        case "Destination MAC": return "目的 MAC"
+        case "Source MAC": return "源 MAC"
+        case "EtherType": return "以太类型"
+        case "Version / IHL": return "版本 / 首部长度"
+        case "Total Length": return "总长度"
+        case "TTL": return "生存跳数 TTL"
+        case "Protocol": return "上层协议"
+        case "Header Checksum": return "首部校验和"
+        case "Source IP": return "源 IPv4"
+        case "Destination IP": return "目的 IPv4"
+        case "Source Port": return "源端口"
+        case "Destination Port": return "目的端口"
+        case "Sequence Number", "Sequence": return "序列号 Seq"
+        case "Ack Number", "Acknowledgment": return "确认号 Ack"
+        case "Header Length / Flags", "Flags": return "首部标志位"
+        case "Window Size", "Window": return "窗口大小"
+        case "Length": return "长度"
+        case "Checksum": return "校验和"
+        case "Record Content Type", "Content Type": return "记录内容类型"
+        case "Record Version", "Legacy Version": return "记录协议版本"
+        case "Record Length": return "记录长度"
+        case "Handshake Type": return "握手消息类型"
+        case "Client Version": return "客户端版本"
+        case "Client Random": return "客户端随机数"
+        case "Cipher Suites": return "密码套件列表"
+        case "Extensions": return "TLS 扩展列表"
+        case "Server Name (SNI)": return "服务器名称指示 (SNI)"
+        case "ALPN Protocols", "ALPN": return "应用层协议协商 (ALPN)"
+        case "Supported Versions": return "支持的 TLS 版本"
+        case "Transaction ID": return "事务 ID"
+        case "Questions": return "查询问题数"
+        case "Query Name", "QNAME": return "查询域名"
+        case "Request Line": return "请求行"
+        case "Host": return "主机头 Host"
+        default: return raw
+        }
     }
 
     private func compactFieldValue(_ val: String) -> String {

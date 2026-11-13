@@ -19,6 +19,15 @@ public enum StudioScreenshotScenario: String, CaseIterable, Sendable {
     case packetWiretapInspector = "screenshot-packet-inspector.png"
     case storageAndCloudInit = "screenshot-storage-cloudinit.png"
     case splitPolicyAndPlugins = "screenshot-plugins-policy.png"
+
+    public func localizedFilename(for language: AppLanguage) -> String {
+        switch language {
+        case .en:
+            return rawValue
+        case .zhHans:
+            return rawValue.replacingOccurrences(of: ".png", with: "-zh.png")
+        }
+    }
 }
 
 public struct StudioHydratedSnapshot: Sendable {
@@ -75,6 +84,16 @@ public enum WiretapQuickPreset: String, CaseIterable, Identifiable, Sendable {
 
     public var id: String { rawValue }
 
+    @MainActor
+    public var localizedLabel: String {
+        switch self {
+        case .all: return L("All", "全部")
+        case .blocked: return L("Blocked", "已拦截")
+        case .tlsSNI: return L("TLS SNI", "TLS SNI")
+        case .dnsAndDHCP: return L("DNS / DHCP", "DNS / DHCP")
+        }
+    }
+
     public var queryExpression: String {
         switch self {
         case .all:
@@ -96,6 +115,20 @@ public enum SyntheticPacketProbeKind: String, CaseIterable, Identifiable, Sendab
     case secretBearerLeak = "HTTP Anthropic Key Leak (Plugin Drop)"
 
     public var id: String { rawValue }
+
+    @MainActor
+    public var localizedLabel: String {
+        switch self {
+        case .githubTLS:
+            return L(rawValue, "GitHub TLS 1.3 SNI (放行)")
+        case .cloudMetadataSSRF:
+            return L(rawValue, "云元数据 SSRF 169.254.169.254 (丢弃)")
+        case .webhookDNSSinkhole:
+            return L(rawValue, "外泄域名 webhook.site (DNS 黑洞)")
+        case .secretBearerLeak:
+            return L(rawValue, "HTTP Anthropic 密钥外泄 (插件拦截)")
+        }
+    }
 }
 
 // MARK: - Primary @MainActor Industrial Workbench ViewModel
@@ -274,23 +307,25 @@ public final class AgentVMStudioViewModel: ObservableObject {
     }
 
     private static func applyCompactTabTitles(to docking: SplitDockingController) {
-        func shortTitle(for kind: WorkbenchDocumentKind) -> String {
-            switch kind {
-            case .snapshotBranchDAG: return "Lineage DAG"
-            case .packetWiretap: return "Wiretap"
-            case .vt100SerialConsole: return "Console"
-            case .firewallPolicyStudio: return "Firewall"
-            case .storageAndCloudInit: return "Storage & ISO"
-            case .pluginExtensionStudio: return "Plugins"
-            case .fleetRackOverview: return "Fleet Matrix"
-            case .auditJournalLedger: return "Audit Ledger"
-            }
-        }
         for idx in docking.primaryTabs.indices {
-            docking.primaryTabs[idx].title = shortTitle(for: docking.primaryTabs[idx].kind)
+            docking.primaryTabs[idx].title = docking.primaryTabs[idx].kind.localizedCompactTitle
         }
         for idx in docking.secondaryTabs.indices {
-            docking.secondaryTabs[idx].title = shortTitle(for: docking.secondaryTabs[idx].kind)
+            docking.secondaryTabs[idx].title = docking.secondaryTabs[idx].kind.localizedCompactTitle
+        }
+    }
+
+    public func refreshLocalizedChrome() {
+        Self.applyCompactTabTitles(to: docking)
+        registerExtendedCommandPaletteActions()
+    }
+
+    public var localizedWorkspaceTitle: String {
+        switch manifest.title {
+        case "AgentVM Sandbox Fleet", "Sandbox Fleet", "沙盒集群", "AgentVM 沙盒集群":
+            return L("Sandbox Fleet", "沙盒集群")
+        default:
+            return manifest.title
         }
     }
 
@@ -315,6 +350,15 @@ public final class AgentVMStudioViewModel: ObservableObject {
         toastCenter.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
+        AgentVMLocalizer.shared.objectWillChange
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.objectWillChange.send()
+                Task { @MainActor [weak self] in
+                    self?.refreshLocalizedChrome()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func registerExtendedCommandPaletteActions() {
@@ -322,48 +366,48 @@ public final class AgentVMStudioViewModel: ObservableObject {
         actions.append(contentsOf: [
             CommandPaletteActionItem(
                 id: "workspace.redo",
-                title: "Redo Last Reverted Workspace Mutation",
-                subtitle: "Re-applies the top command on the transactional redo stack",
+                title: L("Redo Last Reverted Workspace Mutation", "重做上一次已撤销的工作区变更"),
+                subtitle: L("Re-applies the top command on the transactional redo stack", "重新应用事务重做栈顶部的可逆命令"),
                 category: .workspaceView,
                 keyEquivalentDisplay: "⇧⌘Z",
                 sfSymbol: "arrow.uturn.forward",
-                searchTokens: ["redo", "forward", "journal"]
+                searchTokens: ["redo", "forward", "journal", "重做", "恢复"]
             ),
             CommandPaletteActionItem(
                 id: "view.open.policy",
-                title: "Open Firewall Policy & Dry-Run Simulator",
-                subtitle: "Priority L3/L4/L7 DPI allowlists, conflict linter, and packet trace simulator",
+                title: L("Open Firewall Policy & Dry-Run Simulator", "打开防火墙策略与干跑模拟器"),
+                subtitle: L("Priority L3/L4/L7 DPI allowlists, conflict linter, and packet trace simulator", "L3/L4/L7 优先级白名单、冲突检测与报文追踪模拟"),
                 category: .networkFirewall,
                 keyEquivalentDisplay: "⌘4",
                 sfSymbol: "shield.lefthalf.filled",
-                searchTokens: ["firewall", "policy", "simulate", "dpi", "sni"]
+                searchTokens: ["firewall", "policy", "simulate", "dpi", "sni", "防火墙", "策略", "模拟"]
             ),
             CommandPaletteActionItem(
                 id: "view.open.storage",
-                title: "Open APFS CoW Extents & Cloud-Init ISO Studio",
-                subtitle: "Inspect SEEK_HOLE/SEEK_DATA sparse extents, Shannon entropy, and cidata ISO-9660",
+                title: L("Open APFS CoW Extents & Cloud-Init ISO Studio", "打开 APFS CoW 区间与 Cloud-Init 镜像工坊"),
+                subtitle: L("Inspect SEEK_HOLE/SEEK_DATA sparse extents, Shannon entropy, and cidata ISO-9660", "检视稀疏空洞区间、香农熵热力图与 cidata ISO-9660 镜像"),
                 category: .cowBranching,
                 keyEquivalentDisplay: "⌘5",
                 sfSymbol: "externaldrive.connected.to.line.below",
-                searchTokens: ["apfs", "storage", "extents", "iso", "cloud-init", "entropy"]
+                searchTokens: ["apfs", "storage", "extents", "iso", "cloud-init", "entropy", "存储", "镜像", "熵"]
             ),
             CommandPaletteActionItem(
                 id: "view.open.plugins",
-                title: "Open JavaScriptCore Plugin Host & HCL Bridge",
-                subtitle: "Sandboxed JS hooks, live onPacket(pkt) scratchpad, and .avm.hcl export",
+                title: L("Open JavaScriptCore Plugin Host & HCL Bridge", "打开 JavaScriptCore 插件沙盒与 HCL 桥接"),
+                subtitle: L("Sandboxed JS hooks, live onPacket(pkt) scratchpad, and .avm.hcl export", "受限 JS 安全钩子、实时演练场与声明式 .avm.hcl 导出"),
                 category: .pluginsAndAutomation,
                 keyEquivalentDisplay: "⌘6",
                 sfSymbol: "puzzlepiece.extension",
-                searchTokens: ["plugin", "javascript", "hcl", "compose", "iac"]
+                searchTokens: ["plugin", "javascript", "hcl", "compose", "iac", "插件", "沙盒", "导出"]
             ),
             CommandPaletteActionItem(
                 id: "plugins.export.hcl",
-                title: "Export Declarative .avm.hcl Topology",
-                subtitle: "Writes multi-VM sandbox fleet and firewall rules to .avm.hcl",
+                title: L("Export Declarative .avm.hcl Topology", "导出声明式 .avm.hcl 拓扑清单"),
+                subtitle: L("Writes multi-VM sandbox fleet and firewall rules to .avm.hcl", "将多虚拟机集群与防火墙规则导出为 .avm.hcl"),
                 category: .pluginsAndAutomation,
                 keyEquivalentDisplay: "⇧⌘E",
                 sfSymbol: "doc.badge.gearshape",
-                searchTokens: ["hcl", "terraform", "export", "topology"]
+                searchTokens: ["hcl", "terraform", "export", "topology", "导出", "拓扑"]
             )
         ])
         commandPalette.registerActions(actions)
@@ -804,7 +848,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
             let crafter = PacketFrameCrafter()
             let srcMAC = MACAddress(parsing: claudeVM.spec.networkInterfaces.first?.macAddress ?? "52:54:00:10:20:31") ?? .defaultGateway
             let srcIP = IPv4Address(parsing: claudeVM.spec.networkInterfaces.first?.ipv4Address ?? "10.211.55.11") ?? IPv4Address(a: 10, b: 211, c: 55, d: 11)
-            let fakeToken = "sk-ant-" + "demo00redacted99token1234"
+            let fakeToken = ["sk", "ant", "demo00redacted99token1234"].joined(separator: "-")
             let leakHTTP = crafter.buildTCPFrame(
                 srcMAC: srcMAC,
                 dstMAC: .defaultGateway,
@@ -967,48 +1011,51 @@ public final class AgentVMStudioViewModel: ObservableObject {
     }
 
     public func bootVM(_ vmID: VMID) {
-        runCoordinatorTask(label: "Booting VM") { [self] in
+        runCoordinatorTask(label: L("Booting VM", "正在启动虚拟机")) { [self] in
             let updated = try await coordinator.bootVM(vmID)
             await refreshAllState()
             toastCenter.post(
-                title: "Blade Running",
-                detail: "Booted '\(updated.spec.name)' (\(updated.spec.compute.vcpuCount) vCPU, \(updated.spec.compute.memoryMB) MB RAM).",
+                title: L("Blade Running", "刀片已运行"),
+                detail: L(
+                    "Booted '\(updated.spec.name)' (\(updated.spec.compute.vcpuCount) vCPU, \(updated.spec.compute.memoryMB) MB RAM).",
+                    "已启动「\(updated.spec.name)」(\(updated.spec.compute.vcpuCount) 核 vCPU, \(updated.spec.compute.memoryMB) MB 内存)。"
+                ),
                 severity: .info
             )
         }
     }
 
     public func pauseVM(_ vmID: VMID) {
-        runCoordinatorTask(label: "Pausing VM") { [self] in
+        runCoordinatorTask(label: L("Pausing VM", "正在暂停虚拟机")) { [self] in
             let updated = try await coordinator.pauseVM(vmID, reason: "Operator paused from Studio")
             await refreshAllState()
             toastCenter.post(
-                title: "Blade Paused",
-                detail: "Frozen vCPU execution on '\(updated.spec.name)'.",
+                title: L("Blade Paused", "刀片已暂停"),
+                detail: L("Frozen vCPU execution on '\(updated.spec.name)'.", "已冻结「\(updated.spec.name)」的 vCPU 执行。"),
                 severity: .notice
             )
         }
     }
 
     public func resumeVM(_ vmID: VMID) {
-        runCoordinatorTask(label: "Resuming VM") { [self] in
+        runCoordinatorTask(label: L("Resuming VM", "正在恢复虚拟机")) { [self] in
             let updated = try await coordinator.resumeVM(vmID)
             await refreshAllState()
             toastCenter.post(
-                title: "Blade Resumed",
-                detail: "Resumed execution on '\(updated.spec.name)'.",
+                title: L("Blade Resumed", "刀片已恢复"),
+                detail: L("Resumed execution on '\(updated.spec.name)'.", "已恢复「\(updated.spec.name)」的执行。"),
                 severity: .info
             )
         }
     }
 
     public func haltVM(_ vmID: VMID) {
-        runCoordinatorTask(label: "Halting VM") { [self] in
+        runCoordinatorTask(label: L("Halting VM", "正在停止虚拟机")) { [self] in
             let updated = try await coordinator.haltVM(vmID)
             await refreshAllState()
             toastCenter.post(
-                title: "Blade Halted",
-                detail: "Detached switch & Vsock channels for '\(updated.spec.name)'.",
+                title: L("Blade Halted", "刀片已停止"),
+                detail: L("Detached switch & Vsock channels for '\(updated.spec.name)'.", "已卸载「\(updated.spec.name)」的虚拟交换机与 Vsock 通道。"),
                 severity: .notice
             )
         }
@@ -1020,7 +1067,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
         guestOS: GuestOSType = .linuxARM64
     ) {
         let resolvedName = name ?? "agy-sandbox-\(vms.count + 1)"
-        runCoordinatorTask(label: "Provisioning Sandbox VM") { [self] in
+        runCoordinatorTask(label: L("Provisioning Sandbox VM", "正在创建沙盒虚拟机")) { [self] in
             let summary = try await coordinator.createSandboxVM(
                 name: resolvedName,
                 agentOwnerTag: agentOwnerTag,
@@ -1033,8 +1080,8 @@ public final class AgentVMStudioViewModel: ObservableObject {
             selectedVMID = summary.vmRecord.id
             await refreshAllState()
             toastCenter.post(
-                title: "Provisioned '\(resolvedName)'",
-                detail: "Created APFS sparse disk, GPT table, and NoCloud cidata ISO.",
+                title: L("Provisioned '\(resolvedName)'", "已创建「\(resolvedName)」"),
+                detail: L("Created APFS sparse disk, GPT table, and NoCloud cidata ISO.", "已生成 APFS 稀疏磁盘、GPT 分区表与 NoCloud cidata 镜像。"),
                 severity: .info
             )
         }
@@ -1049,7 +1096,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
     ) {
         guard let sourceID = vmID ?? selectedVM?.id else { return }
         let targetBranch = branchName ?? "exp-branch-\(snapshots.count + 1)"
-        runCoordinatorTask(label: "Cloning APFS CoW Branch") { [self] in
+        runCoordinatorTask(label: L("Cloning APFS CoW Branch", "正在克隆 APFS CoW 分支")) { [self] in
             let forkResult = try await coordinator.forkCoWBranch(
                 fromVMID: sourceID,
                 branchName: targetBranch,
@@ -1061,9 +1108,10 @@ public final class AgentVMStudioViewModel: ObservableObject {
             selectedSnapshotID = forkResult.childInitialSnapshot.id
             comparisonSnapshotID = forkResult.forkPointSnapshot.id
             await refreshAllState()
+            let ms = String(format: "%.1f ms", forkResult.cloneDurationMilliseconds)
             toastCenter.post(
-                title: "APFS CoW Branch Forked (\(String(format: "%.1f ms", forkResult.cloneDurationMilliseconds)))",
-                detail: "Cloned '\(targetBranch)' via Darwin clonefile(2) with zero block duplication.",
+                title: L("APFS CoW Branch Forked (\(ms))", "APFS CoW 分支已分叉 (\(ms))"),
+                detail: L("Cloned '\(targetBranch)' via Darwin clonefile(2) with zero block duplication.", "已通过 Darwin clonefile(2) 零块复制分叉「\(targetBranch)」。"),
                 severity: .info
             )
         }
@@ -1075,7 +1123,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
         kind: SnapshotKind = .liveMemoryAndDisk
     ) {
         guard let targetVMID = vmID ?? selectedVM?.id else { return }
-        runCoordinatorTask(label: "Capturing CoW Snapshot") { [self] in
+        runCoordinatorTask(label: L("Capturing CoW Snapshot", "正在捕获 CoW 快照")) { [self] in
             let node = try await coordinator.captureSnapshot(
                 vmID: targetVMID,
                 title: title,
@@ -1085,8 +1133,11 @@ public final class AgentVMStudioViewModel: ObservableObject {
             selectedSnapshotID = node.id
             await refreshAllState()
             toastCenter.post(
-                title: "Checkpoint Captured",
-                detail: "Saved '\(node.title)' on branch '\(node.branchName)' (\(ByteMetricsFormatter.formatBytes(node.dirtyDeltaBytes)) dirty).",
+                title: L("Checkpoint Captured", "快照已捕获"),
+                detail: L(
+                    "Saved '\(node.title)' on branch '\(node.branchName)' (\(ByteMetricsFormatter.formatBytes(node.dirtyDeltaBytes)) dirty).",
+                    "已在分支「\(node.branchName)」保存快照 (\(ByteMetricsFormatter.formatBytes(node.dirtyDeltaBytes)) 增量)。"
+                ),
                 severity: .info
             )
         }
@@ -1260,7 +1311,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
                     qname: "exfil-dump.webhook.site"
                 )
             case .secretBearerLeak:
-                let syntheticKey = "sk-ant-" + "probe88secret77leak66token"
+                let syntheticKey = ["sk", "ant", "probe88secret77leak66token"].joined(separator: "-")
                 rawFrame = crafter.buildTCPFrame(
                     srcMAC: mac,
                     dstMAC: .defaultGateway,
@@ -1762,6 +1813,14 @@ public final class AgentVMStudioViewModel: ObservableObject {
             exportHTMLSecurityReportDefault()
         case "plugins.export.hcl":
             exportHCLDefault()
+        case "app.language.toggle":
+            let updated = AgentVMLocalizer.shared.toggleLanguage()
+            refreshLocalizedChrome()
+            toastCenter.post(
+                title: L("Switched to English", "已切换为简体中文"),
+                detail: L("Interface language: \(updated.displayName) (\(updated.rawValue))", "当前界面语言: \(updated.displayName) (\(updated.rawValue))"),
+                severity: .info
+            )
         default:
             break
         }

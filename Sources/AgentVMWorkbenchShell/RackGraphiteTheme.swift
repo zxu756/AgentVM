@@ -395,3 +395,78 @@ public struct RackKeyCapBadge: View {
             )
     }
 }
+
+// MARK: - Machined Bilingual Segmented Toggle Pill (`中文 | EN`)
+
+public struct RackLanguageTogglePill: View {
+    @ObservedObject public var localizer: AgentVMLocalizer
+
+    public init(localizer: AgentVMLocalizer = .shared) {
+        self.localizer = localizer
+    }
+
+    public var body: some View {
+        HStack(spacing: 2) {
+            LanguageSegmentButton(
+                label: AppLanguage.zhHans.badge,
+                isActive: localizer.language == .zhHans,
+                action: { localizer.setLanguage(.zhHans) }
+            )
+
+            Rectangle()
+                .fill(RackTheme.hairline)
+                .frame(width: 1, height: 12)
+
+            LanguageSegmentButton(
+                label: AppLanguage.en.badge,
+                isActive: localizer.language == .en,
+                action: { localizer.setLanguage(.en) }
+            )
+        }
+        .padding(2)
+        .fixedSize(horizontal: true, vertical: false)
+        .background(
+            RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
+                .fill(RackTheme.chassisBackground)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
+                .strokeBorder(RackTheme.hairlineStrong, lineWidth: 1)
+        )
+        .help(localizer.L("Switch Interface Language · 中文 / EN (⇧⌘L)", "切换界面语言 · 中文 / EN (⇧⌘L)"))
+    }
+
+    private struct LanguageSegmentButton: View {
+        let label: String
+        let isActive: Bool
+        let action: () -> Void
+        @State private var isHovered = false
+
+        var body: some View {
+            Button(action: action) {
+                Text(label)
+                    .font(.system(size: 11, weight: isActive ? .semibold : .medium, design: .default))
+                    .tracking(0)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .foregroundStyle(
+                        isActive
+                            ? Color(red: 0.08, green: 0.07, blue: 0.06)
+                            : (isHovered ? RackTheme.inkPrimary : RackTheme.inkSecondary)
+                    )
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: RackTheme.badgeCornerRadius, style: .continuous)
+                            .fill(
+                                isActive
+                                    ? RackTheme.amberAccent
+                                    : (isHovered ? RackTheme.moduleSurface.opacity(0.65) : Color.clear)
+                            )
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { isHovered = $0 }
+        }
+    }
+}

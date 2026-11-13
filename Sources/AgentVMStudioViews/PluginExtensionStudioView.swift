@@ -7,6 +7,7 @@ import SwiftUI
 
 public struct PluginExtensionStudioView: View {
     @ObservedObject public var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     @State private var isEditingScratchpad: Bool = false
     @State private var configDraftKey: String = ""
     @State private var configDraftValue: String = ""
@@ -68,20 +69,26 @@ public struct PluginExtensionStudioView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(RackTheme.amberAccent)
 
-            Text("JavaScriptCore Plugin Sandbox")
+            Text(localizer.L("JavaScriptCore Plugin Sandbox", "JavaScriptCore 插件沙盒"))
                 .font(RackTheme.sectionHeaderFont)
                 .foregroundStyle(RackTheme.inkPrimary)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
 
             RackStatusPill(
-                label: "\(viewModel.activePluginsCount)/\(max(4, viewModel.pluginStatuses.count)) Active",
+                label: localizer.L(
+                    "\(viewModel.activePluginsCount)/\(max(4, viewModel.pluginStatuses.count)) Active",
+                    "\(viewModel.activePluginsCount)/\(max(4, viewModel.pluginStatuses.count)) 已启用"
+                ),
                 color: RackTheme.linkGreen,
                 monospaced: true
             )
 
             RackStatusPill(
-                label: "\(totalInvocations) hooks · \(totalInterceptions) blocks",
+                label: localizer.L(
+                    "\(totalInvocations) hooks · \(totalInterceptions) blocks",
+                    "\(totalInvocations) 次调用 · \(totalInterceptions) 次拦截"
+                ),
                 color: totalInterceptions > 0 ? RackTheme.amberAccent : RackTheme.vsockBlue,
                 monospaced: true
             )
@@ -91,7 +98,7 @@ public struct PluginExtensionStudioView: View {
             Button {
                 viewModel.exportHCLDefault()
             } label: {
-                Label("Export .avm.hcl", systemImage: "square.and.arrow.up")
+                Label(localizer.L("Export .avm.hcl", "导出 .avm.hcl"), systemImage: "square.and.arrow.up")
             }
             .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
         }
@@ -111,18 +118,21 @@ public struct PluginExtensionStudioView: View {
 
     private var pluginRosterPanel: some View {
         RackPanelContainer(
-            title: "Extension Modules",
-            subtitle: "Zero Host FS/Net · 200ms Watchdog",
+            title: localizer.L("Extension Modules", "扩展安全模块"),
+            subtitle: localizer.L("Zero Host FS/Net · 800ms Watchdog", "零宿主机文件/网络 · 800ms 看门狗"),
             symbolName: "cpu.fill",
             headerTrailing: {
                 if let plugin = viewModel.selectedPlugin {
                     Button {
                         viewModel.loadSelectedPluginSourceIntoScratchpad()
                     } label: {
-                        Label("Load in Scratchpad", systemImage: "curlybraces")
+                        Label(localizer.L("Load in Scratchpad", "载入演练场"), systemImage: "curlybraces")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
-                    .help("Copy \(plugin.manifest.name) source into Scratchpad")
+                    .help(localizer.L(
+                        "Copy \(plugin.manifest.name) source into Scratchpad",
+                        "将「\(plugin.manifest.localizedName)」源码复制到演练场"
+                    ))
                 }
             },
             content: {
@@ -208,7 +218,7 @@ public struct PluginExtensionStudioView: View {
                         )
                     }
 
-                Button("Apply") {
+                Button(localizer.L("Apply", "应用")) {
                     viewModel.updatePluginConfig(
                         pluginID: status.id,
                         key: field.key,
@@ -217,7 +227,7 @@ public struct PluginExtensionStudioView: View {
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
             } else {
-                Text(status.manifest.summary)
+                Text(status.manifest.localizedSummary)
                     .font(RackTheme.captionFont)
                     .foregroundStyle(RackTheme.inkSecondary)
                     .lineLimit(1)
@@ -225,7 +235,7 @@ public struct PluginExtensionStudioView: View {
 
             Spacer(minLength: 4)
 
-            Text("Timeout \(status.manifest.timeoutMilliseconds)ms")
+            Text(localizer.L("Timeout \(status.manifest.timeoutMilliseconds)ms", "超时 \(status.manifest.timeoutMilliseconds)ms"))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(RackTheme.inkMuted)
@@ -248,7 +258,7 @@ public struct PluginExtensionStudioView: View {
 
     private var scratchpadRunnerPanel: some View {
         RackPanelContainer(
-            title: "Live JS Scratchpad",
+            title: localizer.L("Live JS Scratchpad", "实时 JS 演练场"),
             subtitle: nil,
             symbolName: "bolt.horizontal.circle.fill",
             headerTrailing: {
@@ -262,14 +272,14 @@ public struct PluginExtensionStudioView: View {
                     Button {
                         isEditingScratchpad.toggle()
                     } label: {
-                        Text(isEditingScratchpad ? "Done" : "Edit")
+                        Text(isEditingScratchpad ? localizer.L("Done", "完成") : localizer.L("Edit", "编辑"))
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .subtleGhost, compact: true))
 
                     Button {
                         viewModel.evaluateScratchpad()
                     } label: {
-                        Label("Run", systemImage: "play.fill")
+                        Label(localizer.L("Run", "运行"), systemImage: "play.fill")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
                 }
@@ -321,7 +331,7 @@ public struct PluginExtensionStudioView: View {
                     // JSON Verdict + Console Output Box
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 6) {
-                            Text("Hook Return Verdict (JSON)")
+                            Text(localizer.L("Hook Return Verdict (JSON)", "钩子返回判定 (JSON)"))
                                 .font(RackTheme.labelFont)
                                 .foregroundStyle(RackTheme.inkSecondary)
                                 .lineLimit(1)
@@ -331,7 +341,9 @@ public struct PluginExtensionStudioView: View {
 
                             let isDropVerdict = viewModel.scratchpadOutputJSON.localizedCaseInsensitiveContains("\"drop\"")
                             RackStatusPill(
-                                label: isDropVerdict ? "VERDICT: DROP" : "VERDICT: ALLOW",
+                                label: isDropVerdict
+                                    ? localizer.L("VERDICT: DROP", "判定: 丢弃")
+                                    : localizer.L("VERDICT: ALLOW", "判定: 放行"),
                                 color: isDropVerdict ? RackTheme.dropCrimson : RackTheme.linkGreen,
                                 monospaced: true
                             )
@@ -379,7 +391,7 @@ public struct PluginExtensionStudioView: View {
         let activeDocumentText = showingHCL ? viewModel.hclPreview : viewModel.composePreview
 
         return RackPanelContainer(
-            title: "IaC Topology Bridge",
+            title: localizer.L("IaC Topology Bridge", "IaC 拓扑桥接"),
             subtitle: nil,
             symbolName: "doc.text.magnifyingglass",
             headerTrailing: {
@@ -424,13 +436,13 @@ public struct PluginExtensionStudioView: View {
                     // Recent Plugin Hook Audit Feed
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text("Recent Sandbox Hook Events")
+                            Text(localizer.L("Recent Sandbox Hook Events", "近期沙盒钩子事件"))
                                 .font(RackTheme.labelFont)
                                 .foregroundStyle(RackTheme.inkSecondary)
                                 .lineLimit(1)
                                 .fixedSize(horizontal: true, vertical: false)
                             Spacer()
-                            Text("\(viewModel.pluginLogs.count) events")
+                            Text(localizer.L("\(viewModel.pluginLogs.count) events", "\(viewModel.pluginLogs.count) 条事件"))
                                 .font(RackTheme.monoSmallFont)
                                 .monospacedDigit()
                                 .foregroundStyle(RackTheme.inkMuted)
@@ -525,16 +537,16 @@ public struct PluginExtensionStudioView: View {
 
     private func compactHookMessage(_ message: String) -> String {
         if message.localizedCaseInsensitiveContains("pre-exec") || message.localizedCaseInsensitiveContains("checkpoint") {
-            return "Pre-exec CoW snapshot"
+            return localizer.L("Pre-exec CoW snapshot", "执行前自动快照")
         }
         if message.localizedCaseInsensitiveContains("Overrode") {
-            return "Packet -> PLUGIN_DROP"
+            return localizer.L("Packet -> PLUGIN_DROP", "报文 -> 插件拦截")
         }
         if message.localizedCaseInsensitiveContains("Anthropic") || message.localizedCaseInsensitiveContains("Dropped outbound") {
-            return "Blocked API token leak"
+            return localizer.L("Blocked API token leak", "已拦截密钥外泄")
         }
         if message.localizedCaseInsensitiveContains("Registered") {
-            return "Sandbox initialized"
+            return localizer.L("Sandbox initialized", "沙盒已初始化")
         }
         return message.count <= 24 ? message : String(message.prefix(24))
     }
@@ -582,14 +594,18 @@ public struct PluginExtensionStudioView: View {
 // MARK: - Individual Sandboxed Plugin Card
 
 private struct PluginModuleCard: View {
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     let status: PluginRuntimeStatus
     let isSelected: Bool
     let onSelect: () -> Void
     let onToggleEnabled: () -> Void
     let onToggleCapability: (PluginCapability) -> Void
 
-    private var shortSlug: String {
-        status.manifest.id.rawValue.replacingOccurrences(of: "builtin.", with: "")
+    private var cardDisplayTitle: String {
+        if localizer.isChinese {
+            return status.manifest.localizedName
+        }
+        return status.manifest.id.rawValue.replacingOccurrences(of: "builtin.", with: "")
     }
 
     var body: some View {
@@ -599,8 +615,8 @@ private struct PluginModuleCard: View {
                     .fill(status.isEnabled ? RackTheme.linkGreen : RackTheme.inkMuted)
                     .frame(width: 7, height: 7)
 
-                Text(shortSlug)
-                    .font(RackTheme.monoBoldFont)
+                Text(cardDisplayTitle)
+                    .font(localizer.isChinese ? .system(size: 11.5, weight: .semibold) : RackTheme.monoBoldFont)
                     .foregroundStyle(RackTheme.inkPrimary)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
@@ -635,21 +651,21 @@ private struct PluginModuleCard: View {
                             )
                     }
                     .buttonStyle(.plain)
-                    .help(cap.humanDescription)
+                    .help(cap.localizedDescription)
                 }
                 Spacer(minLength: 0)
             }
 
             // Telemetry Counters Row
             HStack(spacing: 10) {
-                Text("Calls \(status.invocationCount)")
+                Text(localizer.L("Calls \(status.invocationCount)", "调用 \(status.invocationCount)"))
                     .font(RackTheme.monoSmallFont)
                     .monospacedDigit()
                     .foregroundStyle(RackTheme.inkSecondary)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
 
-                Text("Blocks \(status.blockedActionsCount)")
+                Text(localizer.L("Blocks \(status.blockedActionsCount)", "拦截 \(status.blockedActionsCount)"))
                     .font(RackTheme.monoSmallFont)
                     .monospacedDigit()
                     .foregroundStyle(status.blockedActionsCount > 0 ? RackTheme.dropCrimson : RackTheme.inkMuted)
@@ -682,6 +698,7 @@ private struct PluginModuleCard: View {
 }
 
 private struct MachinedTogglePill: View {
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     let isOn: Bool
     let action: () -> Void
 
@@ -689,7 +706,7 @@ private struct MachinedTogglePill: View {
         Button(action: action) {
             HStack(spacing: 4) {
                 if isOn {
-                    Text("ON")
+                    Text(localizer.L("ON", "启用"))
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                         .foregroundStyle(RackTheme.linkGreen)
                         .lineLimit(1)
@@ -699,7 +716,7 @@ private struct MachinedTogglePill: View {
                     .fill(isOn ? RackTheme.linkGreen : RackTheme.inkMuted)
                     .frame(width: 8, height: 8)
                 if !isOn {
-                    Text("OFF")
+                    Text(localizer.L("OFF", "停用"))
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                         .foregroundStyle(RackTheme.inkMuted)
                         .lineLimit(1)

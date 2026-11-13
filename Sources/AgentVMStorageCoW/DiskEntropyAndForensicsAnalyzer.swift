@@ -37,6 +37,25 @@ public enum DetectedFilesystemKind: String, Codable, Hashable, Sendable, CaseIte
         }
     }
 
+    @MainActor
+    public var localizedDisplayName: String {
+        switch self {
+        case .ext4: return L("Linux ext4 Filesystem", "Linux ext4 文件系统")
+        case .ext3: return L("Linux ext3 Journaling FS", "Linux ext3 日志文件系统")
+        case .ext2: return L("Linux ext2 Filesystem", "Linux ext2 文件系统")
+        case .fat32EFI: return L("FAT32 / UEFI System Partition", "FAT32 / UEFI 系统分区")
+        case .fat16: return L("FAT16 / VFAT Volume", "FAT16 / VFAT 卷")
+        case .xfs: return L("SGI / Linux XFS", "SGI / Linux XFS 文件系统")
+        case .btrfs: return L("Btrfs Copy-on-Write FS", "Btrfs 写时复制文件系统")
+        case .linuxSwap: return L("Linux Swap Space (v2)", "Linux 交换分区 (v2)")
+        case .apfsContainer: return L("Apple APFS Container (NXSB)", "Apple APFS 容器 (NXSB)")
+        case .luksEncrypted: return L("LUKS Encrypted Volume", "LUKS 加密卷")
+        case .iso9660: return L("ISO-9660 Optical / Cloud-Init", "ISO-9660 光盘 / Cloud-Init")
+        case .qcow2: return L("QEMU QCOW2 Container", "QEMU QCOW2 镜像容器")
+        case .unknown: return L("Unformatted / Raw Blocks", "未格式化 / 原始数据块")
+        }
+    }
+
     public var sfSymbolName: String {
         switch self {
         case .ext4, .ext3, .ext2, .xfs, .btrfs:

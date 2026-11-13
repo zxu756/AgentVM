@@ -36,7 +36,12 @@ public struct AgentVMCLIRunner: Sendable {
         arguments: [String],
         bundleURLOverride: URL? = nil
     ) async -> CLIExecutionOutcome {
-        var args = arguments
+        if let cliLang = AppLanguage.extractCLILanguage(from: arguments) {
+            await MainActor.run {
+                AgentVMLocalizer.shared.setLanguage(cliLang, persist: false)
+            }
+        }
+        var args = AppLanguage.strippingLanguageArguments(from: arguments)
         var resolvedBundleURL = bundleURLOverride ?? Self.defaultWorkspaceBundleURL()
 
         // Extract global --workspace <path> option if provided
@@ -336,6 +341,9 @@ public struct AgentVMCLIRunner: Sendable {
     }
 
     private func runExportHTML(coordinator: AgentVMFleetCoordinator, args: [String]) async throws -> CLIExecutionOutcome {
+        if args.contains("--seed-demo") {
+            try await coordinator.seedIndustrialDemonstrationFleetIfEmpty()
+        }
         let outPath = args.first(where: { !$0.hasPrefix("-") }) ?? "fleet-audit-report.html"
         let exporter = HtmlFleetReportExporter()
         let html = try await exporter.renderStandaloneHTML(coordinator: coordinator)
@@ -364,7 +372,11 @@ public struct AgentVMCLIRunner: Sendable {
         AgentVM v\(SemanticVersion.current.description) — Apple Silicon MicroVM Sandbox, APFS CoW & L2 DPI Engine
 
         USAGE:
-          agentvm [--workspace <bundle.agentvm>] <subcommand> [options]
+          agentvm [--workspace <bundle.agentvm>] [--lang <zh|en>] <subcommand> [options]
+
+        GLOBAL OPTIONS:
+          --workspace, -w <bundle.agentvm>  Select target .agentvm bundle directory
+          --lang <zh|en>                    Select interface language (zh-Hans or English; GUI + screenshot exporter)
 
         SUBCOMMANDS:
           doctor                          Probe Apple Virtualization, APFS clonefile & Rosetta readiness

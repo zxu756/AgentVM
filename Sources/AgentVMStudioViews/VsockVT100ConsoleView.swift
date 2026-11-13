@@ -7,6 +7,7 @@ import SwiftUI
 
 public struct VsockVT100ConsoleView: View {
     @ObservedObject public var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     private struct QuickGuestProbe: Identifiable {
         let label: String
@@ -48,12 +49,12 @@ public struct VsockVT100ConsoleView: View {
     private var consoleProbeHeaderBar: some View {
         HStack(spacing: 8) {
             RackStatusPill(
-                label: "AVM1 VSOCK MUX · CRC32",
+                label: localizer.L("AVM1 VSOCK MUX · CRC32", "AVM1 VSOCK 多路复用 · CRC32"),
                 color: RackTheme.vsockBlue,
                 monospaced: true
             )
 
-            Text("Quick Probes:")
+            Text(localizer.L("Quick Probes:", "快捷探测:"))
                 .font(RackTheme.labelFont)
                 .foregroundStyle(RackTheme.inkMuted)
                 .lineLimit(1)
@@ -87,7 +88,7 @@ public struct VsockVT100ConsoleView: View {
             Button {
                 viewModel.clearTerminalScreen()
             } label: {
-                Label("Clear TTY", systemImage: "trash")
+                Label(localizer.L("Clear TTY", "清空终端"), systemImage: "trash")
             }
             .buttonStyle(RackActionButtonStyle(prominence: .subtleGhost, compact: true))
         }
@@ -100,12 +101,17 @@ public struct VsockVT100ConsoleView: View {
         let vp = viewModel.viewportSnapshot
 
         return RackPanelContainer(
-            title: "VT100 / Xterm-256Color Guest Console",
-            subtitle: "\(vp.columns)x\(vp.rows) cells · Cursor (\(vp.cursorRow), \(vp.cursorColumn)) · Scrollback \(vp.scrollbackLineCount) lines",
+            title: localizer.L("VT100 / Xterm-256Color Guest Console", "VT100 / Xterm-256 色客户机终端"),
+            subtitle: localizer.L(
+                "\(vp.columns)x\(vp.rows) cells · Cursor (\(vp.cursorRow), \(vp.cursorColumn)) · Scrollback \(vp.scrollbackLineCount) lines",
+                "\(vp.columns)x\(vp.rows) 字符格 · 光标 (\(vp.cursorRow), \(vp.cursorColumn)) · 回滚 \(vp.scrollbackLineCount) 行"
+            ),
             symbolName: "terminal.fill",
             headerTrailing: {
                 RackStatusPill(
-                    label: vp.isAlternateScreenActive ? "ALT SCREEN" : "PRIMARY TTY",
+                    label: vp.isAlternateScreenActive
+                        ? localizer.L("ALT SCREEN", "备用屏幕")
+                        : localizer.L("PRIMARY TTY", "主终端缓冲区"),
                     color: RackTheme.linkGreen,
                     monospaced: true
                 )
@@ -145,7 +151,10 @@ public struct VsockVT100ConsoleView: View {
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
 
-                        TextField("Enter guest command over Vsock RPC...", text: $viewModel.consoleCommandInput)
+                        TextField(
+                            localizer.L("Enter guest command over Vsock RPC...", "通过 Vsock RPC 输入要在客户机执行的命令..."),
+                            text: $viewModel.consoleCommandInput
+                        )
                             .textFieldStyle(.plain)
                             .font(RackTheme.monoFont)
                             .foregroundStyle(RackTheme.inkPrimary)
@@ -156,7 +165,7 @@ public struct VsockVT100ConsoleView: View {
                         Button {
                             viewModel.executeCurrentConsoleCommand()
                         } label: {
-                            Label("Exec RPC", systemImage: "paperplane.fill")
+                            Label(localizer.L("Exec RPC", "执行 RPC"), systemImage: "paperplane.fill")
                         }
                         .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
                     }
@@ -277,13 +286,13 @@ public struct VsockVT100ConsoleView: View {
     private var portForwardsAndExecAuditRail: some View {
         VStack(spacing: 8) {
             RackPanelContainer(
-                title: "Port-Forward Relays",
-                subtitle: "Loopback TCP <-> Vsock CID 3",
+                title: localizer.L("Port-Forward Relays", "端口转发中继"),
+                subtitle: localizer.L("Loopback TCP <-> Vsock CID 3", "本地回环 TCP <-> Vsock CID 3"),
                 symbolName: "arrow.left.arrow.right.circle"
             ) {
                 let bindings = effectivePortForwardRows()
                 if bindings.isEmpty {
-                    Text("No active port-forward bindings on this blade.")
+                    Text(localizer.L("No active port-forward bindings on this blade.", "当前刀片暂无活跃端口转发绑定。"))
                         .font(RackTheme.captionFont)
                         .foregroundStyle(RackTheme.inkMuted)
                 } else {
@@ -323,8 +332,11 @@ public struct VsockVT100ConsoleView: View {
             }
 
             RackPanelContainer(
-                title: "Guest Exec Audit Ledger",
-                subtitle: "\(viewModel.execResults.count) audited RPC invocations",
+                title: localizer.L("Guest Exec Audit Ledger", "客户机命令审计账本"),
+                subtitle: localizer.L(
+                    "\(viewModel.execResults.count) audited RPC invocations",
+                    "已审计 \(viewModel.execResults.count) 次 RPC 调用"
+                ),
                 symbolName: "checklist.checked"
             ) {
                 ScrollView {
@@ -378,7 +390,7 @@ public struct VsockVT100ConsoleView: View {
         return VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 RackStatusPill(
-                    label: "EXIT \(res.exitCode)",
+                    label: localizer.L("EXIT \(res.exitCode)", "退出码 \(res.exitCode)"),
                     color: badgeColor,
                     monospaced: true
                 )
@@ -389,7 +401,11 @@ public struct VsockVT100ConsoleView: View {
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 if res.preCheckpointSnapshotID != nil {
-                    RackStatusPill(label: "AUTO-SNAP", color: RackTheme.checkpointGold, monospaced: true)
+                    RackStatusPill(
+                        label: localizer.L("AUTO-SNAP", "自动快照"),
+                        color: RackTheme.checkpointGold,
+                        monospaced: true
+                    )
                 }
             }
 
@@ -410,7 +426,7 @@ public struct VsockVT100ConsoleView: View {
                 Button {
                     viewModel.restoreSnapshot(snapID)
                 } label: {
-                    Label("Rewind Pre-Exec CoW", systemImage: "clock.arrow.circlepath")
+                    Label(localizer.L("Rewind Pre-Exec CoW", "回滚至执行前快照"), systemImage: "clock.arrow.circlepath")
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
             }

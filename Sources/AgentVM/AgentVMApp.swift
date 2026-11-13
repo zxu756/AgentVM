@@ -23,8 +23,13 @@ enum AgentVMEntryPoint {
 
     static func main() async {
         let rawArgs = Array(CommandLine.arguments.dropFirst())
+        if let cliLanguage = AppLanguage.extractCLILanguage(from: rawArgs) {
+            await MainActor.run {
+                AgentVMLocalizer.shared.setLanguage(cliLanguage, persist: false)
+            }
+        }
 
-        // 1. Deterministic 2x Retina Offscreen Screenshot Exporter (`--export-screenshots <output-dir>`)
+        // 1. Deterministic 2x Retina Offscreen Screenshot Exporter (`--export-screenshots <output-dir> [--lang zh|en]`)
         if let exportDir = extractScreenshotExportDirectory(from: rawArgs) {
             do {
                 try await exportAllRetinaScreenshots(to: exportDir)
@@ -90,13 +95,14 @@ enum AgentVMEntryPoint {
     }
 
     private static func extractMCPServerInvocation(from args: [String]) -> URL? {
+        let stripped = AppLanguage.strippingLanguageArguments(from: args)
         var resolvedURL = AgentVMCLIRunner.defaultWorkspaceBundleURL()
         var idx = 0
         var sawMCP = false
-        while idx < args.count {
-            let token = args[idx]
-            if (token == "--workspace" || token == "-w"), idx + 1 < args.count {
-                resolvedURL = URL(fileURLWithPath: args[idx + 1], isDirectory: true)
+        while idx < stripped.count {
+            let token = stripped[idx]
+            if (token == "--workspace" || token == "-w"), idx + 1 < stripped.count {
+                resolvedURL = URL(fileURLWithPath: stripped[idx + 1], isDirectory: true)
                 idx += 2
             } else if token == "mcp" {
                 sawMCP = true
@@ -109,9 +115,10 @@ enum AgentVMEntryPoint {
     }
 
     private static func isCLIInvocation(_ args: [String]) -> Bool {
-        guard !args.isEmpty else { return false }
+        let stripped = AppLanguage.strippingLanguageArguments(from: args)
+        guard !stripped.isEmpty else { return false }
         // Ignore macOS LaunchServices / Xcode runtime arguments when launching GUI
-        let filtered = args.filter { arg in
+        let filtered = stripped.filter { arg in
             !arg.hasPrefix("-psn_")
                 && arg != "-NSDocumentRevisionsDebugMode"
                 && arg != "YES"
@@ -169,7 +176,8 @@ enum AgentVMEntryPoint {
         // Hydrate 3 VMs, CoW branches, snapshots, L2 dissected packets, ext4 superblocks, ISO-9660 & 4 JS plugins
         let hydrated = try await viewModel.buildHydratedSnapshot()
         viewModel.hydrateSynchronously(from: hydrated)
-        viewModel.manifest.title = "Sandbox Fleet"
+        viewModel.manifest.title = L("Sandbox Fleet", "沙盒集群")
+        viewModel.refreshLocalizedChrome()
 
         let logicalWidth: CGFloat = 1360
         let logicalHeight: CGFloat = 840
@@ -270,7 +278,8 @@ enum AgentVMEntryPoint {
                 pngData = encoded
             }
 
-            let fileURL = outputDirectoryURL.appendingPathComponent(scenario.rawValue)
+            let filename = scenario.localizedFilename(for: AgentVMLocalizer.shared.language)
+            let fileURL = outputDirectoryURL.appendingPathComponent(filename)
             try pngData.write(to: fileURL, options: [.atomic])
             FileHandle.standardOutput.write(
                 Data("Exported \(fileURL.path) (\(pixelWidth)x\(pixelHeight) px)\n".utf8)

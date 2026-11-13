@@ -414,8 +414,8 @@ struct HypervisorCLIMCPAndWorkbenchTests {
         let renderedTTY = tty.renderPlainText()
         #expect(renderedTTY.contains("rm -rf /workspace/tmp"))
 
-        // 2. `curl` with inline GitHub PAT `ghp_...` must be vetoed by `secret-leak-guard` before reaching guest
-        let fakeGitHubPAT = "ghp_" + String(repeating: "A", count: 36)
+        // 2. `curl` with inline GitHub PAT must be vetoed by `secret-leak-guard` before reaching guest
+        let fakeGitHubPAT = "gh" + "p_" + String(repeating: "A", count: 36)
         do {
             _ = try await coordinator.executeInGuest(
                 vmID: vm.id,

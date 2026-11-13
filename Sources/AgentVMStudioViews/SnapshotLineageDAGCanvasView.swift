@@ -7,6 +7,7 @@ import SwiftUI
 
 public struct SnapshotLineageDAGCanvasView: View {
     @ObservedObject public var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     @State private var showQuickForkBar: Bool = false
     @State private var customBranchName: String = "agy-verify-patch"
@@ -64,25 +65,31 @@ public struct SnapshotLineageDAGCanvasView: View {
 
         return HStack(spacing: 8) {
             RackMetricTile(
-                label: "Active Blades",
-                value: "\(viewModel.runningVMCount) / \(viewModel.vms.count) Live",
-                detail: String(format: "%d vCPU · %.0f GB Pool", totalVCPUs, totalRAMGB),
+                label: localizer.L("Active Blades", "活跃刀片"),
+                value: localizer.L("\(viewModel.runningVMCount) / \(viewModel.vms.count) Live", "\(viewModel.runningVMCount) / \(viewModel.vms.count) 运行中"),
+                detail: localizer.L(
+                    String(format: "%d vCPU · %.0f GB Pool", totalVCPUs, totalRAMGB),
+                    String(format: "%d 核 vCPU · %.0f GB 内存池", totalVCPUs, totalRAMGB)
+                ),
                 accent: RackTheme.linkGreen
             )
             RackMetricTile(
-                label: "Snapshot Nodes",
-                value: "\(viewModel.snapshots.count) Nodes",
-                detail: "\(branchCount) CoW Branch Lanes",
+                label: localizer.L("Snapshot Nodes", "快照节点"),
+                value: localizer.L("\(viewModel.snapshots.count) Nodes", "\(viewModel.snapshots.count) 个节点"),
+                detail: localizer.L("\(branchCount) CoW Branch Lanes", "\(branchCount) 条 CoW 分支通道"),
                 accent: RackTheme.vsockBlue
             )
             RackMetricTile(
-                label: "CoW Space Saved",
+                label: localizer.L("CoW Space Saved", "CoW 节省空间"),
                 value: String(format: "%.1f%%", viewModel.fleetCoWSpaceSavedPercent),
-                detail: "\(ByteMetricsFormatter.formatBytes(viewModel.totalDirtyCoWBytes)) Dirty Delta",
+                detail: localizer.L(
+                    "\(ByteMetricsFormatter.formatBytes(viewModel.totalDirtyCoWBytes)) Dirty Delta",
+                    "\(ByteMetricsFormatter.formatBytes(viewModel.totalDirtyCoWBytes)) 脏块增量"
+                ),
                 accent: RackTheme.amberAccent
             )
             RackMetricTile(
-                label: "Branch Fork Latency",
+                label: localizer.L("Branch Fork Latency", "分支克隆延迟"),
                 value: String(format: "%.1f ms", viewModel.lastForkLatencyMs),
                 detail: "APFS clonefile(2)",
                 accent: RackTheme.checkpointGold
@@ -98,12 +105,15 @@ public struct SnapshotLineageDAGCanvasView: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(RackTheme.amberAccent)
 
-            Text("Fork CoW Branch from \(viewModel.selectedVM?.spec.name ?? "blade"):")
+            Text(localizer.L(
+                "Fork CoW Branch from \(viewModel.selectedVM?.spec.name ?? "blade"):",
+                "从 \(viewModel.selectedVM?.spec.name ?? "刀片") 分叉 CoW 分支:"
+            ))
                 .font(RackTheme.labelFont)
                 .foregroundStyle(RackTheme.inkPrimary)
                 .lineLimit(1)
 
-            TextField("branch-name", text: $customBranchName)
+            TextField(localizer.L("branch-name", "分支名称"), text: $customBranchName)
                 .textFieldStyle(.plain)
                 .font(RackTheme.monoSmallFont)
                 .foregroundStyle(RackTheme.inkPrimary)
@@ -119,7 +129,7 @@ public struct SnapshotLineageDAGCanvasView: View {
                         .strokeBorder(RackTheme.hairlineStrong, lineWidth: 1)
                 )
 
-            TextField("agent-owner", text: $customAgentTag)
+            TextField(localizer.L("agent-owner", "所属智能体"), text: $customAgentTag)
                 .textFieldStyle(.plain)
                 .font(RackTheme.monoSmallFont)
                 .foregroundStyle(RackTheme.amberAccent)
@@ -144,11 +154,11 @@ public struct SnapshotLineageDAGCanvasView: View {
                 )
                 showQuickForkBar = false
             } label: {
-                Label("Clone Now", systemImage: "bolt.fill")
+                Label(localizer.L("Clone Now", "立即克隆"), systemImage: "bolt.fill")
             }
             .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
 
-            Button("Cancel") {
+            Button(localizer.L("Cancel", "取消")) {
                 showQuickForkBar = false
             }
             .buttonStyle(RackActionButtonStyle(prominence: .subtleGhost, compact: true))
@@ -171,27 +181,27 @@ public struct SnapshotLineageDAGCanvasView: View {
 
     private var dagCanvasPanel: some View {
         RackPanelContainer(
-            title: "APFS CoW Lineage DAG",
+            title: localizer.L("APFS CoW Lineage DAG", "APFS CoW 血缘拓扑图"),
             subtitle: nil,
             symbolName: "point.3.connected.trianglepath.dotted",
             headerTrailing: {
                 HStack(spacing: 6) {
                     if let dag = viewModel.dagValidationReport, dag.orphanParentReferences.isEmpty {
-                        RackStatusPill(label: "DAG ACYCLIC", color: RackTheme.linkGreen, monospaced: true)
+                        RackStatusPill(label: localizer.L("DAG ACYCLIC", "无环校验通过"), color: RackTheme.linkGreen, monospaced: true)
                     }
                     Button {
                         withAnimation(.easeOut(duration: 0.16)) {
                             showQuickForkBar.toggle()
                         }
                     } label: {
-                        Label("Fork CoW", systemImage: "arrow.triangle.branch")
+                        Label(localizer.L("Fork CoW", "分叉 CoW"), systemImage: "arrow.triangle.branch")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
 
                     Button {
                         viewModel.captureCheckpoint()
                     } label: {
-                        Label("Checkpoint", systemImage: "camera.metering.matrix")
+                        Label(localizer.L("Checkpoint", "捕获快照"), systemImage: "camera.metering.matrix")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                 }
@@ -411,17 +421,17 @@ public struct SnapshotLineageDAGCanvasView: View {
 
             HStack(spacing: 4) {
                 if snap.hasLiveRAMState {
-                    miniTag("RAM", color: RackTheme.linkGreen)
+                    miniTag(localizer.L("RAM", "内存"), color: RackTheme.linkGreen)
                 } else {
                     miniTag(shortKindBadge(snap.kind), color: laneColor)
                 }
 
                 if vmHeadMatches {
-                    miniTag("HEAD", color: RackTheme.amberAccent)
+                    miniTag(localizer.L("HEAD", "当前"), color: RackTheme.amberAccent)
                 } else if isLCA {
-                    miniTag("LCA", color: RackTheme.checkpointGold)
+                    miniTag(localizer.L("LCA", "祖先"), color: RackTheme.checkpointGold)
                 } else if isCompareTarget {
-                    miniTag("DIFF", color: RackTheme.vsockBlue)
+                    miniTag(localizer.L("DIFF", "对比"), color: RackTheme.vsockBlue)
                 }
 
                 Spacer(minLength: 2)
@@ -464,21 +474,21 @@ public struct SnapshotLineageDAGCanvasView: View {
             viewModel.selectSnapshotForInspection(snap.id)
         }
         .contextMenu {
-            Button("Inspect Snapshot") {
+            Button(localizer.L("Inspect Snapshot", "检视快照详情")) {
                 viewModel.selectSnapshotForInspection(snap.id)
             }
-            Button("Compare LCA Diff Against Selected") {
+            Button(localizer.L("Compare LCA Diff Against Selected", "与当前选中快照对比 LCA 差异")) {
                 viewModel.setComparisonSnapshot(snap.id)
             }
             Divider()
-            Button("Restore Blade to This Snapshot") {
+            Button(localizer.L("Restore Blade to This Snapshot", "将刀片恢复至此快照")) {
                 viewModel.restoreSnapshot(snap.id)
             }
-            Button(snap.isPinned ? "Unpin Snapshot" : "Pin Snapshot") {
+            Button(snap.isPinned ? localizer.L("Unpin Snapshot", "取消固定快照") : localizer.L("Pin Snapshot", "固定快照")) {
                 viewModel.togglePinSnapshot(snap.id)
             }
             if !snap.isPinned {
-                Button("Delete Snapshot", role: .destructive) {
+                Button(localizer.L("Delete Snapshot", "删除快照"), role: .destructive) {
                     viewModel.deleteSnapshot(snap.id)
                 }
             }
@@ -506,8 +516,8 @@ public struct SnapshotLineageDAGCanvasView: View {
 
     private var lcaDiffAndNodeInspectorPanel: some View {
         RackPanelContainer(
-            title: "Compare LCA Diff",
-            subtitle: "LCA Delta",
+            title: localizer.L("Compare LCA Diff", "LCA 差异对比"),
+            subtitle: localizer.L("LCA Delta", "血缘增量"),
             symbolName: "arrow.left.and.right.righttriangle.left.righttriangle.right"
         ) {
             ScrollView {
@@ -521,7 +531,10 @@ public struct SnapshotLineageDAGCanvasView: View {
                     if let diff = viewModel.currentLCADiff {
                         lcaDiffSummarySection(diff)
                     } else {
-                        Text("Select two snapshots across branches to compute their Lowest Common Ancestor and 64 KiB block divergence.")
+                        Text(localizer.L(
+                            "Select two snapshots across branches to compute their Lowest Common Ancestor and 64 KiB block divergence.",
+                            "跨分支选择两个快照节点，即可计算最近公共祖先 (LCA) 与 64 KiB 数据块差异。"
+                        ))
                             .font(RackTheme.captionFont)
                             .foregroundStyle(RackTheme.inkMuted)
                             .padding(8)
@@ -540,18 +553,18 @@ public struct SnapshotLineageDAGCanvasView: View {
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 RackStatusPill(
-                    label: snap.hasLiveRAMState ? "LIVE RAM" : shortKindBadge(snap.kind),
+                    label: snap.hasLiveRAMState ? localizer.L("LIVE RAM", "实时内存") : shortKindBadge(snap.kind),
                     color: snap.hasLiveRAMState ? RackTheme.linkGreen : RackTheme.amberAccent,
                     monospaced: true
                 )
             }
 
             VStack(spacing: 4) {
-                compactKV("Branch Lane", shortenBranchLabel(snap.branchName, maxChars: 24))
-                compactKV("Virtual / Dirty", "\(ByteMetricsFormatter.formatBytes(snap.virtualDiskBytes)) / \(ByteMetricsFormatter.formatBytes(snap.dirtyDeltaBytes))")
-                compactKV("Saved Ratio", String(format: "%.1f%% CoW", snap.spaceSavingsPercent))
+                compactKV(localizer.L("Branch Lane", "分支通道"), shortenBranchLabel(snap.branchName, maxChars: 24))
+                compactKV(localizer.L("Virtual / Dirty", "虚拟 / 脏块"), "\(ByteMetricsFormatter.formatBytes(snap.virtualDiskBytes)) / \(ByteMetricsFormatter.formatBytes(snap.dirtyDeltaBytes))")
+                compactKV(localizer.L("Saved Ratio", "节省比例"), String(format: "%.1f%% CoW", snap.spaceSavingsPercent))
                 if let cmd = snap.triggerCommand, !cmd.isEmpty {
-                    compactKV("Trigger Exec", compactCommandSummary(cmd))
+                    compactKV(localizer.L("Trigger Exec", "触发命令"), compactCommandSummary(cmd))
                 }
             }
 
@@ -559,14 +572,17 @@ public struct SnapshotLineageDAGCanvasView: View {
                 Button {
                     viewModel.restoreSnapshot(snap.id)
                 } label: {
-                    Label("Restore", systemImage: "clock.arrow.circlepath")
+                    Label(localizer.L("Restore", "恢复"), systemImage: "clock.arrow.circlepath")
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
 
                 Button {
                     viewModel.togglePinSnapshot(snap.id)
                 } label: {
-                    Label(snap.isPinned ? "Pinned" : "Pin", systemImage: snap.isPinned ? "pin.slash" : "pin")
+                    Label(
+                        snap.isPinned ? localizer.L("Pinned", "已固定") : localizer.L("Pin", "固定"),
+                        systemImage: snap.isPinned ? "pin.slash" : "pin"
+                    )
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
 
@@ -587,7 +603,7 @@ public struct SnapshotLineageDAGCanvasView: View {
     private var comparisonTargetPickerRow: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text("Compare Target")
+                Text(localizer.L("Compare Target", "对比目标"))
                     .font(RackTheme.labelFont)
                     .foregroundStyle(RackTheme.amberAccent)
                     .lineLimit(1)
@@ -601,7 +617,7 @@ public struct SnapshotLineageDAGCanvasView: View {
                 } label: {
                     HStack(spacing: 4) {
                         let targetSnap = viewModel.snapshots.first(where: { $0.id == viewModel.comparisonSnapshotID })
-                        Text(targetSnap.map { shortenBranchLabel($0.branchName, maxChars: 16) } ?? "Select Node")
+                        Text(targetSnap.map { shortenBranchLabel($0.branchName, maxChars: 16) } ?? localizer.L("Select Node", "选择节点"))
                             .font(RackTheme.monoSmallFont)
                             .foregroundStyle(RackTheme.vsockBlue)
                             .lineLimit(1)
@@ -624,7 +640,7 @@ public struct SnapshotLineageDAGCanvasView: View {
 
     private func lcaDiffSummarySection(_ diff: SnapshotDiffReport) -> some View {
         let lcaLabel: String = {
-            guard let lcaID = diff.lowestCommonAncestorID else { return "Disjoint Roots" }
+            guard let lcaID = diff.lowestCommonAncestorID else { return localizer.L("Disjoint Roots", "独立根节点") }
             if let node = viewModel.snapshots.first(where: { $0.id == lcaID }) {
                 return compactSnapshotTitle(node, maxChars: 18)
             }
@@ -633,9 +649,21 @@ public struct SnapshotLineageDAGCanvasView: View {
 
         return VStack(alignment: .leading, spacing: 8) {
             VStack(spacing: 4) {
-                compactKV("LCA Ancestor", lcaLabel)
-                compactKV("Hop Distance", "L:\(diff.ancestorDistanceLeft) · R:\(diff.ancestorDistanceRight) hops")
-                compactKV("Divergent Data", "\(diff.divergentBlockCount) blks (\(ByteMetricsFormatter.formatBytes(diff.divergentBytes)))")
+                compactKV(localizer.L("LCA Ancestor", "最近公共祖先"), lcaLabel)
+                compactKV(
+                    localizer.L("Hop Distance", "拓扑跳数"),
+                    localizer.L(
+                        "L:\(diff.ancestorDistanceLeft) · R:\(diff.ancestorDistanceRight) hops",
+                        "左:\(diff.ancestorDistanceLeft) · 右:\(diff.ancestorDistanceRight) 跳"
+                    )
+                )
+                compactKV(
+                    localizer.L("Divergent Data", "差异数据块"),
+                    localizer.L(
+                        "\(diff.divergentBlockCount) blks (\(ByteMetricsFormatter.formatBytes(diff.divergentBytes)))",
+                        "\(diff.divergentBlockCount) 块 (\(ByteMetricsFormatter.formatBytes(diff.divergentBytes)))"
+                    )
+                )
             }
             .padding(8)
             .background(
@@ -648,7 +676,7 @@ public struct SnapshotLineageDAGCanvasView: View {
             )
 
             if !diff.configDiffs.isEmpty {
-                Text("VMSpec Field Deltas (\(diff.configDiffs.count))")
+                Text(localizer.L("VMSpec Field Deltas (\(diff.configDiffs.count))", "虚拟机配置差异 (\(diff.configDiffs.count))"))
                     .font(RackTheme.labelFont)
                     .foregroundStyle(RackTheme.inkSecondary)
                     .lineLimit(1)
@@ -688,7 +716,7 @@ public struct SnapshotLineageDAGCanvasView: View {
             }
 
             if !diff.divergentExtents.isEmpty {
-                Text("Divergent Disk Extents (\(diff.divergentExtents.count))")
+                Text(localizer.L("Divergent Disk Extents (\(diff.divergentExtents.count))", "差异磁盘区间 (\(diff.divergentExtents.count))"))
                     .font(RackTheme.labelFont)
                     .foregroundStyle(RackTheme.inkSecondary)
                     .lineLimit(1)
@@ -894,35 +922,31 @@ public struct SnapshotLineageDAGCanvasView: View {
     }
 
     private func shortKindBadge(_ kind: SnapshotKind) -> String {
-        switch kind {
-        case .baseGoldenImage: return "BASE"
-        case .coldDiskOnly: return "DISK"
-        case .liveMemoryAndDisk: return "LIVE"
-        case .branchForkPoint: return "FORK"
-        case .autoPreCommandCheckpoint: return "AUTO"
-        case .budgetCircuitBreaker: return "HALT"
-        }
+        kind.localizedShortBadge
     }
 
     private func compactSnapshotTitle(_ snap: SnapshotNode, maxChars: Int = 20) -> String {
         let raw = snap.title
         if raw.hasPrefix("Golden Base") {
-            return "Golden Base"
+            return localizer.L("Golden Base", "黄金基线镜像")
         }
         if raw.hasPrefix("Branch Fork -> ") {
             let target = String(raw.dropFirst("Branch Fork -> ".count))
-            if target.contains("claude") { return "Fork: claude-auth" }
-            if target.contains("codex") { return "Fork: codex-fuzz" }
-            return shortenBranchLabel("Fork: \(target)", maxChars: maxChars)
+            if target.contains("claude") { return localizer.L("Fork: claude-auth", "分叉: claude") }
+            if target.contains("codex") { return localizer.L("Fork: codex-fuzz", "分叉: codex") }
+            return shortenBranchLabel(localizer.L("Fork: \(target)", "分叉: \(target)"), maxChars: maxChars)
         }
         if raw.hasPrefix("CoW Head (") {
-            return "CoW Branch Head"
+            return localizer.L("CoW Branch Head", "CoW 分支头")
         }
         if raw.localizedCaseInsensitiveContains("Pre-Migration") {
-            return "Pre-Migration RAM"
+            return localizer.L("Pre-Migration RAM", "迁移前内存点")
         }
         if raw.hasPrefix("Auto-checkpoint before ") || raw.localizedCaseInsensitiveContains("Recursive") {
-            return "Pre-Exec: rm -rf"
+            return localizer.L("Pre-Exec: rm -rf", "执行前: rm -rf")
+        }
+        if raw == "Operator Live Checkpoint" {
+            return localizer.L("Live Checkpoint", "手动内存快照")
         }
         return shortenBranchLabel(raw, maxChars: maxChars)
     }

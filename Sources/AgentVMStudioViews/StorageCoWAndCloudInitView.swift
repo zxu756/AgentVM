@@ -7,6 +7,7 @@ import SwiftUI
 
 public struct StorageCoWAndCloudInitView: View {
     @ObservedObject public var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     private let cloudInitTabNames = ["user-data", "network-config", "meta-data", "vendor-data"]
 
@@ -50,27 +51,27 @@ public struct StorageCoWAndCloudInitView: View {
 
         return HStack(spacing: 8) {
             RackMetricTile(
-                label: "Virtual Capacity",
+                label: localizer.L("Virtual Capacity", "虚拟磁盘容量"),
                 value: ByteMetricsFormatter.formatBytes(vSize),
-                detail: "\(fsKind) · \(partCount) GPT Partitions",
+                detail: localizer.L("\(fsKind) · \(partCount) GPT Partitions", "\(fsKind) · \(partCount) 个 GPT 分区"),
                 accent: RackTheme.inkPrimary
             )
             RackMetricTile(
-                label: "Sparse Holes",
+                label: localizer.L("Sparse Holes", "稀疏空洞区"),
                 value: ByteMetricsFormatter.formatBytes(holes),
-                detail: "SEEK_HOLE Zero-Alloc",
+                detail: localizer.L("SEEK_HOLE Zero-Alloc", "SEEK_HOLE 零物理分配"),
                 accent: RackTheme.linkGreen
             )
             RackMetricTile(
-                label: "Shared Parent Blocks",
+                label: localizer.L("Shared Parent Blocks", "共享父镜像块"),
                 value: ByteMetricsFormatter.formatBytes(shared),
-                detail: "Inherited CoW Extents",
+                detail: localizer.L("Inherited CoW Extents", "继承自父快照数据块"),
                 accent: RackTheme.vsockBlue
             )
             RackMetricTile(
-                label: "Unique CoW Dirty",
+                label: localizer.L("Unique CoW Dirty", "独有 CoW 脏块"),
                 value: ByteMetricsFormatter.formatBytes(dirty),
-                detail: "Diverged Child Blocks",
+                detail: localizer.L("Diverged Child Blocks", "子分支差异写入块"),
                 accent: RackTheme.amberAccent
             )
         }
@@ -80,14 +81,14 @@ public struct StorageCoWAndCloudInitView: View {
 
     private var apfsExtentAllocationPanel: some View {
         RackPanelContainer(
-            title: "APFS Extent Allocation Map",
+            title: localizer.L("APFS Extent Allocation Map", "APFS 区间分配图"),
             subtitle: nil,
             symbolName: "internaldrive.fill",
             headerTrailing: {
                 Button {
                     viewModel.compactSelectedVMDiskZeroBlocks()
                 } label: {
-                    Label("Punch Zero Holes", systemImage: "scissors")
+                    Label(localizer.L("Punch Zero Holes", "回收零块空洞"), systemImage: "scissors")
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
             },
@@ -118,7 +119,7 @@ public struct StorageCoWAndCloudInitView: View {
                         )
                     }
                 } else {
-                    Text("Select a sandbox VM blade to scan APFS sparse extents.")
+                    Text(localizer.L("Select a sandbox VM blade to scan APFS sparse extents.", "选择任意沙盒刀片以扫描 APFS 稀疏区间。"))
                         .font(RackTheme.captionFont)
                         .foregroundStyle(RackTheme.inkMuted)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -161,11 +162,11 @@ public struct StorageCoWAndCloudInitView: View {
 
     private func extentLegendRow(alloc: DiskAllocationSummary) -> some View {
         HStack(spacing: 12) {
-            legendSwatch(label: "Sparse Holes", color: colorForExtent(.sparseHole))
-            legendSwatch(label: "Shared Parent Blocks", color: colorForExtent(.allocatedClean))
-            legendSwatch(label: "Unique CoW Dirty", color: colorForExtent(.allocatedDirty))
+            legendSwatch(label: localizer.L("Sparse Holes", "稀疏空洞"), color: colorForExtent(.sparseHole))
+            legendSwatch(label: localizer.L("Shared Parent Blocks", "共享父块"), color: colorForExtent(.allocatedClean))
+            legendSwatch(label: localizer.L("Unique CoW Dirty", "独有脏块"), color: colorForExtent(.allocatedDirty))
             Spacer(minLength: 4)
-            Text("Blk \(alloc.filesystemBlockSize) B")
+            Text(localizer.L("Blk \(alloc.filesystemBlockSize) B", "块 \(alloc.filesystemBlockSize) B"))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(RackTheme.inkMuted)
@@ -193,11 +194,11 @@ public struct StorageCoWAndCloudInitView: View {
 
     private var extentTableHeader: some View {
         HStack(spacing: 8) {
-            Text("Byte Offset")
+            Text(localizer.L("Byte Offset", "字节偏移"))
                 .frame(width: 96, alignment: .leading)
-            Text("Length")
+            Text(localizer.L("Length", "区间长度"))
                 .frame(width: 78, alignment: .trailing)
-            Text("Extent Class")
+            Text(localizer.L("Extent Class", "区间类型"))
                 .frame(width: 128, alignment: .leading)
             Text("CRC-32")
                 .frame(maxWidth: .infinity, alignment: .trailing)
@@ -217,9 +218,9 @@ public struct StorageCoWAndCloudInitView: View {
         }()
         let pillText: String = {
             switch ext.kind {
-            case .sparseHole: return "SPARSE HOLE"
-            case .allocatedClean: return "SHARED PARENT"
-            case .allocatedDirty: return "COW DIRTY"
+            case .sparseHole: return localizer.L("SPARSE HOLE", "稀疏空洞")
+            case .allocatedClean: return localizer.L("SHARED PARENT", "共享父块")
+            case .allocatedDirty: return localizer.L("COW DIRTY", "CoW 脏块")
             }
         }()
 
@@ -267,13 +268,16 @@ public struct StorageCoWAndCloudInitView: View {
 
     private var diskForensicsAndEntropyPanel: some View {
         RackPanelContainer(
-            title: "Superblock & Shannon Entropy Forensics",
+            title: localizer.L("Superblock & Shannon Entropy Forensics", "超级块与香农熵取证"),
             subtitle: nil,
             symbolName: "waveform.badge.magnifyingglass",
             headerTrailing: {
                 if let report = viewModel.diskForensics {
                     RackStatusPill(
-                        label: String(format: "PEAK %.2f b/B", report.peakBlockEntropyBits),
+                        label: localizer.L(
+                            String(format: "PEAK %.2f b/B", report.peakBlockEntropyBits),
+                            String(format: "峰值 %.2f b/B", report.peakBlockEntropyBits)
+                        ),
                         color: RackTheme.checkpointGold,
                         monospaced: true
                     )
@@ -286,13 +290,19 @@ public struct StorageCoWAndCloudInitView: View {
                         entropyHeatmapStrip(samples: report.entropyHeatmapSamples)
 
                         HStack(spacing: 12) {
-                            Text(String(format: "Mean Allocated H(X): %.2f bits/B", report.overallAllocatedEntropyBits))
+                            Text(localizer.L(
+                                String(format: "Mean Allocated H(X): %.2f bits/B", report.overallAllocatedEntropyBits),
+                                String(format: "已分配块平均熵 H(X): %.2f bits/B", report.overallAllocatedEntropyBits)
+                            ))
                                 .font(RackTheme.monoSmallFont)
                                 .monospacedDigit()
                                 .foregroundStyle(RackTheme.inkSecondary)
                                 .lineLimit(1)
                             Spacer(minLength: 4)
-                            Text("Format: \(report.containerSummary.format.rawValue)")
+                            Text(localizer.L(
+                                "Format: \(report.containerSummary.format.rawValue)",
+                                "格式: \(report.containerSummary.format.rawValue)"
+                            ))
                                 .font(RackTheme.monoSmallFont)
                                 .foregroundStyle(RackTheme.amberAccent)
                                 .lineLimit(1)
@@ -305,7 +315,7 @@ public struct StorageCoWAndCloudInitView: View {
                                         Image(systemName: fs.kind.sfSymbolName)
                                             .font(.system(size: 10.5, weight: .semibold))
                                             .foregroundStyle(RackTheme.linkGreen)
-                                        Text(fs.kind.displayName)
+                                        Text(fs.kind.localizedDisplayName)
                                             .font(.system(size: 11, weight: .semibold))
                                             .foregroundStyle(RackTheme.inkPrimary)
                                             .lineLimit(1)
@@ -326,7 +336,11 @@ public struct StorageCoWAndCloudInitView: View {
 
                                 ForEach(report.containerSummary.partitions) { part in
                                     HStack(spacing: 6) {
-                                        RackStatusPill(label: "GPT #\(part.index)", color: RackTheme.vsockBlue, monospaced: true)
+                                        RackStatusPill(
+                                            label: localizer.L("GPT #\(part.index)", "GPT 分区 #\(part.index)"),
+                                            color: RackTheme.vsockBlue,
+                                            monospaced: true
+                                        )
                                         Text(part.name)
                                             .font(.system(size: 11, weight: .semibold))
                                             .foregroundStyle(RackTheme.inkPrimary)
@@ -350,7 +364,7 @@ public struct StorageCoWAndCloudInitView: View {
                         }
                     }
                 } else {
-                    Text("No forensics telemetry available.")
+                    Text(localizer.L("No forensics telemetry available.", "暂无取证遥测数据。"))
                         .font(RackTheme.captionFont)
                         .foregroundStyle(RackTheme.inkMuted)
                 }
@@ -401,18 +415,22 @@ public struct StorageCoWAndCloudInitView: View {
 
     private var noCloudISO9660StudioPanel: some View {
         RackPanelContainer(
-            title: "NoCloud 'cidata' ISO-9660 Studio",
+            title: localizer.L("NoCloud 'cidata' ISO-9660 Studio", "NoCloud 'cidata' ISO-9660 工坊"),
             subtitle: nil,
             symbolName: "opticaldisc.fill",
             headerTrailing: {
                 HStack(spacing: 6) {
                     if let iso = viewModel.isoInspection, iso.hasRockRidgeSUSP {
-                        RackStatusPill(label: "ROCK RIDGE SUSP", color: RackTheme.linkGreen, monospaced: true)
+                        RackStatusPill(
+                            label: localizer.L("ROCK RIDGE SUSP", "ROCK RIDGE 扩展"),
+                            color: RackTheme.linkGreen,
+                            monospaced: true
+                        )
                     }
                     Button {
                         viewModel.rebuildCloudInitISOForSelectedVM()
                     } label: {
-                        Label("Rebuild ISO", systemImage: "arrow.triangle.2.circlepath")
+                        Label(localizer.L("Rebuild ISO", "重构镜像"), systemImage: "arrow.triangle.2.circlepath")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
                 }
@@ -421,7 +439,7 @@ public struct StorageCoWAndCloudInitView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     // Quick Hostname & Default User Inline Editor
                     HStack(spacing: 8) {
-                        Text("Hostname:")
+                        Text(localizer.L("Hostname:", "主机名:"))
                             .font(RackTheme.captionFont)
                             .foregroundStyle(RackTheme.inkMuted)
                             .lineLimit(1)
@@ -442,7 +460,7 @@ public struct StorageCoWAndCloudInitView: View {
                                     .strokeBorder(RackTheme.hairlineStrong, lineWidth: 1)
                             )
 
-                        Text("User:")
+                        Text(localizer.L("User:", "默认用户:"))
                             .font(RackTheme.captionFont)
                             .foregroundStyle(RackTheme.inkMuted)
                             .lineLimit(1)
@@ -525,25 +543,28 @@ public struct StorageCoWAndCloudInitView: View {
     private func isoVolumeMetadataBanner(_ iso: ISOInspectionReport) -> some View {
         let totalBytes = UInt64(iso.volumeSpaceBlocks) * UInt64(iso.logicalBlockSize)
         return HStack(spacing: 10) {
-            Text("VolID: \(iso.volumeIdentifier)")
+            Text(localizer.L("VolID: \(iso.volumeIdentifier)", "卷标: \(iso.volumeIdentifier)"))
                 .font(RackTheme.monoBoldFont)
                 .foregroundStyle(RackTheme.amberAccent)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-            Text("Sector: \(iso.logicalBlockSize) B")
+            Text(localizer.L("Sector: \(iso.logicalBlockSize) B", "扇区: \(iso.logicalBlockSize) B"))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(RackTheme.inkSecondary)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-            Text("Sectors: \(iso.volumeSpaceBlocks) (\(ByteMetricsFormatter.formatBytes(totalBytes)))")
+            Text(localizer.L(
+                "Sectors: \(iso.volumeSpaceBlocks) (\(ByteMetricsFormatter.formatBytes(totalBytes)))",
+                "扇区数: \(iso.volumeSpaceBlocks) (\(ByteMetricsFormatter.formatBytes(totalBytes)))"
+            ))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(RackTheme.inkSecondary)
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
             Spacer(minLength: 4)
-            Text("L-Path LBA \(iso.typeLPathTableLBA)")
+            Text(localizer.L("L-Path LBA \(iso.typeLPathTableLBA)", "路径表 LBA \(iso.typeLPathTableLBA)"))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(RackTheme.vsockBlue)
@@ -565,15 +586,15 @@ public struct StorageCoWAndCloudInitView: View {
     private func rockRidgeEntriesTable(_ iso: ISOInspectionReport) -> some View {
         VStack(spacing: 2) {
             HStack(spacing: 8) {
-                Text("Rock Ridge NM")
+                Text(localizer.L("Rock Ridge NM", "Rock Ridge 文件名"))
                     .frame(width: 112, alignment: .leading)
-                Text("ISO 8.3 ID")
+                Text(localizer.L("ISO 8.3 ID", "ISO 8.3 标识"))
                     .frame(width: 96, alignment: .leading)
-                Text("Sector LBA")
+                Text(localizer.L("Sector LBA", "起始扇区"))
                     .frame(width: 72, alignment: .trailing)
-                Text("Mode")
+                Text(localizer.L("Mode", "权限"))
                     .frame(width: 48, alignment: .trailing)
-                Text("Size")
+                Text(localizer.L("Size", "大小"))
                     .frame(width: 62, alignment: .trailing)
                 Text("SHA-256")
                     .frame(maxWidth: .infinity, alignment: .trailing)

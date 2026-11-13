@@ -4,6 +4,7 @@ import SwiftUI
 // MARK: - Left Collapsible Fleet & CoW Lineage Navigator Rail
 
 public struct FleetNavigatorRailView: View {
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     public let vms: [VMInstanceRecord]
     public let snapshots: [SnapshotNode]
     public let selectedVMID: VMID?
@@ -47,7 +48,7 @@ public struct FleetNavigatorRailView: View {
                 Image(systemName: "server.rack")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(RackTheme.amberAccent)
-                Text("Sandbox Fleet")
+                Text(localizer.L("Sandbox Fleet", "沙盒集群"))
                     .font(RackTheme.sectionHeaderFont)
                     .foregroundStyle(RackTheme.inkPrimary)
                     .lineLimit(1)
@@ -58,6 +59,7 @@ public struct FleetNavigatorRailView: View {
                         .font(.system(size: 11, weight: .semibold))
                 }
                 .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
+                .help(localizer.L("Provision New Sandbox VM (⌘N)", "新建沙盒虚拟机 (⌘N)"))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -66,7 +68,7 @@ public struct FleetNavigatorRailView: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 11))
                     .foregroundStyle(RackTheme.inkMuted)
-                TextField("Filter blades or agents...", text: $filterText)
+                TextField(localizer.L("Filter blades or agents", "筛选刀片或智能体"), text: $filterText)
                     .textFieldStyle(.plain)
                     .font(RackTheme.captionFont)
                     .foregroundStyle(RackTheme.inkPrimary)
@@ -110,6 +112,7 @@ public struct FleetNavigatorRailView: View {
     }
 
     private struct FleetBladeRowCard: View {
+        @ObservedObject private var localizer = AgentVMLocalizer.shared
         let vm: VMInstanceRecord
         let snapshotCount: Int
         let isSelected: Bool
@@ -132,7 +135,7 @@ public struct FleetNavigatorRailView: View {
 
                     Spacer(minLength: 4)
 
-                    Text(vm.telemetry.state.badgeLabel)
+                    Text(vm.telemetry.state.localizedBadge)
                         .font(RackTheme.monoSmallFont)
                         .foregroundStyle(RackTheme.signalColor(for: vm.telemetry.state))
                         .lineLimit(1)
@@ -154,7 +157,7 @@ public struct FleetNavigatorRailView: View {
 
                     Spacer(minLength: 0)
 
-                    Text("\(snapshotCount) snaps")
+                    Text(localizer.L("\(snapshotCount) snaps", "\(snapshotCount) 快照"))
                         .font(RackTheme.monoSmallFont)
                         .monospacedDigit()
                         .foregroundStyle(RackTheme.inkMuted)
@@ -185,7 +188,7 @@ public struct FleetNavigatorRailView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(RackTheme.amberAccent)
-                    .help("Instant APFS CoW Branch")
+                    .help(localizer.L("Instant APFS CoW Branch", "即时 APFS CoW 分叉"))
 
                     Button(action: onToggleRun) {
                         Image(systemName: vm.telemetry.state == .running ? "pause.fill" : "play.fill")
@@ -193,7 +196,7 @@ public struct FleetNavigatorRailView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(vm.telemetry.state == .running ? RackTheme.checkpointGold : RackTheme.linkGreen)
-                    .help("Start or Pause VM")
+                    .help(localizer.L("Start or Pause VM", "启动或暂停虚拟机"))
                 }
             }
             .padding(.horizontal, 10)
@@ -216,6 +219,7 @@ public struct FleetNavigatorRailView: View {
 // MARK: - Right Hardware & Security Topology Inspector Rail
 
 public struct VMHardwareInspectorRailView: View {
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     public let vm: VMInstanceRecord?
     public let activePortForwardsCount: Int
     public let onSnapshotNow: () -> Void
@@ -239,7 +243,7 @@ public struct VMHardwareInspectorRailView: View {
                 Image(systemName: "slider.horizontal.below.rectangle")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(RackTheme.amberAccent)
-                Text("Blade Inspector")
+                Text(localizer.L("Blade Inspector", "刀片检查器"))
                     .font(RackTheme.sectionHeaderFont)
                     .foregroundStyle(RackTheme.inkPrimary)
                     .lineLimit(1)
@@ -264,12 +268,12 @@ public struct VMHardwareInspectorRailView: View {
                                     .lineLimit(1)
                                 Spacer()
                                 RackStatusPill(
-                                    label: vm.telemetry.state.badgeLabel,
+                                    label: vm.telemetry.state.localizedBadge,
                                     color: RackTheme.signalColor(for: vm.telemetry.state),
                                     monospaced: true
                                 )
                             }
-                            Text(vm.spec.guestOS.displayName)
+                            Text(vm.spec.guestOS.localizedDisplayName)
                                 .font(RackTheme.captionFont)
                                 .foregroundStyle(RackTheme.inkSecondary)
                                 .lineLimit(1)
@@ -277,49 +281,49 @@ public struct VMHardwareInspectorRailView: View {
 
                         HStack(spacing: 6) {
                             Button(action: onForkCoW) {
-                                Label("Fork CoW", systemImage: "arrow.triangle.branch")
+                                Label(localizer.L("Fork CoW", "分叉 CoW"), systemImage: "arrow.triangle.branch")
                             }
                             .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
 
                             Button(action: onSnapshotNow) {
-                                Label("Checkpoint", systemImage: "camera.metering.matrix")
+                                Label(localizer.L("Checkpoint", "捕获快照"), systemImage: "camera.metering.matrix")
                             }
                             .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                         }
 
-                        inspectorGroup(title: "Compute & Memory") {
-                            kvRow("vCPU Topology", "\(vm.spec.compute.vcpuCount) Apple VZ Cores")
-                            kvRow("Allocated RAM", "\(vm.spec.compute.memoryMB) MB")
-                            kvRow("Resident RSS", "\(vm.telemetry.memoryResidentMB) MB")
-                            kvRow("Balloon Reclaim", "\(vm.telemetry.balloonReclaimedMB) MB")
-                            kvRow("Guest Agent", vm.telemetry.guestAgentConnected ? "AVM1 Connected" : "Standby")
+                        inspectorGroup(title: localizer.L("Compute & Memory", "计算与内存")) {
+                            kvRow(localizer.L("vCPU Topology", "vCPU 拓扑"), localizer.L("\(vm.spec.compute.vcpuCount) Apple VZ Cores", "\(vm.spec.compute.vcpuCount) 核 Apple VZ"))
+                            kvRow(localizer.L("Allocated RAM", "分配内存"), "\(vm.spec.compute.memoryMB) MB")
+                            kvRow(localizer.L("Resident RSS", "常驻内存"), "\(vm.telemetry.memoryResidentMB) MB")
+                            kvRow(localizer.L("Balloon Reclaim", "气球回收"), "\(vm.telemetry.balloonReclaimedMB) MB")
+                            kvRow(localizer.L("Guest Agent", "客户机代理"), vm.telemetry.guestAgentConnected ? localizer.L("AVM1 Connected", "AVM1 已连接") : localizer.L("Standby", "待命"))
                         }
 
-                        inspectorGroup(title: "APFS Storage & VirtioFS") {
-                            kvRow("Block Volumes", "\(vm.spec.blockDevices.count) attached")
-                            kvRow("Dirty CoW Delta", ByteMetricsFormatter.formatBytes(vm.telemetry.cowDirtyBytes))
-                            kvRow("Disk Read / Write", "\(ByteMetricsFormatter.formatBytes(vm.telemetry.diskReadBytesTotal)) / \(ByteMetricsFormatter.formatBytes(vm.telemetry.diskWriteBytesTotal))")
+                        inspectorGroup(title: localizer.L("APFS Storage & VirtioFS", "APFS 存储与 VirtioFS")) {
+                            kvRow(localizer.L("Block Volumes", "块存储卷"), localizer.L("\(vm.spec.blockDevices.count) attached", "\(vm.spec.blockDevices.count) 块已挂载"))
+                            kvRow(localizer.L("Dirty CoW Delta", "CoW 脏块"), ByteMetricsFormatter.formatBytes(vm.telemetry.cowDirtyBytes))
+                            kvRow(localizer.L("Disk Read / Write", "磁盘读写"), "\(ByteMetricsFormatter.formatBytes(vm.telemetry.diskReadBytesTotal)) / \(ByteMetricsFormatter.formatBytes(vm.telemetry.diskWriteBytesTotal))")
                             ForEach(vm.spec.virtioFSMounts) { mount in
-                                kvRow("Mount [\(mount.mountTag)]", mount.guestMountPoint)
+                                kvRow(localizer.L("Mount [\(mount.mountTag)]", "挂载 [\(mount.mountTag)]"), mount.guestMountPoint)
                             }
                         }
 
-                        inspectorGroup(title: "L2 Switch & Vsock Tunnels") {
+                        inspectorGroup(title: localizer.L("L2 Switch & Vsock Tunnels", "二层交换与 Vsock 隧道")) {
                             if let nic = vm.spec.networkInterfaces.first {
-                                kvRow("NIC Mode", nic.mode == .userSpaceSwitch ? "User-Space L2 DPI" : nic.mode.rawValue)
-                                kvRow("Guest IPv4", nic.ipv4Address)
-                                kvRow("Guest MAC", nic.macAddress)
+                                kvRow(localizer.L("NIC Mode", "网卡模式"), nic.mode.localizedInspectorBadge)
+                                kvRow(localizer.L("Guest IPv4", "客户机 IPv4"), nic.ipv4Address)
+                                kvRow(localizer.L("Guest MAC", "客户机 MAC"), nic.macAddress)
                             }
-                            kvRow("Active TCP Flows", "\(vm.telemetry.activeTCPFlows)")
-                            kvRow("Firewall Drops", "\(vm.telemetry.firewallDroppedPackets) pkts")
-                            kvRow("Port Forwards", "\(activePortForwardsCount) bound")
+                            kvRow(localizer.L("Active TCP Flows", "活跃 TCP 流"), "\(vm.telemetry.activeTCPFlows)")
+                            kvRow(localizer.L("Firewall Drops", "防火墙拦截"), localizer.L("\(vm.telemetry.firewallDroppedPackets) pkts", "\(vm.telemetry.firewallDroppedPackets) 帧"))
+                            kvRow(localizer.L("Port Forwards", "端口转发"), localizer.L("\(activePortForwardsCount) bound", "\(activePortForwardsCount) 已绑定"))
                         }
                     }
                     .padding(12)
                 }
             } else {
                 VStack(spacing: 6) {
-                    Text("No virtual machine selected")
+                    Text(localizer.L("No virtual machine selected", "未选择虚拟机"))
                         .font(RackTheme.labelFont)
                         .foregroundStyle(RackTheme.inkMuted)
                 }
@@ -370,6 +374,7 @@ public struct VMHardwareInspectorRailView: View {
 // MARK: - Bottom 4-Channel Workbench Drawer
 
 public struct WorkbenchBottomDrawerView: View {
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     @Binding public var activeChannel: BottomDrawerChannel
     public let serialLines: [String]
     public let diagnostics: [DiagnosticEvent]
@@ -414,7 +419,7 @@ public struct WorkbenchBottomDrawerView: View {
                     Button {
                         activeChannel = channel
                     } label: {
-                        Text(channel.rawValue)
+                        Text(channel.localizedTitle)
                             .font(RackTheme.labelFont)
                             .foregroundStyle(selected ? RackTheme.inkPrimary : RackTheme.inkMuted)
                             .lineLimit(1)
@@ -433,13 +438,13 @@ public struct WorkbenchBottomDrawerView: View {
 
                 if activeChannel == .undoHistory {
                     Button(action: onUndo) {
-                        Label("Undo", systemImage: "arrow.uturn.backward")
+                        Label(localizer.L("Undo", "撤销"), systemImage: "arrow.uturn.backward")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                     .disabled(undoTitles.isEmpty)
 
                     Button(action: onRedo) {
-                        Label("Redo", systemImage: "arrow.uturn.forward")
+                        Label(localizer.L("Redo", "重做"), systemImage: "arrow.uturn.forward")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                     .disabled(redoTitles.isEmpty)
@@ -475,7 +480,7 @@ public struct WorkbenchBottomDrawerView: View {
                         ForEach(diagnostics.prefix(40)) { event in
                             HStack(spacing: 8) {
                                 RackStatusPill(
-                                    label: event.severity.rawValue.uppercased(),
+                                    label: event.severity.localizedBadge,
                                     color: RackTheme.severityColor(for: event.severity),
                                     monospaced: true
                                 )
@@ -484,7 +489,7 @@ public struct WorkbenchBottomDrawerView: View {
                                     .foregroundStyle(RackTheme.amberAccent)
                                     .lineLimit(1)
                                     .fixedSize(horizontal: true, vertical: false)
-                                Text(event.message)
+                                Text(event.localizedMessage)
                                     .font(RackTheme.captionFont)
                                     .foregroundStyle(RackTheme.inkPrimary)
                                     .lineLimit(1)
@@ -493,7 +498,10 @@ public struct WorkbenchBottomDrawerView: View {
                         }
                     case .undoHistory:
                         if undoTitles.isEmpty && redoTitles.isEmpty {
-                            Text("Undo journal clean — perform any VM, Snapshot, or Policy mutation to record reversible transactions.")
+                            Text(localizer.L(
+                                "Undo journal clean — perform any VM, Snapshot, or Policy mutation to record reversible transactions.",
+                                "撤销日志为空 — 执行任意虚拟机、快照或防火墙策略变更后将自动记录可逆事务。"
+                            ))
                                 .font(RackTheme.captionFont)
                                 .foregroundStyle(RackTheme.inkMuted)
                         } else {

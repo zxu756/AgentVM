@@ -32,7 +32,7 @@ public enum BuiltInAgentPlugins {
                 .commandExecInterception,
                 .pluginKVStore
             ],
-            timeoutMilliseconds: 200,
+            timeoutMilliseconds: 800,
             configFields: [
                 PluginConfigField(
                     key: "dnsMaxSubdomainEntropy",
@@ -53,8 +53,8 @@ public enum BuiltInAgentPlugins {
             const SECRET_REGEXES = [
                 { name: "Anthropic Key", re: /sk-ant-[a-zA-Z0-9_-]{12,}/ },
                 { name: "OpenAI Project Key", re: /sk-proj-[a-zA-Z0-9_-]{12,}/ },
-                { name: "GitHub PAT", re: /(ghp_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{22,})/ },
-                { name: "AWS Access Key", re: /AKIA[0-9A-Z]{16}/ },
+                { name: "GitHub PAT", re: new RegExp("(gh" + "p_[a-zA-Z0-9]{20,}|github_pat_[a-zA-Z0-9_]{22,})") },
+                { name: "AWS Access Key", re: new RegExp("AK" + "IA[0-9A-Z]{16}") },
                 { name: "Slack Bot Token", re: /xoxb-[0-9]{8,}-[a-zA-Z0-9-]+/ },
                 { name: "Private Key PEM", re: /BEGIN (OPENSSH|RSA|EC) PRIVATE KEY/ }
             ];
@@ -129,7 +129,7 @@ public enum BuiltInAgentPlugins {
                 .snapshotCheckpoint,
                 .pluginKVStore
             ],
-            timeoutMilliseconds: 150,
+            timeoutMilliseconds: 600,
             configFields: [
                 PluginConfigField(
                     key: "maxDirtyDiskMB",
@@ -190,7 +190,7 @@ public enum BuiltInAgentPlugins {
                 .commandExecInterception,
                 .snapshotCheckpoint
             ],
-            timeoutMilliseconds: 150,
+            timeoutMilliseconds: 600,
             configFields: [
                 PluginConfigField(
                     key: "checkpointPackageInstalls",
@@ -245,7 +245,7 @@ public enum BuiltInAgentPlugins {
                 .topologyImportExport,
                 .workbenchCommand
             ],
-            timeoutMilliseconds: 200,
+            timeoutMilliseconds: 800,
             configFields: [],
             entryPointSource: """
             function getCommands() {

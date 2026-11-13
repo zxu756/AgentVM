@@ -7,6 +7,7 @@ import SwiftUI
 
 public struct FirewallPolicyStudioView: View {
     @ObservedObject public var viewModel: AgentVMStudioViewModel
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
 
     @State private var showAddRuleComposer: Bool = false
     @State private var newRuleSNIGlob: String = "*.huggingface.co"
@@ -49,7 +50,7 @@ public struct FirewallPolicyStudioView: View {
 
     private var presetAndLintHeaderBar: some View {
         HStack(spacing: 7) {
-            Text("Preset:")
+            Text(localizer.L("Preset:", "预设:"))
                 .font(RackTheme.labelFont)
                 .foregroundStyle(RackTheme.inkMuted)
                 .lineLimit(1)
@@ -58,7 +59,7 @@ public struct FirewallPolicyStudioView: View {
             Button {
                 viewModel.applyFirewallPreset(.strictAgentAllowlistPreset())
             } label: {
-                Label("Strict Allowlist", systemImage: "checkmark.shield")
+                Label(localizer.L("Strict Allowlist", "严格白名单"), systemImage: "checkmark.shield")
             }
             .buttonStyle(
                 RackActionButtonStyle(
@@ -70,7 +71,7 @@ public struct FirewallPolicyStudioView: View {
             Button {
                 viewModel.applyFirewallPreset(.airgappedPreset())
             } label: {
-                Label("Air-Gap Sandbox", systemImage: "wifi.slash")
+                Label(localizer.L("Air-Gap Sandbox", "气隙隔离"), systemImage: "wifi.slash")
             }
             .buttonStyle(
                 RackActionButtonStyle(
@@ -84,7 +85,7 @@ public struct FirewallPolicyStudioView: View {
                     showAddRuleComposer.toggle()
                 }
             } label: {
-                Label("Add SNI", systemImage: "plus")
+                Label(localizer.L("Add SNI", "添加 SNI"), systemImage: "plus")
             }
             .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
 
@@ -92,13 +93,13 @@ public struct FirewallPolicyStudioView: View {
 
             if viewModel.policyConflicts.isEmpty {
                 RackStatusPill(
-                    label: "0 SHADOW CONFLICTS",
+                    label: localizer.L("0 SHADOW CONFLICTS", "0 遮蔽冲突"),
                     color: RackTheme.linkGreen,
                     monospaced: true
                 )
             } else {
                 RackStatusPill(
-                    label: "\(viewModel.policyConflicts.count) CONFLICTS",
+                    label: localizer.L("\(viewModel.policyConflicts.count) CONFLICTS", "\(viewModel.policyConflicts.count) 处冲突"),
                     color: RackTheme.checkpointGold,
                     monospaced: true
                 )
@@ -108,7 +109,7 @@ public struct FirewallPolicyStudioView: View {
 
     private var addSNIRuleBar: some View {
         HStack(spacing: 8) {
-            Text("Allow TLS 443 SNI Glob:")
+            Text(localizer.L("Allow TLS 443 SNI Glob:", "放行 TLS 443 SNI 通配符:"))
                 .font(RackTheme.labelFont)
                 .foregroundStyle(RackTheme.inkPrimary)
                 .lineLimit(1)
@@ -130,13 +131,13 @@ public struct FirewallPolicyStudioView: View {
                         .strokeBorder(RackTheme.hairlineStrong, lineWidth: 1)
                 )
 
-            Button("Commit Rule") {
+            Button(localizer.L("Commit Rule", "提交规则")) {
                 viewModel.addFirewallAllowSNIRule(domainGlob: newRuleSNIGlob)
                 showAddRuleComposer = false
             }
             .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
 
-            Button("Cancel") {
+            Button(localizer.L("Cancel", "取消")) {
                 showAddRuleComposer = false
             }
             .buttonStyle(RackActionButtonStyle(prominence: .subtleGhost, compact: true))
@@ -188,16 +189,16 @@ public struct FirewallPolicyStudioView: View {
         let sortedRules = pol.rules.sorted { $0.priority < $1.priority }
 
         return RackPanelContainer(
-            title: "Priority L3/L4/L7 Egress Policy",
-            subtitle: "Default \(pol.defaultEgressVerdict.rawValue)",
+            title: localizer.L("Priority L3/L4/L7 Egress Policy", "L3/L4/L7 优先级出站策略"),
+            subtitle: localizer.L("Default \(pol.defaultEgressVerdict.rawValue)", "默认 \(pol.defaultEgressVerdict.localizedBadge)"),
             symbolName: "shield.lefthalf.filled",
             headerTrailing: {
                 HStack(spacing: 6) {
                     if pol.blockPrivateMetadataIPs {
-                        RackStatusPill(label: "IMDS GUARD ON", color: RackTheme.amberAccent, monospaced: true)
+                        RackStatusPill(label: localizer.L("IMDS GUARD ON", "元数据防护"), color: RackTheme.amberAccent, monospaced: true)
                     }
                     RackStatusPill(
-                        label: "\(viewModel.firewallMetrics.evaluatedPacketsTotal) PKTS",
+                        label: localizer.L("\(viewModel.firewallMetrics.evaluatedPacketsTotal) PKTS", "\(viewModel.firewallMetrics.evaluatedPacketsTotal) 帧"),
                         color: RackTheme.vsockBlue,
                         monospaced: true
                     )
@@ -209,7 +210,10 @@ public struct FirewallPolicyStudioView: View {
                         Image(systemName: "lock.shield.fill")
                             .font(.system(size: 18))
                             .foregroundStyle(RackTheme.dropCrimson)
-                        Text("Zero-Egress Air-Gap Active — All external L3/L4 packets default to DROP.")
+                        Text(localizer.L(
+                            "Zero-Egress Air-Gap Active — All external L3/L4 packets default to DROP.",
+                            "全气隙零出站模式已启用 — 所有外部 L3/L4 流量默认丢弃。"
+                        ))
                             .font(RackTheme.labelFont)
                             .foregroundStyle(RackTheme.inkSecondary)
                             .lineLimit(1)
@@ -252,7 +256,7 @@ public struct FirewallPolicyStudioView: View {
                     Circle()
                         .fill(rule.enabled ? RackTheme.linkGreen : RackTheme.inkMuted)
                         .frame(width: 6.5, height: 6.5)
-                    Text(rule.enabled ? "ON" : "OFF")
+                    Text(rule.enabled ? localizer.L("ON", "启用") : localizer.L("OFF", "停用"))
                         .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                         .foregroundStyle(rule.enabled ? RackTheme.linkGreen : RackTheme.inkMuted)
                         .lineLimit(1)
@@ -279,7 +283,7 @@ public struct FirewallPolicyStudioView: View {
                 .frame(width: 34, alignment: .leading)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(rule.name)
+                Text(rule.localizedName)
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(rule.enabled ? RackTheme.inkPrimary : RackTheme.inkMuted)
                     .lineLimit(1)
@@ -291,7 +295,7 @@ public struct FirewallPolicyStudioView: View {
                         .lineLimit(1)
 
                     if let kbps = rule.rateLimitKbps {
-                        Text("cap \(kbps / 1000) Mbps")
+                        Text(localizer.L("cap \(kbps / 1000) Mbps", "限速 \(kbps / 1000) Mbps"))
                             .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                             .foregroundStyle(RackTheme.checkpointGold)
                             .lineLimit(1)
@@ -302,7 +306,7 @@ public struct FirewallPolicyStudioView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             RackStatusPill(
-                label: rule.verdict.rawValue,
+                label: rule.verdict.localizedBadge,
                 color: rule.enabled ? vColor : RackTheme.inkMuted,
                 monospaced: true
             )
@@ -323,14 +327,14 @@ public struct FirewallPolicyStudioView: View {
 
     private var interactivePolicySimulatorPanel: some View {
         RackPanelContainer(
-            title: "Dry-Run Packet Policy Simulator",
-            subtitle: "Dry-Run Trace",
+            title: localizer.L("Dry-Run Packet Policy Simulator", "报文策略干跑模拟器"),
+            subtitle: localizer.L("Dry-Run Trace", "逐条追踪"),
             symbolName: "waveform.and.magnifyingglass",
             headerTrailing: {
                 HStack(spacing: 5) {
                     scenarioPresetButton("GitHub", proto: .tls, ip: "140.82.121.6", port: "443", sni: "api.github.com", dns: "")
                     scenarioPresetButton("SSRF", proto: .http, ip: "169.254.169.254", port: "80", sni: "", dns: "")
-                    scenarioPresetButton("Sinkhole", proto: .dns, ip: "10.211.55.1", port: "53", sni: "", dns: "exfil.webhook.site")
+                    scenarioPresetButton(localizer.L("Sinkhole", "DNS 黑洞"), proto: .dns, ip: "10.211.55.1", port: "53", sni: "", dns: "exfil.webhook.site")
                 }
             },
             content: {
@@ -350,19 +354,19 @@ public struct FirewallPolicyStudioView: View {
                             viewModel.runFirewallDryRunSimulation()
                         }
 
-                        simTextField(placeholder: "Dst IP", text: $viewModel.simDestinationIP, width: 114)
-                        simTextField(placeholder: "Port", text: $viewModel.simDestinationPort, width: 54)
+                        simTextField(placeholder: localizer.L("Dst IP", "目的 IP"), text: $viewModel.simDestinationIP, width: 114)
+                        simTextField(placeholder: localizer.L("Port", "端口"), text: $viewModel.simDestinationPort, width: 54)
 
                         if viewModel.simProtocol == .dns {
-                            simTextField(placeholder: "DNS Query Domain", text: $viewModel.simDNSQuery, width: nil)
+                            simTextField(placeholder: localizer.L("DNS Query Domain", "DNS 查询域名"), text: $viewModel.simDNSQuery, width: nil)
                         } else {
-                            simTextField(placeholder: "TLS SNI / Hostname", text: $viewModel.simTLSSNI, width: nil)
+                            simTextField(placeholder: localizer.L("TLS SNI / Hostname", "TLS SNI / 主机名"), text: $viewModel.simTLSSNI, width: nil)
                         }
 
                         Button {
                             viewModel.runFirewallDryRunSimulation()
                         } label: {
-                            Label("Trace", systemImage: "play.fill")
+                            Label(localizer.L("Trace", "追踪"), systemImage: "play.fill")
                         }
                         .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
                     }
@@ -372,7 +376,7 @@ public struct FirewallPolicyStudioView: View {
                         let winColor = RackTheme.verdictColor(for: trace.finalVerdict)
                         HStack(spacing: 8) {
                             RackStatusPill(
-                                label: "VERDICT: \(trace.finalVerdict.rawValue)",
+                                label: localizer.L("VERDICT: \(trace.finalVerdict.rawValue)", "判定: \(trace.finalVerdict.localizedBadge)"),
                                 color: winColor,
                                 monospaced: true
                             )
@@ -467,14 +471,14 @@ public struct FirewallPolicyStudioView: View {
                 .lineLimit(1)
                 .frame(width: 30, alignment: .leading)
 
-            Text(step.ruleName)
+            Text(FirewallRule.localizeRuleTitle(step.ruleName))
                 .font(.system(size: 11, weight: step.matched ? .semibold : .regular))
                 .foregroundStyle(step.matched ? RackTheme.inkPrimary : RackTheme.inkSecondary)
                 .lineLimit(1)
 
             Spacer(minLength: 6)
 
-            Text(step.matched ? "MATCH" : "SKIP")
+            Text(step.matched ? localizer.L("MATCH", "命中") : localizer.L("SKIP", "跳过"))
                 .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                 .foregroundStyle(hitColor)
                 .lineLimit(1)
@@ -496,13 +500,25 @@ public struct FirewallPolicyStudioView: View {
 
     private func compactTraceReason(_ text: String) -> String {
         if text.contains("Allow GitHub TLS") {
-            return "Rule P40 · Allow GitHub TLS (*.github.com)"
+            return localizer.L(
+                "Rule P40 · Allow GitHub TLS (*.github.com)",
+                "规则 P40 · 允许 GitHub TLS (*.github.com)"
+            )
         }
         if text.contains("169.254.169.254") {
-            return "Rule P30 · Block Cloud Instance Metadata SSRF"
+            return localizer.L(
+                "Rule P30 · Block Cloud Instance Metadata SSRF",
+                "规则 P30 · 阻断云实例元数据 SSRF"
+            )
         }
         if text.contains("Webhook") || text.contains("Sinkhole") {
-            return "Rule P70 · DNS Sinkhole Exfiltration Domain"
+            return localizer.L(
+                "Rule P70 · DNS Sinkhole Exfiltration Domain",
+                "规则 P70 · DNS 黑洞拦截外泄域名"
+            )
+        }
+        if text.contains("Default egress") || text.contains("default") {
+            return localizer.L(text, "未命中显式规则 · 应用默认出站策略")
         }
         if text.count <= 48 { return text }
         if let quoteEnd = text.firstIndex(of: "(") {

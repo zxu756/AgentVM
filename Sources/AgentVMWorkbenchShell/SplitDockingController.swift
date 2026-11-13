@@ -193,6 +193,7 @@ public final class SplitDockingController: ObservableObject {
 // MARK: - Docking Tab Strip Bar View
 
 public struct DockingTabStripBar: View {
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     public let tabs: [WorkbenchTabDescriptor]
     public let activeTabID: UUID?
     public let isSecondaryPane: Bool
@@ -230,6 +231,7 @@ public struct DockingTabStripBar: View {
                         let isSelected = tab.id == activeTabID
                         TabItemButton(
                             tab: tab,
+                            displayTitle: resolvedTabTitle(tab),
                             isSelected: isSelected,
                             canClose: !tab.isPinned && (isSecondaryPane || tabs.count > 1),
                             onSelect: { onSelect(tab.id) },
@@ -246,12 +248,12 @@ public struct DockingTabStripBar: View {
             HStack(spacing: 4) {
                 if splitMode == .singlePane && !isSecondaryPane {
                     Button(action: onSplitRight) {
-                        Label("Split View", systemImage: "rectangle.split.2x1")
+                        Label(localizer.L("Split View", "分屏视图"), systemImage: "rectangle.split.2x1")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .subtleGhost, compact: true))
                 } else if isSecondaryPane {
                     Button(action: onCollapseSplit) {
-                        Label("Unsplit", systemImage: "rectangle")
+                        Label(localizer.L("Unsplit", "取消分屏"), systemImage: "rectangle")
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .subtleGhost, compact: true))
                 }
@@ -267,8 +269,21 @@ public struct DockingTabStripBar: View {
         }
     }
 
+    private func resolvedTabTitle(_ tab: WorkbenchTabDescriptor) -> String {
+        let standardTitles: Set<String> = [
+            tab.kind.defaultTitle,
+            "Lineage DAG", "Wiretap", "Console", "Firewall", "Storage & ISO", "Plugins", "Fleet Matrix", "Audit Ledger",
+            "血缘拓扑", "二层抓包", "终端控制台", "防火墙策略", "存储与镜像", "JS 插件", "机架矩阵", "审计账本"
+        ]
+        if standardTitles.contains(tab.title) {
+            return tab.kind.localizedCompactTitle
+        }
+        return tab.title
+    }
+
     private struct TabItemButton: View {
         let tab: WorkbenchTabDescriptor
+        let displayTitle: String
         let isSelected: Bool
         let canClose: Bool
         let onSelect: () -> Void
@@ -281,7 +296,7 @@ public struct DockingTabStripBar: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(isSelected ? RackTheme.amberAccent : RackTheme.inkMuted)
 
-                Text(tab.title)
+                Text(displayTitle)
                     .font(RackTheme.labelFont)
                     .foregroundStyle(isSelected ? RackTheme.inkPrimary : RackTheme.inkSecondary)
                     .lineLimit(1)

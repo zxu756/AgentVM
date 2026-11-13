@@ -121,6 +121,7 @@ public struct WorkbenchToastStackOverlay: View {
 // MARK: - Bottom Telemetry Status Bar
 
 public struct WorkbenchTelemetryStatusBar: View {
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     public let hostCapabilities: HostCapabilityReport
     public let runningVMCount: Int
     public let totalVMCount: Int
@@ -165,7 +166,11 @@ public struct WorkbenchTelemetryStatusBar: View {
                 Circle()
                     .fill(hostCapabilities.isVirtualizationFrameworkSupported ? RackTheme.linkGreen : RackTheme.amberAccent)
                     .frame(width: 7, height: 7)
-                Text(hostCapabilities.isVirtualizationFrameworkSupported ? "Hypervisor: Apple VZ (\(hostCapabilities.architecture))" : "Hypervisor: Simulation Mode")
+                Text(
+                    hostCapabilities.isVirtualizationFrameworkSupported
+                        ? localizer.L("Hypervisor: Apple VZ (\(hostCapabilities.architecture))", "虚拟化: Apple VZ (\(hostCapabilities.architecture))")
+                        : localizer.L("Hypervisor: Simulation Mode", "虚拟化: 确定性模拟")
+                )
                     .font(RackTheme.monoSmallFont)
                     .foregroundStyle(RackTheme.inkPrimary)
                     .lineLimit(1)
@@ -174,7 +179,7 @@ public struct WorkbenchTelemetryStatusBar: View {
 
             statusDivider
 
-            Text("Fleet: \(runningVMCount)/\(totalVMCount) Active")
+            Text(localizer.L("Fleet: \(runningVMCount)/\(totalVMCount) Active", "集群: \(runningVMCount)/\(totalVMCount) 运行中"))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(RackTheme.inkSecondary)
@@ -183,7 +188,7 @@ public struct WorkbenchTelemetryStatusBar: View {
 
             statusDivider
 
-            Text("CoW Delta: \(ByteMetricsFormatter.formatBytes(totalDirtyCoWBytes))")
+            Text(localizer.L("CoW Delta: \(ByteMetricsFormatter.formatBytes(totalDirtyCoWBytes))", "CoW 增量: \(ByteMetricsFormatter.formatBytes(totalDirtyCoWBytes))"))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(RackTheme.amberAccent)
@@ -192,7 +197,7 @@ public struct WorkbenchTelemetryStatusBar: View {
 
             statusDivider
 
-            Text("Wiretap: \(capturedPacketCount) pkts (\(droppedPacketCount) dropped)")
+            Text(localizer.L("Wiretap: \(capturedPacketCount) pkts (\(droppedPacketCount) dropped)", "抓包: \(capturedPacketCount) 帧 (\(droppedPacketCount) 拦截)"))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(droppedPacketCount > 0 ? RackTheme.dropCrimson : RackTheme.inkSecondary)
@@ -201,7 +206,7 @@ public struct WorkbenchTelemetryStatusBar: View {
 
             statusDivider
 
-            Text("JS Plugins: \(activePluginsCount) enabled")
+            Text(localizer.L("JS Plugins: \(activePluginsCount) enabled", "JS 插件: \(activePluginsCount) 已启用"))
                 .font(RackTheme.monoSmallFont)
                 .monospacedDigit()
                 .foregroundStyle(RackTheme.vsockBlue)
@@ -211,13 +216,13 @@ public struct WorkbenchTelemetryStatusBar: View {
             Spacer(minLength: 8)
 
             Button(action: onToggleBottomDrawer) {
-                Label("Drawer", systemImage: "rectangle.bottomhalf.inset.filled")
+                Label(localizer.L("Drawer", "日志抽屉"), systemImage: "rectangle.bottomhalf.inset.filled")
             }
             .buttonStyle(RackActionButtonStyle(prominence: .subtleGhost, compact: true))
 
             Button(action: onOpenCommandPalette) {
                 HStack(spacing: 5) {
-                    Text("Command Palette")
+                    Text(localizer.L("Command Palette", "命令面板"))
                     RackKeyCapBadge("⌘K")
                 }
             }
@@ -243,6 +248,7 @@ public struct WorkbenchTelemetryStatusBar: View {
 // MARK: - Multi-Tab Preferences Window (Cmd+,)
 
 public struct WorkbenchPreferencesView: View {
+    @ObservedObject private var localizer = AgentVMLocalizer.shared
     @Binding public var preferences: WorkspacePreferences
     public let onSave: (WorkspacePreferences) -> Void
     @State private var selectedSection: PrefSection = .hypervisor
@@ -262,6 +268,16 @@ public struct WorkbenchPreferencesView: View {
             case .security: return "lock.shield"
             }
         }
+
+        @MainActor
+        public var localizedTitle: String {
+            switch self {
+            case .hypervisor: return L("Hypervisor & Quota", "虚拟化与配额")
+            case .storage: return L("APFS CoW Pool", "APFS 写时复制池")
+            case .network: return L("L2 Switch & DNS", "二层交换机与 DNS")
+            case .security: return L("Plugins & Guardrails", "插件与安全护栏")
+            }
+        }
     }
 
     public init(
@@ -275,7 +291,7 @@ public struct WorkbenchPreferencesView: View {
     public var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("AgentVM Preferences")
+                Text(localizer.L("AgentVM Preferences", "AgentVM 偏好设置"))
                     .font(RackTheme.sectionHeaderFont)
                     .foregroundStyle(RackTheme.inkPrimary)
                     .padding(.horizontal, 10)
@@ -290,7 +306,7 @@ public struct WorkbenchPreferencesView: View {
                             Image(systemName: section.icon)
                                 .frame(width: 16)
                                 .foregroundStyle(active ? RackTheme.amberAccent : RackTheme.inkSecondary)
-                            Text(section.rawValue)
+                            Text(section.localizedTitle)
                                 .font(RackTheme.labelFont)
                                 .foregroundStyle(active ? RackTheme.inkPrimary : RackTheme.inkSecondary)
                                 .lineLimit(1)
@@ -306,9 +322,18 @@ public struct WorkbenchPreferencesView: View {
                     .buttonStyle(.plain)
                 }
                 Spacer()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(localizer.L("Interface Language", "界面语言"))
+                        .font(RackTheme.captionFont)
+                        .foregroundStyle(RackTheme.inkMuted)
+                    RackLanguageTogglePill(localizer: localizer)
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 8)
             }
             .padding(12)
-            .frame(width: 200)
+            .frame(width: 210)
             .background(RackTheme.bladeRecessed)
 
             Rectangle()
@@ -316,51 +341,105 @@ public struct WorkbenchPreferencesView: View {
                 .frame(width: 1)
 
             VStack(alignment: .leading, spacing: 16) {
-                Text(selectedSection.rawValue)
-                    .font(RackTheme.displayTitleFont)
-                    .foregroundStyle(RackTheme.inkPrimary)
+                HStack {
+                    Text(selectedSection.localizedTitle)
+                        .font(RackTheme.displayTitleFont)
+                        .foregroundStyle(RackTheme.inkPrimary)
+                    Spacer()
+                    RackLanguageTogglePill(localizer: localizer)
+                }
 
                 switch selectedSection {
                 case .hypervisor:
-                    Stepper("Default Guest vCPUs: \(preferences.defaultVCPUs)", value: $preferences.defaultVCPUs, in: 1...16)
-                    Stepper("Max Concurrent Running VMs: \(preferences.maxConcurrentRunningVMs)", value: $preferences.maxConcurrentRunningVMs, in: 1...32)
-                    Stepper("Host RAM Ceiling: \(preferences.maxTotalFleetRAMPercent)%", value: $preferences.maxTotalFleetRAMPercent, in: 25...90, step: 5)
-                    Stepper("Auto-Pause Idle Branches After: \(preferences.autoPauseIdleMinutes) min", value: $preferences.autoPauseIdleMinutes, in: 5...240, step: 5)
+                    LabeledContent(localizer.L("Interface Language (⇧⌘L)", "界面显示语言 (⇧⌘L)")) {
+                        Picker("", selection: Binding(
+                            get: { localizer.language },
+                            set: { localizer.setLanguage($0) }
+                        )) {
+                            ForEach(AppLanguage.allCases) { lang in
+                                Text("\(lang.displayName) (\(lang.badge))").tag(lang)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 220)
+                    }
+                    Stepper(
+                        localizer.L("Default Guest vCPUs: \(preferences.defaultVCPUs)", "默认客户机 vCPU 核数: \(preferences.defaultVCPUs)"),
+                        value: $preferences.defaultVCPUs,
+                        in: 1...16
+                    )
+                    Stepper(
+                        localizer.L("Max Concurrent Running VMs: \(preferences.maxConcurrentRunningVMs)", "最大并发运行虚拟机数: \(preferences.maxConcurrentRunningVMs)"),
+                        value: $preferences.maxConcurrentRunningVMs,
+                        in: 1...32
+                    )
+                    Stepper(
+                        localizer.L("Host RAM Ceiling: \(preferences.maxTotalFleetRAMPercent)%", "宿主机内存占用上限: \(preferences.maxTotalFleetRAMPercent)%"),
+                        value: $preferences.maxTotalFleetRAMPercent,
+                        in: 25...90,
+                        step: 5
+                    )
+                    Stepper(
+                        localizer.L("Auto-Pause Idle Branches After: \(preferences.autoPauseIdleMinutes) min", "空闲分支自动暂停阈值: \(preferences.autoPauseIdleMinutes) 分钟"),
+                        value: $preferences.autoPauseIdleMinutes,
+                        in: 5...240,
+                        step: 5
+                    )
                 case .storage:
-                    LabeledContent("Storage Pool Folder") {
+                    LabeledContent(localizer.L("Storage Pool Folder", "存储池相对目录")) {
                         TextField("StoragePool", text: $preferences.storagePoolRelativeDir)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 240)
                     }
-                    Stepper("Max Dirty CoW Pool Quota: \(preferences.maxCoWDirtyQuotaGB) GB", value: $preferences.maxCoWDirtyQuotaGB, in: 8...512, step: 8)
-                    Toggle("Auto-Snapshot Before Destructive Guest Exec", isOn: $preferences.enablePreExecAutoSnapshot)
+                    Stepper(
+                        localizer.L("Max Dirty CoW Pool Quota: \(preferences.maxCoWDirtyQuotaGB) GB", "CoW 脏块存储池配额上限: \(preferences.maxCoWDirtyQuotaGB) GB"),
+                        value: $preferences.maxCoWDirtyQuotaGB,
+                        in: 8...512,
+                        step: 8
+                    )
+                    Toggle(
+                        localizer.L("Auto-Snapshot Before Destructive Guest Exec", "执行高危客户机命令前自动创建 CoW 快照"),
+                        isOn: $preferences.enablePreExecAutoSnapshot
+                    )
                 case .network:
-                    LabeledContent("Switch Subnet CIDR") {
+                    LabeledContent(localizer.L("Switch Subnet CIDR", "虚拟交换机网段 CIDR")) {
                         TextField("10.211.55.0/24", text: $preferences.switchSubnetCIDR)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 220)
                     }
-                    LabeledContent("Switch Gateway IPv4") {
+                    LabeledContent(localizer.L("Switch Gateway IPv4", "虚拟交换机网关 IPv4")) {
                         TextField("10.211.55.1", text: $preferences.switchGatewayIP)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 220)
                     }
-                    LabeledContent("Upstream DNS Resolver") {
+                    LabeledContent(localizer.L("Upstream DNS Resolver", "上游 DNS 解析服务器")) {
                         TextField("1.1.1.1", text: $preferences.upstreamDNSServer)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 220)
                     }
-                    Toggle("Continuous Ring-Buffer PCAPNG Capture", isOn: $preferences.autoCapturePCAPNG)
+                    Toggle(
+                        localizer.L("Continuous Ring-Buffer PCAPNG Capture", "持续环形缓冲区 PCAPNG 抓包记录"),
+                        isOn: $preferences.autoCapturePCAPNG
+                    )
                 case .security:
-                    Toggle("Enable Secret-Leak DPI Plugin by Default", isOn: $preferences.enableSecretLeakPluginByDefault)
-                    Stepper("PCAP Ring Buffer Capacity: \(preferences.maxPCAPRingBufferPackets) pkts", value: $preferences.maxPCAPRingBufferPackets, in: 5_000...200_000, step: 5_000)
+                    Toggle(
+                        localizer.L("Enable Secret-Leak DPI Plugin by Default", "默认启用密钥外泄 DPI 检测插件"),
+                        isOn: $preferences.enableSecretLeakPluginByDefault
+                    )
+                    Stepper(
+                        localizer.L("PCAP Ring Buffer Capacity: \(preferences.maxPCAPRingBufferPackets) pkts", "PCAP 环形缓冲区容量: \(preferences.maxPCAPRingBufferPackets) 帧"),
+                        value: $preferences.maxPCAPRingBufferPackets,
+                        in: 5_000...200_000,
+                        step: 5_000
+                    )
                 }
 
                 Spacer()
 
                 HStack {
                     Spacer()
-                    Button("Apply & Persist Preferences") {
+                    Button(localizer.L("Apply & Persist Preferences", "应用并保存偏好设置")) {
                         onSave(preferences)
                     }
                     .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber))
@@ -372,7 +451,7 @@ public struct WorkbenchPreferencesView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(RackTheme.chassisBackground)
         }
-        .frame(width: 640, height: 380)
+        .frame(width: 660, height: 410)
         .preferredColorScheme(.dark)
     }
 }

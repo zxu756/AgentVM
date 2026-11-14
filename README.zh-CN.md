@@ -1,10 +1,10 @@
 **[English](README.md)** | **简体中文**
 
-# AgentVM `v1.1.0`
+# AgentVM `v1.2.0`
 
 > **当前状态（M0 — 止血与诚实基线）**：APFS 写时复制（`clonefile(2)`）稀疏磁盘与快照血统管理、SQLite WAL 工作区持久化、纯 Swift NoCloud `cidata` ISO-9660 镜像生成以及 `JavaScriptCore` 策略沙盒现已在本地可用。以太网/IPv4/DNS/TLS 报文拆解和 `.pcapng` 读写目前只是库层面的能力（`AgentVMNetSwitch`，有单元测试覆盖）；命令行和桌面界面都还没有打开抓包文件的入口。真实 Linux 镜像下载、`VZVirtualMachine` 客户机启动与 `AF_VSOCK` 实时命令执行正在开发中（排在 M1–M3）。这一版还不能启动任何客户机，所以目前没有任何形式的客户机网络；用户态出站防火墙拦截与实时抓包排在 M5。
 
-[![Version](https://img.shields.io/badge/version-v1.1.0-D97724)](https://github.com/zxu756/AgentVM/releases)
+[![Version](https://img.shields.io/badge/version-v1.2.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
 [![Swift](https://img.shields.io/badge/Swift-6.0%20Strict%20Concurrency-D97724)](https://swift.org)
 [![Bilingual](https://img.shields.io/badge/界面语言-中文%20%7C%20EN-2A9D6F)](README.md)

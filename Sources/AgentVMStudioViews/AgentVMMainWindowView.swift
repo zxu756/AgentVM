@@ -69,6 +69,8 @@ public struct AgentVMMainWindowView: View {
 
                 WorkbenchTelemetryStatusBar(
                     hostCapabilities: viewModel.hostCapabilities,
+                    hypervisorStatusText: viewModel.hypervisorStatusText,
+                    isHypervisorReady: viewModel.isHypervisorReadyForRealGuests,
                     runningVMCount: viewModel.runningVMCount,
                     totalVMCount: viewModel.vms.count,
                     totalDirtyCoWBytes: viewModel.totalDirtyCoWBytes,
@@ -146,7 +148,7 @@ public struct AgentVMMainWindowView: View {
 
                 if let vm = viewModel.selectedVM {
                     RackStatusPill(
-                        label: "\(vm.spec.name) · \(vm.telemetry.state.localizedBadge)",
+                        label: "\(vm.spec.name) · \(vm.telemetry.localizedStateBadge)",
                         color: RackTheme.signalColor(for: vm.telemetry.state),
                         monospaced: true
                     )
@@ -479,7 +481,7 @@ private struct FleetRackMatrixOverviewPane: View {
                             ForEach(viewModel.vms) { vm in
                                 HStack(spacing: 12) {
                                     RackStatusPill(
-                                        label: vm.telemetry.state.localizedBadge,
+                                        label: vm.telemetry.localizedStateBadge,
                                         color: RackTheme.signalColor(for: vm.telemetry.state),
                                         monospaced: true
                                     )

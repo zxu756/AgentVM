@@ -444,9 +444,15 @@ public actor UserSpaceL2Switch {
 
     // MARK: - Core L2 Frame Switching, DPI Firewall Enforcement & Protocol Responders
 
+    /// Label put in front of the summary of a frame that was crafted on the host (UI "Probe" menu) rather
+    /// than received from a guest NIC. It is stored with the packet, so every surface that prints the packet
+    /// summary (capture table, `agentvm pcap`, MCP `agentvm_query_wiretap`, HTML report) shows it.
+    public static let syntheticProbeLabel = "SYNTHETIC PROBE"
+
     public func injectFrameFromGuest(
         vmID: VMID,
-        rawFrame: Data
+        rawFrame: Data,
+        syntheticOriginLabel: String? = nil
     ) async throws -> (captured: CapturedPacket, switchGeneratedReplies: [Data]) {
         let seq = allocateSequenceNumber()
         let timestamp = Self.nowMicroseconds()
@@ -484,6 +490,9 @@ public actor UserSpaceL2Switch {
         captured.verdict = evaluation.verdict
         captured.matchedRuleID = evaluation.ruleID
         captured.verdictReason = evaluation.reason
+        if let syntheticOriginLabel, !syntheticOriginLabel.isEmpty {
+            captured.infoSummary = "[\(syntheticOriginLabel)] \(captured.infoSummary)"
+        }
 
         // 3. Record Captured Frame & Port Telemetry
         captureRing.append(captured)
@@ -858,11 +867,12 @@ public actor UserSpaceL2Switch {
         )
     }
 
-    public func exportPCAPNGData(filterQuery: String? = nil) -> Data {
+    public func exportPCAPNGData(filterQuery: String? = nil, sectionComment: String? = nil) -> Data {
         let packets = recentPackets(limit: captureRing.capacity, filterQuery: filterQuery)
         return PCAPNGCodec().encodeCapture(
             packets: packets,
-            hardwareDescription: "AgentVM UserSpace L2 Switch (\(subnetCIDR.description))"
+            hardwareDescription: "AgentVM UserSpace L2 Switch (\(subnetCIDR.description))",
+            sectionComment: sectionComment
         )
     }
 

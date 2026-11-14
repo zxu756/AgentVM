@@ -219,6 +219,19 @@ extension VMLifecycleState {
     }
 }
 
+extension VMLiveTelemetry {
+    /// State badge for every UI surface. A non-stopped state that only exists in the simulator is shown as
+    /// `SIMULATED · <state>`; views use this instead of `state.localizedBadge` so the marker cannot be dropped.
+    @MainActor
+    public var localizedStateBadge: String {
+        guard isSimulatedActiveState else { return state.localizedBadge }
+        return L(
+            "\(Self.simulatedStateMarker) · \(state.localizedBadge)",
+            "\(Self.simulatedStateMarker) 模拟 · \(state.localizedBadge)"
+        )
+    }
+}
+
 extension GuestOSType {
     @MainActor
     public var localizedDisplayName: String {

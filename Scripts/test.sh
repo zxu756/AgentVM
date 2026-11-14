@@ -4,12 +4,25 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Build parallelism: set AGENTVM_BUILD_JOBS=N to pass `-j N` to every swift build/test this script starts.
+SWIFT_JOBS_ARGS=()
+if [[ -n "${AGENTVM_BUILD_JOBS:-}" ]]; then
+    SWIFT_JOBS_ARGS=(-j "$AGENTVM_BUILD_JOBS")
+fi
+
 usage() {
     cat >&2 <<'EOF'
 Usage:
   Scripts/test.sh scope <Module...>
-  Scripts/test.sh milestone <0|1|2|3|4|5|6>
+  Scripts/test.sh milestone <0|1|2|3|4|5|6> [--record]
   Scripts/test.sh release
+
+  milestone 0 writes the acceptance logs to a temporary directory and leaves the working tree untouched.
+  Pass --record to copy them into reports/ (the committed evidence the README refers to).
+  No mode of this script launches the desktop UI.
+
+Environment:
+  AGENTVM_BUILD_JOBS=N   pass `-j N` to swift build / swift test
 
 Modules:
   AgentVMModels
@@ -53,6 +66,7 @@ map_module_to_filters() {
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
+            echo "CLIAndMCPSimulationHonestyTests"
             echo "BilingualLocalizationTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
@@ -63,6 +77,7 @@ map_module_to_filters() {
             ;;
         AgentVM)
             echo "CLIAndMCPTests"
+            echo "CLIAndMCPSimulationHonestyTests"
             echo "StudioViewsHonestyTests"
             ;;
         *)
@@ -103,35 +118,67 @@ run_scope() {
     done
 
     echo "==> [AgentVM] Scoped unit tests: ${filters[*]}"
-    swift test --no-parallel "${filter_args[@]}"
+    swift test "${SWIFT_JOBS_ARGS[@]+"${SWIFT_JOBS_ARGS[@]}"}" --no-parallel "${filter_args[@]}"
+}
+
+# Runs one acceptance script, showing its output and keeping a copy in "$2".
+run_logged() {
+    local script="$1"
+    local log_file="$2"
+    if [[ ! -x "$script" ]]; then
+        echo "ERROR: $script not found or not executable" >&2
+        exit 1
+    fi
+    set +e
+    "$script" 2>&1 | tee "$log_file"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    if [[ $rc -ne 0 ]]; then
+        echo "ERROR: $(basename "$script") failed (exit $rc); log kept at $log_file" >&2
+        exit "$rc"
+    fi
 }
 
 run_milestone() {
     local m="${1:-}"
+    local record=0
+    local extra
+    for extra in "${@:2}"; do
+        case "$extra" in
+            --record) record=1 ;;
+            *) echo "ERROR: Unknown milestone option '$extra'" >&2; usage ;;
+        esac
+    done
     case "$m" in
         0)
             echo "==> [AgentVM] Milestone M0: touched module unit scopes"
             run_scope \
                 AgentVMModels \
                 AgentVMStore \
+                AgentVMNetSwitch \
                 AgentVMPluginHost \
                 AgentVMHypervisor \
                 AgentVMCLIAndMCP \
                 AgentVMWorkbenchShell \
                 AgentVMStudioViews
-            if [[ -x "$ROOT_DIR/Scripts/acceptance/m0-acceptance.sh" ]]; then
-                echo "==> [AgentVM] Milestone M0: m0-acceptance.sh"
-                "$ROOT_DIR/Scripts/acceptance/m0-acceptance.sh"
+
+            # Acceptance logs go to a temporary directory. reports/ is only rewritten on --record,
+            # so a plain run never dirties the working tree.
+            local log_dir
+            log_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentvm-m0-logs.XXXXXX")"
+            echo "==> [AgentVM] Milestone M0: m0-acceptance.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/m0-acceptance.sh" "$log_dir/m0-acceptance.txt"
+            echo "==> [AgentVM] Milestone M0: readme-commands.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/readme-commands.sh" "$log_dir/readme-commands.txt"
+
+            if [[ $record -eq 1 ]]; then
+                mkdir -p "$ROOT_DIR/reports"
+                cp "$log_dir/m0-acceptance.txt" "$ROOT_DIR/reports/m0-acceptance.txt"
+                cp "$log_dir/readme-commands.txt" "$ROOT_DIR/reports/readme-commands.txt"
+                rm -rf "$log_dir"
+                echo "==> [AgentVM] Recorded reports/m0-acceptance.txt and reports/readme-commands.txt"
             else
-                echo "ERROR: Scripts/acceptance/m0-acceptance.sh not found or not executable" >&2
-                exit 1
-            fi
-            if [[ -x "$ROOT_DIR/Scripts/acceptance/readme-commands.sh" ]]; then
-                echo "==> [AgentVM] Milestone M0: readme-commands.sh"
-                "$ROOT_DIR/Scripts/acceptance/readme-commands.sh"
-            else
-                echo "ERROR: Scripts/acceptance/readme-commands.sh not found or not executable" >&2
-                exit 1
+                echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
             fi
             ;;
         1|2|3|4|5|6)
@@ -146,7 +193,7 @@ run_milestone() {
 
 run_release() {
     echo "==> [AgentVM] Release gate: full unit test suite (--no-parallel)"
-    swift test --no-parallel
+    swift test "${SWIFT_JOBS_ARGS[@]+"${SWIFT_JOBS_ARGS[@]}"}" --no-parallel
 
     if [[ -x "$ROOT_DIR/Scripts/acceptance/m0-acceptance.sh" ]]; then
         echo "==> [AgentVM] Release gate: m0-acceptance.sh"

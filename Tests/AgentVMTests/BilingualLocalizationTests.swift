@@ -8,11 +8,44 @@ import Testing
 @Suite("M12 Bilingual Localization (`中文` / `EN`), Locale Priority & HTML Dossier", .timeLimit(.minutes(1)))
 struct BilingualLocalizationTests {
 
-    private func makeIsolatedDefaults() throws -> (UserDefaults, String) {
-        let suiteName = "io.github.zxu756.AgentVM.tests.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defaults.removePersistentDomain(forName: suiteName)
-        return (defaults, suiteName)
+    /// Tests must not touch `~/Library/Preferences`. A named `UserDefaults(suiteName:)` domain leaves a
+    /// plist behind even after `removePersistentDomain`, so the localizer is exercised against this
+    /// in-memory stand-in instead: every accessor the localizer uses is overridden and nothing reaches cfprefsd.
+    private final class InMemoryUserDefaults: UserDefaults, @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [String: Any] = [:]
+
+        init() {
+            // `suiteName: nil` binds no named domain; all reads and writes below are served from `storage`.
+            super.init(suiteName: nil)!
+        }
+
+        override func object(forKey defaultName: String) -> Any? {
+            lock.lock(); defer { lock.unlock() }
+            return storage[defaultName]
+        }
+
+        override func string(forKey defaultName: String) -> String? {
+            object(forKey: defaultName) as? String
+        }
+
+        override func set(_ value: Any?, forKey defaultName: String) {
+            lock.lock(); defer { lock.unlock() }
+            if let value {
+                storage[defaultName] = value
+            } else {
+                storage.removeValue(forKey: defaultName)
+            }
+        }
+
+        override func removeObject(forKey defaultName: String) {
+            lock.lock(); defer { lock.unlock() }
+            storage.removeValue(forKey: defaultName)
+        }
+    }
+
+    private func makeIsolatedDefaults() -> UserDefaults {
+        InMemoryUserDefaults()
     }
 
     @Test("AppLanguage CLI --lang parsing, argument stripping, and badge metadata")
@@ -43,8 +76,7 @@ struct BilingualLocalizationTests {
 
     @Test("AppLanguage resolution priority: CLI --lang > AGENTVM_LANG > UserDefaults > Locale.preferredLanguages")
     func appLanguageResolutionOrderAndChineseAutoDetection() throws {
-        let (defaults, suiteName) = try makeIsolatedDefaults()
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = makeIsolatedDefaults()
 
         // 1. Auto-detects Simplified Chinese when macOS primary preferred language starts with "zh"
         let autoZh = AppLanguage.resolve(
@@ -104,8 +136,7 @@ struct BilingualLocalizationTests {
     @Test("AgentVMLocalizer live zh-Hans <-> en toggle, persistence, and domain enum localization")
     @MainActor
     func localizerLiveTogglePersistenceAndDomainStrings() throws {
-        let (defaults, suiteName) = try makeIsolatedDefaults()
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = makeIsolatedDefaults()
 
         let localizer = AgentVMLocalizer(
             arguments: [],

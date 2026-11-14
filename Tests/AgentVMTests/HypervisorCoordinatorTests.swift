@@ -295,7 +295,9 @@ struct HypervisorCoordinatorTests {
             bootImmediately: true
         )
 
-        #expect(forkResult.cloneDurationMilliseconds < 500.0)
+        // No latency bound is asserted here: a meaningful budget needs the measured numbers from M3
+        // (fork of a disk holding a real OS). The duration is only checked for being a real measurement.
+        #expect(forkResult.cloneDurationMilliseconds > 0)
         #expect(forkResult.parentVMID == parent.vmRecord.id)
         #expect(forkResult.childVM.spec.parentVMID == parent.vmRecord.id)
         #expect(forkResult.childVM.spec.forkedFromSnapshotID == forkResult.forkPointSnapshot.id)
@@ -346,8 +348,16 @@ struct HypervisorCoordinatorTests {
             kind: .liveMemoryAndDisk,
             isPinned: true
         )
-        #expect(cleanSnap.memoryStatePath != nil)
-        #expect(cleanSnap.memoryStateBytes > 0)
+        // The simulation backend has no guest RAM: the snapshot is disk-only and no placeholder
+        // `.vzstate` file is written into the workspace (it used to write a fake "AVMSTATE1" file).
+        #expect(cleanSnap.memoryStatePath == nil)
+        #expect(cleanSnap.memoryStateBytes == 0)
+        // ...and it is recorded as what it is: a disk snapshot, not "Live RAM + Disk".
+        #expect(cleanSnap.kind == .coldDiskOnly)
+        let snapshotFiles = try FileManager.default.contentsOfDirectory(
+            atPath: bundleURL.appendingPathComponent("snapshots", isDirectory: true).path
+        )
+        #expect(!snapshotFiles.contains(where: { $0.hasSuffix(".vzstate") }))
         let expectedDigest = try BinaryChecksums.sha256HexFile(at: diskURL)
 
         // Corrupt / overwrite the 4 MiB region on the active VM disk
@@ -589,6 +599,10 @@ struct HypervisorCoordinatorTests {
         )
         #expect(coldSnap.memoryStatePath == nil)
         #expect(coldSnap.memoryStateBytes == 0)
+        // No RAM state was saved, so the node must not be labelled "live-ram-disk".
+        #expect(coldSnap.kind == .coldDiskOnly)
+        let storedCold = try #require(try await coordinator.store.fetchSnapshot(coldSnap.id))
+        #expect(storedCold.kind == .coldDiskOnly)
     }
 
     @Test("HostHypervisorProbe executes real Darwin.clonefile(2) probe and leaves zero temporary files")
@@ -604,5 +618,210 @@ struct HypervisorCoordinatorTests {
         // Probing devfs (/dev) must fail real clonefile(2) and report isAPFSClonefileSupported == false
         let devfsCaps = HostHypervisorProbe.probeCapabilities(probeDirectoryURL: URL(fileURLWithPath: "/dev", isDirectory: true))
         #expect(devfsCaps.isAPFSClonefileSupported == false)
+    }
+
+    // MARK: - 6. M0 Rework: Simulated State Never Passes For Real (A21)
+
+    @Test("Hardware backend never answers exec with the simulated responder for a `running` record that has no live session")
+    func hardwareBackendNeverAttachesSimulatedResponderToRunningRecordWithoutSession() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-coord-stale-running")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let bundleURL = tempDir.appendingPathComponent("StaleRunning.agentvm", isDirectory: true)
+        let coordinator = try AgentVMFleetCoordinator(bundleURL: bundleURL)
+        #expect(await coordinator.currentExecutionBackend() == .strictHardwareVZ)
+
+        let created = try await coordinator.createSandboxVM(name: "stale", diskVirtualBytes: 16 * 1024 * 1024)
+        let vmID = created.vmRecord.id
+
+        // A workspace written by v1.0.0 / v1.1.0 holds exactly this: `running` + `guestAgentConnected` with
+        // no simulation flag, and no process behind it. The hardware backend holds no session for it.
+        var stale = try #require(try await coordinator.store.fetchVM(vmID))
+        stale.telemetry.state = .running
+        stale.telemetry.guestAgentConnected = true
+        try await coordinator.store.upsertVM(stale)
+
+        do {
+            let result = try await coordinator.executeInGuest(
+                vmID: vmID,
+                request: GuestExecRequest(executable: "uname", arguments: ["-a"])
+            )
+            Issue.record("Hardware backend returned an exec result with no guest behind it: \(result.stdoutUTF8)")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_GUEST_AGENT_UNAVAILABLE")
+            #expect(!err.localizedDescription.contains("Linux 6."))
+        }
+
+        // Nothing was executed, so nothing may appear in the exec ledger or on the terminal.
+        #expect(try await coordinator.store.listExecResults(vmID: vmID).isEmpty)
+        let ttyText = await coordinator.terminalScreenBuffer(for: vmID).renderPlainText()
+        #expect(!ttyText.contains("Linux"))
+        #expect(!ttyText.contains("uname"))
+    }
+
+    @Test("State written by the simulation backend is flagged in the store, discarded by the hardware backend, and never counted or acted on")
+    func simulatedStateIsFlaggedThenDiscardedByHardwareBackend() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-coord-sim-flag")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let bundleURL = tempDir.appendingPathComponent("SimFlag.agentvm", isDirectory: true)
+
+        // 1. The simulation backend boots two VMs and pauses one.
+        let simulator = try AgentVMFleetCoordinator(bundleURL: bundleURL, executionBackend: .deterministicSimulation)
+        let vmA = try await simulator.createSandboxVM(name: "sim-a", diskVirtualBytes: 16 * 1024 * 1024).vmRecord
+        let vmB = try await simulator.createSandboxVM(name: "sim-b", diskVirtualBytes: 16 * 1024 * 1024).vmRecord
+        #expect(vmA.telemetry.simulated == false) // a freshly created, stopped VM is not simulated state
+
+        let bootedA = try await simulator.bootVM(vmA.id)
+        #expect(bootedA.telemetry.state == .running)
+        #expect(bootedA.telemetry.simulated == true)
+        _ = try await simulator.bootVM(vmB.id)
+        let pausedB = try await simulator.pauseVM(vmB.id)
+        #expect(pausedB.telemetry.state == .paused)
+        #expect(pausedB.telemetry.simulated == true)
+
+        // What is persisted carries the flag next to the state, and survives a JSON round trip.
+        let storedA = try #require(try await simulator.store.fetchVM(vmA.id))
+        #expect(storedA.telemetry.state == .running)
+        #expect(storedA.telemetry.simulated == true)
+        #expect(storedA.telemetry.markedStateLabel() == "SIMULATED:running")
+        #expect(storedA.telemetry.isRunningOutsideSimulation == false)
+        let roundTripped = try JSONDecoder().decode(VMLiveTelemetry.self, from: JSONEncoder().encode(storedA.telemetry))
+        #expect(roundTripped.simulated == true)
+
+        // A simulated exec is stored in the ledger with the marker in the command line.
+        _ = try await simulator.executeInGuest(vmID: vmA.id, request: GuestExecRequest(executable: "uname", arguments: ["-a"]))
+        let ledger = try await simulator.store.listExecResults(vmID: vmA.id)
+        #expect(ledger.count == 1)
+        #expect(ledger.allSatisfy { $0.commandLine.hasPrefix("[SIMULATED] ") })
+
+        // Under the simulation backend every reported record is flagged, stopped ones included.
+        let simReport = try await simulator.listVMsForReporting()
+        #expect(simReport.allSatisfy { $0.telemetry.simulated })
+
+        // 2. A hardware-backend coordinator on the same workspace (what a later default CLI process is).
+        let hardware = try AgentVMFleetCoordinator(bundleURL: bundleURL)
+        let hwReport = try await hardware.listVMsForReporting()
+        let reportedA = try #require(hwReport.first(where: { $0.id == vmA.id }))
+        #expect(reportedA.telemetry.state == .running)
+        #expect(reportedA.telemetry.simulated == true) // reported, and flagged
+
+        // Booting a third VM must not be blocked by simulated "running" VMs filling the quota.
+        var manifest = try await hardware.store.loadManifest()
+        manifest.preferences.maxConcurrentRunningVMs = 1
+        try await hardware.store.saveManifest(manifest)
+        let vmC = try await hardware.createSandboxVM(name: "real-c", diskVirtualBytes: 16 * 1024 * 1024).vmRecord
+        do {
+            _ = try await hardware.bootVM(vmC.id)
+            Issue.record("Expected hardware boot of an empty disk to fail")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_NO_BOOTABLE_SYSTEM") // not ERR_QUOTA_EXCEEDED
+        }
+
+        // bootVM on the simulated-running VM: no early "already running" return; the state is discarded.
+        do {
+            _ = try await hardware.bootVM(vmA.id)
+            Issue.record("Hardware backend reported a simulated VM as booted")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_NO_BOOTABLE_SYSTEM")
+        }
+        let afterA = try #require(try await hardware.store.fetchVM(vmA.id))
+        #expect(afterA.telemetry.state == .stopped)
+        #expect(afterA.telemetry.simulated == false)
+        #expect(afterA.telemetry.guestAgentConnected == false)
+        #expect(afterA.telemetry.vsockStreamsOpen == 0)
+
+        // resumeVM on the simulated-paused VM: there is nothing real to resume.
+        do {
+            _ = try await hardware.resumeVM(vmB.id)
+            Issue.record("Hardware backend resumed a simulated VM")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_LIFECYCLE_STATE")
+        }
+        let afterB = try #require(try await hardware.store.fetchVM(vmB.id))
+        #expect(afterB.telemetry.state == .stopped)
+        #expect(afterB.telemetry.simulated == false)
+
+        let diagnostics = try await hardware.store.listDiagnostics(limit: 100)
+        #expect(diagnostics.filter { $0.code == "SIMULATED_STATE_DISCARDED" }.count == 2)
+
+        await haltAllRunningVMs(simulator)
+    }
+
+    @Test("Telemetry and manifest written before the rework still decode (no `simulated` / `activeFirewallPolicyID` keys)")
+    func legacyTelemetryAndManifestDecodeWithoutNewKeys() throws {
+        // Telemetry JSON exactly as dc92ca4 wrote it for a "running" VM: no `simulated` key.
+        let current = VMLiveTelemetry(vmID: VMID("vm-legacy"), state: .running, guestAgentConnected: true)
+        var object = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(current)) as? [String: Any])
+        #expect(object["simulated"] as? Bool == false)
+        object.removeValue(forKey: "simulated")
+        let legacy = try JSONDecoder().decode(VMLiveTelemetry.self, from: JSONSerialization.data(withJSONObject: object))
+        #expect(legacy.simulated == false)
+        #expect(legacy.state == .running)
+        #expect(legacy.markedStateLabel() == "running")
+        #expect(legacy.markedStateLabel(localizedState: "运行中") == "运行中")
+
+        var marked = legacy
+        marked.simulated = true
+        #expect(marked.markedStateLabel() == "SIMULATED:running")
+        #expect(marked.markedStateLabel(localizedState: "运行中") == "SIMULATED:运行中")
+        marked.state = .stopped
+        #expect(marked.markedStateLabel() == "stopped") // stopped is true on any backend
+        #expect(marked.isSimulatedActiveState == false)
+
+        let manifest = AgentVMProjectManifest(title: "Legacy")
+        var manifestObject = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(manifest)) as? [String: Any])
+        #expect(manifestObject["activeFirewallPolicyID"] == nil)
+        manifestObject.removeValue(forKey: "activeFirewallPolicyID")
+        let decoded = try JSONDecoder().decode(AgentVMProjectManifest.self, from: JSONSerialization.data(withJSONObject: manifestObject))
+        #expect(decoded.activeFirewallPolicyID == nil)
+    }
+
+    // MARK: - 7. M0 Rework: Firewall Preset Persistence (A24) & Entitlement Probe (A23)
+
+    @Test("activateFirewallPolicy persists the selection in manifest.json and a new coordinator starts from it")
+    func firewallPresetSelectionPersistsInManifest() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-coord-policy")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let bundleURL = tempDir.appendingPathComponent("Policy.agentvm", isDirectory: true)
+
+        let first = try AgentVMFleetCoordinator(bundleURL: bundleURL)
+        #expect(await first.l2Switch.firewall.currentPolicy().id == FirewallPolicySet.strictAgentAllowlistPreset().id)
+        #expect(try await first.store.loadManifest().activeFirewallPolicyID == nil)
+
+        try await first.activateFirewallPolicy(.airgappedPreset())
+        #expect(await first.l2Switch.firewall.currentPolicy().id == FirewallPolicySet.airgappedPreset().id)
+        #expect(try await first.store.loadManifest().activeFirewallPolicyID == FirewallPolicySet.airgappedPreset().id)
+
+        let second = try AgentVMFleetCoordinator(bundleURL: bundleURL)
+        let restored = await second.l2Switch.firewall.currentPolicy()
+        #expect(restored.id == FirewallPolicySet.airgappedPreset().id)
+        #expect(restored.defaultEgressVerdict == .drop)
+        #expect(restored.rules.isEmpty)
+
+        // An ID that is not a built-in preset falls back to the strict default instead of failing to open the workspace.
+        var manifest = try await second.store.loadManifest()
+        manifest.activeFirewallPolicyID = PolicySetID("pol-does-not-exist")
+        try await second.store.saveManifest(manifest)
+        let third = try AgentVMFleetCoordinator(bundleURL: bundleURL)
+        #expect(await third.l2Switch.firewall.currentPolicy().id == FirewallPolicySet.strictAgentAllowlistPreset().id)
+    }
+
+    @Test("Entitlement probe reads the running process: unknown keys are false and the capability report uses the same reading")
+    func entitlementProbeReadsCurrentProcess() async throws {
+        #expect(HostHypervisorProbe.currentProcessHasBooleanEntitlement("io.github.zxu756.agentvm.tests.no-such-entitlement") == false)
+        #expect(HostHypervisorProbe.currentProcessHasBooleanEntitlement("") == false)
+
+        let direct = HostHypervisorProbe.currentProcessHasBooleanEntitlement(HostHypervisorProbe.virtualizationEntitlementKey)
+        let caps = HostHypervisorProbe.probeCapabilities()
+        #expect(caps.hasVirtualizationEntitlement == direct)
+        #expect(caps.canStartVirtualMachines == (caps.isVirtualizationFrameworkSupported && direct))
+
+        // Framework support alone must not be reported as readiness.
+        let supportedOnly = HostCapabilityReport(
+            macOSVersion: "14.0.0", physicalCores: 4, logicalCores: 4, hostMemoryBytes: 8 << 30,
+            isVirtualizationFrameworkSupported: true, hasVirtualizationEntitlement: false,
+            maxSupportedVCPUs: 4, maxSupportedMemoryMB: 4096
+        )
+        #expect(supportedOnly.canStartVirtualMachines == false)
     }
 }

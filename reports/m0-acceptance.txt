@@ -1,38 +1,75 @@
 ==================================================================
- AgentVM Milestone M0 Acceptance Suite (01-agentvm.md Rows 1..8)
+ AgentVM Milestone M0 Acceptance Suite
+   Rows 1-8 : 01-agentvm.md M0 table
+   Rows 9-14: 06-m0-review.md supplementary rows
 ==================================================================
 
-[Row 1/8] Running 20 cold workspace iterations x 7 commands (140 invocations)...
-PASS [Row 1/8]: 20/20 iterations (140 cold CLI runs across en & zh) exited 0 with 0 crashes and 0 timeouts.
+[Row 1/14] Running 20 cold workspace iterations x 7 commands (140 invocations)...
+PASS [Row 1/14]: 20/20 iterations (140 cold CLI runs across en & zh) exited 0 with 0 crashes and 0 timeouts.
 
-[Row 2/8] Verifying 'agentvm up a' on empty disk fails honestly (en & zh)...
-PASS [Row 2/8]: 'agentvm up a' exits non-zero with localized no-bootable-OS stderr and leaves state != running.
+[Row 2/14] Verifying 'agentvm up a' on empty disk fails honestly (en & zh)...
+PASS [Row 2/14]: 'agentvm up a' exits non-zero with a fully localized no-bootable-OS stderr and leaves state != running.
 
-[Row 3/8] Verifying 'agentvm doctor' live clonefile(2) probe and zero '< 20ms' strings (en & zh)...
-PASS [Row 3/8]: 'agentvm doctor' runs a live clonefile(2) probe with zero '< 20ms' claims and zero temp leftovers.
+[Row 3/14] Verifying 'agentvm doctor' live clonefile(2) probe and zero '< 20ms' strings (en & zh)...
+PASS [Row 3/14]: 'agentvm doctor' runs a live clonefile(2) probe with zero '< 20ms' claims and zero temp leftovers.
 
-[Row 4/8] Verifying 'swift test' creates zero files in repository root...
-PASS [Row 4/8]: Repository root has zero new or leaked SQLite files after swift test.
+[Row 4/14] Running the full 'swift test' suite and checking repo root and ~/Library/Preferences...
+PASS [Row 4/14]: Test run with 164 tests in 12 suites passed; repo root unchanged, 0 stray SQLite files, 0 new AgentVM preference files in ~/Library/Preferences.
 
-[Row 5/8] Verifying 'agentvm exec a -- uname -a' fails honestly with zero Linux strings (en & zh)...
-PASS [Row 5/8]: 'agentvm exec a -- uname -a' exits non-zero and emits zero Linux kernel strings.
+[Row 5/14] Verifying 'agentvm exec a -- uname -a' fails honestly with zero Linux strings (en & zh)...
+PASS [Row 5/14]: 'agentvm exec a -- uname -a' exits non-zero and emits zero Linux kernel strings.
 
-[Row 6/8] Verifying 'agentvm --backend simulation exec a -- uname -a' prefixes SIMULATED (en & zh)...
-PASS [Row 6/8]: Explicit '--backend simulation' outputs carry SIMULATED: prefix on every line.
+[Row 6/14] Verifying 'agentvm --backend simulation exec a -- uname -a' prefixes SIMULATED (en & zh)...
+PASS [Row 6/14]: Explicit '--backend simulation' outputs carry SIMULATED: prefix on every line.
 
-[Row 7/8] Running Scripts/acceptance/readme-commands.sh...
+[Row 7/14] Running Scripts/acceptance/readme-commands.sh...
 ==> [readme-commands] Checking README.md & README.zh-CN.md for banned claims...
 PASS: Zero banned claims in README.md and README.zh-CN.md
-==> [readme-commands] Replaying Quick-Start workflow (--lang en) in isolated temp workspace
-PASS: README Quick-Start verified for --lang en
-==> [readme-commands] Replaying Quick-Start workflow (--lang zh) in isolated temp workspace
-PASS: README Quick-Start verified for --lang zh
+PASS: README.md and README.zh-CN.md list the same 25 commands
+==> [readme-commands] Replaying README.md
+SKIP (this script already built the product above): swift build --product AgentVM
+SKIP (the replay substitutes the built binary for `agentvm`): alias agentvm="$(pwd)/.build/debug/AgentVM"
+SKIP (test entry point; running it from here would recurse): ./Scripts/test.sh scope AgentVMStore AgentVMHypervisor AgentVMCLIAndMCP
+SKIP (this script itself): ./Scripts/acceptance/readme-commands.sh
+SKIP (test entry point; running it from here would recurse): ./Scripts/test.sh milestone 0
+SKIP (packaging step, builds the release .app bundle): ./Scripts/build-app.sh
+SKIP (launches the desktop UI; no script may do that): open build/AgentVM.app
+SKIP (launches the desktop UI; no script may do that): ./build/AgentVM.app/Contents/MacOS/AgentVM --demo
+PASS: README.md: replayed 17 agentvm commands, checked 7 documented outputs, skipped 8 non-replayable lines
+==> [readme-commands] Replaying README.zh-CN.md
+SKIP (this script already built the product above): swift build --product AgentVM
+SKIP (the replay substitutes the built binary for `agentvm`): alias agentvm="$(pwd)/.build/debug/AgentVM"
+SKIP (test entry point; running it from here would recurse): ./Scripts/test.sh scope AgentVMStore AgentVMHypervisor AgentVMCLIAndMCP
+SKIP (this script itself): ./Scripts/acceptance/readme-commands.sh
+SKIP (test entry point; running it from here would recurse): ./Scripts/test.sh milestone 0
+SKIP (packaging step, builds the release .app bundle): ./Scripts/build-app.sh
+SKIP (launches the desktop UI; no script may do that): open build/AgentVM.app
+SKIP (launches the desktop UI; no script may do that): ./build/AgentVM.app/Contents/MacOS/AgentVM --demo
+PASS: README.zh-CN.md: replayed 17 agentvm commands, checked 7 documented outputs, skipped 8 non-replayable lines
 ALL README COMMAND CHECKS PASSED.
-PASS [Row 7/8]: readme-commands.sh verified all EN & ZH README commands.
+PASS [Row 7/14]: readme-commands.sh replayed the commands extracted from README.md and README.zh-CN.md.
 
-[Row 8/8] Launching AgentVM GUI binary without --demo on empty workspace...
-PASS [Row 8/8]: GUI launched cleanly without --demo -> 0 VMs, 0 snapshots, 0 packets, 0 alerts.
+[Row 8/14] Verifying default (non --demo) ViewModel state is empty (windowless test, no GUI process)...
+PASS [Row 8/14]: default ViewModel (no --demo) -> 0 VMs, 0 snapshots, 0 packets, 0 alerts; no GUI process was started.
+
+[Row 9/14] Verifying simulated state is marked for the default backend (ps, ps --json, up, exec; en & zh)...
+PASS [Row 9/14]: after '--backend simulation up a', default ps shows SIMULATED:running (en & zh), ps --json has telemetry.simulated = true, and default up / exec fail without simulator output.
+
+[Row 10/14] Verifying every CLI subcommand output is marked in simulation mode...
+PASS [Row 10/14]: 26 simulation-mode CLI outputs are marked on every line (incl. empty-output exec and error paths); ps --json, export-hcl, the exported .pcapng and the exported HTML carry their own markers.
+
+[Row 11/14] Calling every MCP tool from tools/list in simulation mode...
+PASS [Row 11/14]: all 9 tools from tools/list (and one error result) return marked results in simulation mode; the default-backend agentvm_list_fleet reports simulated state with telemetry.simulated = true.
+
+[Row 12/14] Verifying 'doctor' reads the executable's real virtualization entitlement (en & zh)...
+PASS [Row 12/14]: the tested build has no com.apple.security.virtualization entitlement (codesign) and doctor does not say PASS / 通过; positive control: a temporary copy re-signed with Scripts/entitlements.plist reports PASS / 通过.
+
+[Row 13/14] Verifying 'policy airgap' persists across processes and unknown options exit 2...
+PASS [Row 13/14]: 'policy airgap' is still Total Air-Gap in the next process (en & zh) and 'policy strict' switches back; 'ps --bogus' and 'policy bogus' exit 2.
+
+[Row 14/14] Verifying tracked files contain no macOS home-directory absolute paths...
+PASS [Row 14/14]: git grep -n for the home-directory prefix (slash-Users-slash) has no results in tracked files.
 
 ==================================================================
- ALL 8 M0 ACCEPTANCE CHECKS PASSED
+ ALL 14 M0 ACCEPTANCE CHECKS PASSED (no GUI process started, no VM booted)
 ==================================================================

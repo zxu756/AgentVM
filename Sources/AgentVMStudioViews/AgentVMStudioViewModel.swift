@@ -33,6 +33,8 @@ public enum StudioScreenshotScenario: String, CaseIterable, Sendable {
 public struct StudioHydratedSnapshot: Sendable {
     public var manifest: AgentVMProjectManifest
     public var hostCapabilities: HostCapabilityReport
+    /// Whether the coordinator behind this snapshot runs the simulation backend.
+    public var isSimulationBackend: Bool = false
     public var vms: [VMInstanceRecord]
     public var selectedVMID: VMID?
     public var snapshots: [SnapshotNode]
@@ -157,6 +159,8 @@ public final class AgentVMStudioViewModel: ObservableObject {
     @Published public var preferences: WorkspacePreferences = WorkspacePreferences()
     @Published public var hostCapabilities: HostCapabilityReport = HostHypervisorProbe.probeCapabilities()
     @Published public var isDemoMode: Bool = false
+    /// `true` while the coordinator runs the simulation backend (`--demo`, **Load Demo**, a demonstration workspace).
+    @Published public var isSimulationBackendActive: Bool = false
     @Published public var isBootstrapped: Bool = false
     @Published public var isBusy: Bool = false
     @Published public var lastStatusBanner: String = "Workspace ready"
@@ -282,6 +286,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
             ?? Self.extractWorkspaceBundleOverride(from: rawArgs)
             ?? Self.defaultInteractiveBundleURL(isDemoMode: resolvedDemo)
         self.workspaceBundleURL = resolvedURL
+        self.isSimulationBackendActive = resolvedDemo
         if let coordinator {
             self.coordinator = coordinator
         } else {
@@ -377,6 +382,34 @@ public final class AgentVMStudioViewModel: ObservableObject {
 
     public var hasLiveConnectedTraffic: Bool {
         false
+    }
+
+    /// Status-bar text for what backs this window's fleet. A demonstration fleet runs on the host-side
+    /// simulator and says so; "Apple VZ" is shown only when this executable can really start a VM.
+    public var hypervisorStatusText: String {
+        if isSimulationBackendActive {
+            return L(
+                "Hypervisor: SIMULATED (host-side simulator, no real guest)",
+                "虚拟化: SIMULATED 模拟（主机侧模拟，无真实客户机）"
+            )
+        }
+        if hostCapabilities.canStartVirtualMachines {
+            return L(
+                "Hypervisor: Apple VZ (\(hostCapabilities.architecture))",
+                "虚拟化: Apple VZ (\(hostCapabilities.architecture))"
+            )
+        }
+        if hostCapabilities.isVirtualizationFrameworkSupported {
+            return L(
+                "Hypervisor: Apple VZ not usable (no virtualization entitlement)",
+                "虚拟化: Apple VZ 不可用（当前可执行文件没有虚拟化权限）"
+            )
+        }
+        return L("Hypervisor: not supported on this host", "虚拟化: 宿主机不支持")
+    }
+
+    public var isHypervisorReadyForRealGuests: Bool {
+        !isSimulationBackendActive && hostCapabilities.canStartVirtualMachines
     }
 
     public static func defaultInteractiveBundleURL(isDemoMode: Bool = false) -> URL {
@@ -509,8 +542,12 @@ public final class AgentVMStudioViewModel: ObservableObject {
         return pluginStatuses.first
     }
 
+    /// "Running" for the fleet counters. A state the simulator wrote counts only while this window itself is
+    /// on the simulation backend (where the whole window is labelled SIMULATED / DEMO).
     public var runningVMCount: Int {
-        vms.filter { $0.telemetry.state == .running }.count
+        vms.filter {
+            $0.telemetry.state == .running && (isSimulationBackendActive || !$0.telemetry.simulated)
+        }.count
     }
 
     public var totalDirtyCoWBytes: UInt64 {
@@ -578,12 +615,16 @@ public final class AgentVMStudioViewModel: ObservableObject {
         var loadedManifest = try await coordinator.store.loadManifest()
         let effectiveDemo = isDemoMode || loadedManifest.isDemonstrationWorkspace
         if effectiveDemo {
+            // A demonstration workspace is driven by the simulator, and only by the simulator: its fleet state is
+            // simulated, so lifecycle actions in this window must not be handed to the hardware backend.
+            await coordinator.setExecutionBackend(.deterministicSimulation)
             try await coordinator.seedIndustrialDemonstrationFleetIfEmpty()
             try await enrichDemonstrationArtifactsIfNeeded()
             loadedManifest = try await coordinator.store.loadManifest()
         }
 
         let caps = await coordinator.hostCapabilities()
+        let backendIsSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
         let loadedVMs = try await coordinator.store.listVMs()
         let loadedSnapshots = try await coordinator.store.listSnapshots()
 
@@ -688,6 +729,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
         return StudioHydratedSnapshot(
             manifest: loadedManifest,
             hostCapabilities: caps,
+            isSimulationBackend: backendIsSimulation,
             vms: loadedVMs,
             selectedVMID: chosenVM?.id,
             snapshots: loadedSnapshots,
@@ -737,6 +779,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
         }
         self.preferences = snapshot.manifest.preferences
         self.hostCapabilities = snapshot.hostCapabilities
+        self.isSimulationBackendActive = snapshot.isSimulationBackend
         self.vms = snapshot.vms
         self.selectedVMID = snapshot.selectedVMID
         self.snapshots = snapshot.snapshots
@@ -1425,15 +1468,26 @@ public final class AgentVMStudioViewModel: ObservableObject {
                     payload: Data("POST /collect HTTP/1.1\r\nHost: dropbox-sink.example.net\r\nAuthorization: Bearer \(syntheticKey)\r\n\r\n".utf8)
                 )
             }
-            let captured = try await coordinator.processOutboundGuestFrame(vmID: vm.id, rawFrame: rawFrame)
+            // This frame is crafted here on the host, not sent by a guest: it enters the capture table labelled.
+            let captured = try await injectLabelledProbeFrame(rawFrame, vmID: vm.id)
             await refreshAllState()
             selectPacket(captured.id)
             toastCenter.post(
-                title: "Packet #\(captured.sequenceNumber) -> \(captured.verdict.rawValue)",
+                title: "[\(UserSpaceL2Switch.syntheticProbeLabel)] Packet #\(captured.sequenceNumber) -> \(captured.verdict.rawValue)",
                 detail: captured.verdictReason,
                 severity: captured.verdict.isPermitted ? .info : .warning
             )
         }
+    }
+
+    /// Sends a host-crafted probe frame through the switch and firewall, labelled as synthetic in the capture ring.
+    @discardableResult
+    public func injectLabelledProbeFrame(_ rawFrame: Data, vmID: VMID) async throws -> CapturedPacket {
+        try await coordinator.processOutboundGuestFrame(
+            vmID: vmID,
+            rawFrame: rawFrame,
+            syntheticOriginLabel: UserSpaceL2Switch.syntheticProbeLabel
+        )
     }
 
     public func exportPCAPNGDefault() {
@@ -1445,7 +1499,12 @@ public final class AgentVMStudioViewModel: ObservableObject {
     public func exportPCAPNG(to url: URL) {
         let query = wiretapFilterText.trimmingCharacters(in: .whitespacesAndNewlines)
         runCoordinatorTask(label: "Exporting PCAPNG") { [self] in
-            let data = await coordinator.l2Switch.exportPCAPNGData(filterQuery: query.isEmpty ? nil : query)
+            let filter = query.isEmpty ? nil : query
+            let exported = await coordinator.l2Switch.recentPackets(limit: Int.max, filterQuery: filter)
+            let data = await coordinator.l2Switch.exportPCAPNGData(
+                filterQuery: filter,
+                sectionComment: captureFileOriginComment(for: exported)
+            )
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
                 withIntermediateDirectories: true
@@ -1457,6 +1516,17 @@ public final class AgentVMStudioViewModel: ObservableObject {
                 severity: .info
             )
         }
+    }
+
+    /// File-level comment for a `.pcapng` exported from this window, or `nil` when every frame came from a guest.
+    public func captureFileOriginComment(for packets: [CapturedPacket]) -> String? {
+        if isSimulationBackendActive {
+            return AgentVMCLIRunner.simulatedCaptureComment
+        }
+        let probePrefix = "[\(UserSpaceL2Switch.syntheticProbeLabel)]"
+        let probeCount = packets.filter { $0.infoSummary.hasPrefix(probePrefix) }.count
+        guard probeCount > 0 else { return nil }
+        return "\(UserSpaceL2Switch.syntheticProbeLabel): \(probeCount) of \(packets.count) frame(s) in this capture were crafted on the host with the Probe menu, not sent by a guest VM."
     }
 
     // MARK: - Vsock / VT100 Guest Command Execution Actions
@@ -1530,7 +1600,8 @@ public final class AgentVMStudioViewModel: ObservableObject {
                 ),
                 on: coordinator.store
             )
-            await coordinator.l2Switch.firewall.updatePolicy(preset)
+            // Same path as `agentvm policy <preset>`: switch the engine and persist the selection in the manifest.
+            try await coordinator.activateFirewallPolicy(preset)
             await refreshAllState()
             toastCenter.post(
                 title: "Firewall Policy Activated",

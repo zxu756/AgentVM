@@ -1,6 +1,7 @@
 import AgentVMModels
 import Darwin
 import Foundation
+import Security
 import Virtualization
 
 // MARK: - Native Apple Silicon Host Capability Probe & VZVirtualMachineConfiguration Builder
@@ -21,6 +22,7 @@ public enum HostHypervisorProbe {
         let resolvedPhys = physCores > 0 ? Int(physCores) : logicalCores
 
         let vzSupported = VZVirtualMachine.isSupported
+        let vzEntitled = currentProcessHasBooleanEntitlement(virtualizationEntitlementKey)
         let maxCPU = max(1, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
         let maxMemMB = max(512, VZVirtualMachineConfiguration.maximumAllowedMemorySize / (1024 * 1024))
 
@@ -45,12 +47,26 @@ public enum HostHypervisorProbe {
             logicalCores: logicalCores,
             hostMemoryBytes: info.physicalMemory,
             isVirtualizationFrameworkSupported: vzSupported,
+            hasVirtualizationEntitlement: vzEntitled,
             isNestedVirtualizationSupported: nestedSupported,
             isRosettaLinuxShareAvailable: rosettaAvailable,
             isAPFSClonefileSupported: clonefileSupported,
             maxSupportedVCPUs: maxCPU,
             maxSupportedMemoryMB: maxMemMB
         )
+    }
+
+    public static let virtualizationEntitlementKey = "com.apple.security.virtualization"
+
+    /// Reads one entitlement of the *current process* from its code signature via
+    /// `SecTaskCreateFromSelf` + `SecTaskCopyValueForEntitlement`. Returns `true` only when the entitlement
+    /// is present with a boolean `true` value. `VZVirtualMachine.isSupported` says nothing about this:
+    /// it is `true` on any capable host even when the executable is not entitled to start a VM.
+    public static func currentProcessHasBooleanEntitlement(_ key: String) -> Bool {
+        guard let task = SecTaskCreateFromSelf(nil) else { return false }
+        guard let value = SecTaskCopyValueForEntitlement(task, key as CFString, nil) else { return false }
+        guard CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
+        return CFBooleanGetValue((value as! CFBoolean))
     }
 
     private static func performRealClonefileProbe(in directoryURL: URL) -> Bool {

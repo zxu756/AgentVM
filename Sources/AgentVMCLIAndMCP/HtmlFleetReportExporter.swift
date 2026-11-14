@@ -16,14 +16,21 @@ public struct HtmlFleetReportExporter: Sendable {
     ) async throws -> String {
         let manifest = try await coordinator.store.loadManifest()
         let isDemo = isDemoOverride ?? manifest.isDemonstrationWorkspace
-        let vms = try await coordinator.store.listVMs()
+        // Records carry `telemetry.simulated` (see `AgentVMFleetCoordinator.listVMsForReporting`).
+        let vms = try await coordinator.listVMsForReporting()
+        let isSimulationBackend = await coordinator.currentExecutionBackend() == .deterministicSimulation
         let snapshots = try await coordinator.store.listSnapshots()
         let packets = await coordinator.l2Switch.recentPackets(limit: 80)
         let policy = await coordinator.l2Switch.firewall.currentPolicy()
         let plugins = await coordinator.pluginEngine.listPluginStatuses()
         let caps = await coordinator.hostCapabilities()
 
-        let activeCount = vms.filter { $0.telemetry.state == .running }.count
+        // Only a `running` state that did not come from the simulator counts as an active blade.
+        let activeCount = vms.filter { $0.telemetry.isRunningOutsideSimulation }.count
+        let simulatedActiveCount = vms.filter { $0.telemetry.isSimulatedActiveState }.count
+        let activeMetricText = simulatedActiveCount > 0
+            ? "\(activeCount) / \(vms.count) (+\(simulatedActiveCount) SIMULATED)"
+            : "\(activeCount) / \(vms.count)"
         let totalDirty = vms.reduce(UInt64(0)) { $0 + $1.telemetry.cowDirtyBytes }
         let droppedPkts = packets.filter { !$0.verdict.isPermitted }.count
 
@@ -31,8 +38,13 @@ public struct HtmlFleetReportExporter: Sendable {
         for vm in vms {
             let ip = escapeHTML(vm.spec.networkInterfaces.first?.ipv4Address ?? "-")
             let dirty = escapeHTML(ByteMetricsFormatter.formatBytes(vm.telemetry.cowDirtyBytes))
-            let stateBadgeClass = vm.telemetry.state == .running ? "pill-allow" : "pill-amber"
-            let stateText = lifecycleBilingualLabels(vm.telemetry.state)
+            let plainStateText = lifecycleBilingualLabels(vm.telemetry.state)
+            let isSimulatedState = vm.telemetry.isSimulatedActiveState
+            // A simulated state never gets the green "allow" pill and always names itself.
+            let stateBadgeClass = (vm.telemetry.state == .running && !isSimulatedState) ? "pill-allow" : "pill-amber"
+            let stateText: (en: String, zh: String) = isSimulatedState
+                ? ("SIMULATED: \(plainStateText.en)", "SIMULATED 模拟: \(plainStateText.zh)")
+                : plainStateText
             let mountsText = vm.spec.virtioFSMounts.map { ByteMetricsFormatter.scrubHomePath($0.hostDirectoryPath) }.joined(separator: ", ")
             vmRows += """
             <tr>
@@ -90,6 +102,18 @@ public struct HtmlFleetReportExporter: Sendable {
               <div class="demo-banner" role="note" data-en="[DEMO] Synthetic demonstration dataset: simulated microVMs, crafted Layer-2 frames, and sample audit metrics (not captured from live guest VMs)." data-zh="[演示数据] 合成演示数据集：模拟微虚拟机、构造的二层数据帧与示例审计指标（非真实客户机运行采集）。">[DEMO] Synthetic demonstration dataset: simulated microVMs, crafted Layer-2 frames, and sample audit metrics (not captured from live guest VMs).</div>
             """
             : ""
+        let simulationBannerHTML: String
+        if isSimulationBackend {
+            simulationBannerHTML = """
+              <div class="demo-banner" role="note" data-en="SIMULATED: this report was exported with --backend simulation. Lifecycle states, guest agent status and exec results in it come from the host-side simulator, not from real guest VMs." data-zh="SIMULATED 模拟: 本报告在 --backend simulation 下导出。其中的运行状态、客户机代理状态和命令结果来自主机侧模拟，不来自真实客户机。">SIMULATED: this report was exported with --backend simulation. Lifecycle states, guest agent status and exec results in it come from the host-side simulator, not from real guest VMs.</div>
+            """
+        } else if simulatedActiveCount > 0 {
+            simulationBannerHTML = """
+              <div class="demo-banner" role="note" data-en="SIMULATED: \(simulatedActiveCount) VM state(s) below were written by the simulation backend. No real guest is running behind them, and they are not counted as active." data-zh="SIMULATED 模拟: 下面有 \(simulatedActiveCount) 台虚拟机的状态是模拟后端写入的，背后没有真实客户机在运行，也不计入活跃数。">SIMULATED: \(simulatedActiveCount) VM state(s) below were written by the simulation backend. No real guest is running behind them, and they are not counted as active.</div>
+            """
+        } else {
+            simulationBannerHTML = ""
+        }
         let arch = escapeHTML(caps.architecture)
         let osVer = escapeHTML(caps.macOSVersion)
         let hostMem = escapeHTML(caps.hostMemoryGBFormatted)
@@ -375,11 +399,12 @@ public struct HtmlFleetReportExporter: Sendable {
             </div>
           </header>
           \(demoBannerHTML)
+          \(simulationBannerHTML)
 
           <section class="metrics" aria-label="Fleet telemetry summary">
             <div class="metric-box">
               <div class="metric-label" data-en="Active Sandbox Blades" data-zh="活跃沙盒实例">Active Sandbox Blades</div>
-              <div class="metric-value">\(activeCount) / \(vms.count)</div>
+              <div class="metric-value">\(activeMetricText)</div>
             </div>
             <div class="metric-box">
               <div class="metric-label" data-en="CoW Snapshot Nodes" data-zh="CoW 快照节点">CoW Snapshot Nodes</div>

@@ -113,6 +113,9 @@ public struct HostCapabilityReport: Codable, Hashable, Sendable {
     public var logicalCores: Int
     public var hostMemoryBytes: UInt64
     public var isVirtualizationFrameworkSupported: Bool
+    /// Whether the running executable itself carries the `com.apple.security.virtualization` entitlement,
+    /// read from the current process (not inferred from `VZVirtualMachine.isSupported`).
+    public var hasVirtualizationEntitlement: Bool
     public var isNestedVirtualizationSupported: Bool
     public var isRosettaLinuxShareAvailable: Bool
     public var isAPFSClonefileSupported: Bool
@@ -127,6 +130,7 @@ public struct HostCapabilityReport: Codable, Hashable, Sendable {
         logicalCores: Int,
         hostMemoryBytes: UInt64,
         isVirtualizationFrameworkSupported: Bool,
+        hasVirtualizationEntitlement: Bool = false,
         isNestedVirtualizationSupported: Bool = false,
         isRosettaLinuxShareAvailable: Bool = false,
         isAPFSClonefileSupported: Bool = true,
@@ -140,12 +144,19 @@ public struct HostCapabilityReport: Codable, Hashable, Sendable {
         self.logicalCores = logicalCores
         self.hostMemoryBytes = hostMemoryBytes
         self.isVirtualizationFrameworkSupported = isVirtualizationFrameworkSupported
+        self.hasVirtualizationEntitlement = hasVirtualizationEntitlement
         self.isNestedVirtualizationSupported = isNestedVirtualizationSupported
         self.isRosettaLinuxShareAvailable = isRosettaLinuxShareAvailable
         self.isAPFSClonefileSupported = isAPFSClonefileSupported
         self.maxSupportedVCPUs = maxSupportedVCPUs
         self.maxSupportedMemoryMB = maxSupportedMemoryMB
         self.probedAt = probedAt
+    }
+
+    /// The host can start a `VZVirtualMachine` from this executable only when the framework reports support
+    /// and the executable is signed with the virtualization entitlement.
+    public var canStartVirtualMachines: Bool {
+        isVirtualizationFrameworkSupported && hasVirtualizationEntitlement
     }
 
     public var hostMemoryGBFormatted: String {
@@ -234,9 +245,47 @@ public struct ValidationIssue: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+/// Why a VM cannot be booted. Kept structured (instead of a free-form English string) so the whole
+/// `ERR_NO_BOOTABLE_SYSTEM` message can be rendered in either language.
+public enum NoBootableSystemReason: Sendable, Equatable {
+    case kernelImageMissing(path: String)
+    case macOSBootArtifactsMissing
+    case noBootDeviceConfigured
+    case bootDiskImageMissing(fileName: String)
+    case emptyPartitionTable(fileName: String)
+
+    public func localizedDetail(in language: AppLanguage) -> String {
+        let isZh = (language == .zhHans)
+        switch self {
+        case let .kernelImageMissing(path):
+            return isZh
+                ? "在「\(path)」找不到 Linux 内核镜像。"
+                : "Linux kernel image not found at '\(path)'."
+        case .macOSBootArtifactsMissing:
+            return isZh
+                ? "缺少 macOS 辅助存储或硬件型号文件。"
+                : "macOS auxiliary storage or hardware model missing."
+        case .noBootDeviceConfigured:
+            return isZh
+                ? "没有配置启动用的块设备。"
+                : "No boot block device configured."
+        case let .bootDiskImageMissing(fileName):
+            return isZh
+                ? "找不到启动磁盘镜像「\(fileName)」。"
+                : "Boot disk image missing at '\(fileName)'."
+        case let .emptyPartitionTable(fileName):
+            return isZh
+                ? "启动磁盘「\(fileName)」只有一张空的分区表，没有安装 EFI 引导程序，也没有根文件系统。"
+                : "Boot disk '\(fileName)' contains only an empty partition table with no installed EFI bootloader or root OS filesystem."
+        }
+    }
+}
+
 public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case virtualizationUnsupported(reason: String)
-    case noBootableSystem(vmName: String, detail: String)
+    case virtualizationEntitlementMissing
+    case noBootableSystem(vmName: String, reason: NoBootableSystemReason)
+    case vmNameAlreadyExists(name: String, existingID: VMID)
     case guestAgentNotConnected(vmName: String, state: String)
     case invalidConfiguration(issues: [ValidationIssue])
     case vmNotFound(VMID)
@@ -268,7 +317,9 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     public var errorCode: String {
         switch self {
         case .virtualizationUnsupported: return "ERR_VZ_UNSUPPORTED"
+        case .virtualizationEntitlementMissing: return "ERR_VZ_ENTITLEMENT_MISSING"
         case .noBootableSystem: return "ERR_NO_BOOTABLE_SYSTEM"
+        case .vmNameAlreadyExists: return "ERR_VM_NAME_EXISTS"
         case .guestAgentNotConnected: return "ERR_GUEST_AGENT_UNAVAILABLE"
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
         case .vmNotFound: return "ERR_VM_NOT_FOUND"
@@ -310,10 +361,19 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "Apple Virtualization.framework 不可用：\(reason)"
                 : "Apple Virtualization.framework unavailable: \(reason)"
-        case let .noBootableSystem(vmName, detail):
+        case .virtualizationEntitlementMissing:
             return isZh
-                ? "虚拟机「\(vmName)」磁盘上没有可引导的客户机系统（内核或根文件系统缺失）：\(detail) 若仅需验证主机侧协议演练，请显式传入 --backend simulation。"
+                ? "系统支持虚拟化；当前可执行文件没有虚拟化权限（com.apple.security.virtualization），无法启动虚拟机。"
+                : "The host supports virtualization; the current executable does not have the virtualization entitlement (com.apple.security.virtualization) and cannot start virtual machines."
+        case let .noBootableSystem(vmName, reason):
+            let detail = reason.localizedDetail(in: language)
+            return isZh
+                ? "虚拟机「\(vmName)」磁盘上没有可引导的客户机系统（内核或根文件系统缺失）：\(detail)若仅需验证主机侧协议演练，请显式传入 --backend simulation。"
                 : "VM '\(vmName)' has no bootable guest OS or kernel on its disk: \(detail) Pass --backend simulation explicitly if you want to run the host-side simulation responder."
+        case let .vmNameAlreadyExists(name, existingID):
+            return isZh
+                ? "工作区里已经有一台名为「\(name)」的虚拟机（\(existingID.rawValue)），没有创建新的。请换一个名字。"
+                : "A virtual machine named '\(name)' already exists in this workspace (\(existingID.rawValue)); nothing was created. Choose a different name."
         case let .guestAgentNotConnected(vmName, state):
             return isZh
                 ? "虚拟机「\(vmName)」当前状态为 \(state)，尚未连接真实客户机代理（agentvm-guestd），无法执行客户机命令。"
@@ -425,8 +485,10 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
 
     public var remediationHint: String {
         switch self {
-        case .virtualizationUnsupported:
+        case .virtualizationUnsupported, .virtualizationEntitlementMissing:
             return "Sign the binary with com.apple.security.virtualization entitlement on Apple Silicon macOS 14+."
+        case .vmNameAlreadyExists:
+            return "Run 'agentvm ps' to list existing virtual machines."
         case .cowCloneFailed:
             return "Ensure source and destination disk images reside on the same APFS volume."
         case .firewallBlocked:

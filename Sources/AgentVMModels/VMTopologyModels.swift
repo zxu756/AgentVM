@@ -572,8 +572,16 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
     public var vsockStreamsOpen: Int
     public var guestAgentConnected: Bool
     public var hasLiveGuestTelemetry: Bool
+    /// `true` when `state`, `guestAgentConnected` and `vsockStreamsOpen` were written by the explicit
+    /// simulation backend (`--backend simulation`, `--seed-demo`, `--demo`) and no real guest exists behind them.
+    /// The flag is persisted in the same JSON blob as the state it qualifies, so any reader that sees a
+    /// simulated `running` also sees `"simulated": true`. Records written before this field existed decode as `false`.
+    public var simulated: Bool
     public var uptimeSeconds: TimeInterval
     public var sampledAt: Date
+
+    /// Marker every text surface prints next to a simulated lifecycle state.
+    public static let simulatedStateMarker = "SIMULATED"
 
     public init(
         vmID: VMID,
@@ -593,6 +601,7 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         vsockStreamsOpen: Int = 0,
         guestAgentConnected: Bool = false,
         hasLiveGuestTelemetry: Bool = false,
+        simulated: Bool = false,
         uptimeSeconds: TimeInterval = 0,
         sampledAt: Date = Date()
     ) {
@@ -613,6 +622,7 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         self.vsockStreamsOpen = vsockStreamsOpen
         self.guestAgentConnected = guestAgentConnected
         self.hasLiveGuestTelemetry = hasLiveGuestTelemetry
+        self.simulated = simulated
         self.uptimeSeconds = uptimeSeconds
         self.sampledAt = sampledAt
     }
@@ -635,6 +645,7 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         case vsockStreamsOpen
         case guestAgentConnected
         case hasLiveGuestTelemetry
+        case simulated
         case uptimeSeconds
         case sampledAt
     }
@@ -658,8 +669,27 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         self.vsockStreamsOpen = try container.decode(Int.self, forKey: .vsockStreamsOpen)
         self.guestAgentConnected = try container.decode(Bool.self, forKey: .guestAgentConnected)
         self.hasLiveGuestTelemetry = try container.decodeIfPresent(Bool.self, forKey: .hasLiveGuestTelemetry) ?? false
+        self.simulated = try container.decodeIfPresent(Bool.self, forKey: .simulated) ?? false
         self.uptimeSeconds = try container.decode(TimeInterval.self, forKey: .uptimeSeconds)
         self.sampledAt = try container.decode(Date.self, forKey: .sampledAt)
+    }
+
+    /// A non-stopped lifecycle state that only exists inside the simulation backend.
+    public var isSimulatedActiveState: Bool {
+        simulated && state != .stopped
+    }
+
+    /// `true` only for a `running` state that was not produced by the simulation backend.
+    public var isRunningOutsideSimulation: Bool {
+        state == .running && !simulated
+    }
+
+    /// Plain-text lifecycle label for tables and logs. A simulated non-stopped state is rendered as
+    /// `SIMULATED:<state>` so it can never be read as a real one. Pass a localized state name to translate
+    /// the part after the marker; the marker itself is never translated.
+    public func markedStateLabel(localizedState: String? = nil) -> String {
+        let base = localizedState ?? state.rawValue
+        return isSimulatedActiveState ? "\(Self.simulatedStateMarker):\(base)" : base
     }
 
     public var formattedCPUUsage: String {

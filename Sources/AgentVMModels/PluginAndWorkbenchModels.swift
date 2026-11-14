@@ -377,6 +377,10 @@ public struct AgentVMProjectManifest: Codable, Hashable, Sendable {
     public var updatedAt: Date
     public var preferences: WorkspacePreferences
     public var isDemonstrationWorkspace: Bool
+    /// The firewall policy preset selected for this workspace (`agentvm policy <preset>`, MCP
+    /// `agentvm_set_firewall_preset`, Firewall Policy Studio). `nil` means the built-in default
+    /// (strict allowlist). Persisted here so the selection survives across processes.
+    public var activeFirewallPolicyID: PolicySetID?
 
     public init(
         formatVersion: Int = 4,
@@ -386,7 +390,8 @@ public struct AgentVMProjectManifest: Codable, Hashable, Sendable {
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         preferences: WorkspacePreferences = WorkspacePreferences(),
-        isDemonstrationWorkspace: Bool = false
+        isDemonstrationWorkspace: Bool = false,
+        activeFirewallPolicyID: PolicySetID? = nil
     ) {
         self.formatVersion = formatVersion
         self.workspaceID = workspaceID
@@ -396,6 +401,7 @@ public struct AgentVMProjectManifest: Codable, Hashable, Sendable {
         self.updatedAt = updatedAt
         self.preferences = preferences
         self.isDemonstrationWorkspace = isDemonstrationWorkspace
+        self.activeFirewallPolicyID = activeFirewallPolicyID
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -407,6 +413,7 @@ public struct AgentVMProjectManifest: Codable, Hashable, Sendable {
         case updatedAt
         case preferences
         case isDemonstrationWorkspace
+        case activeFirewallPolicyID
     }
 
     public init(from decoder: Decoder) throws {
@@ -419,5 +426,6 @@ public struct AgentVMProjectManifest: Codable, Hashable, Sendable {
         self.updatedAt = try container.decode(Date.self, forKey: .updatedAt)
         self.preferences = try container.decode(WorkspacePreferences.self, forKey: .preferences)
         self.isDemonstrationWorkspace = try container.decodeIfPresent(Bool.self, forKey: .isDemonstrationWorkspace) ?? false
+        self.activeFirewallPolicyID = try container.decodeIfPresent(PolicySetID.self, forKey: .activeFirewallPolicyID)
     }
 }

@@ -123,6 +123,10 @@ public struct WorkbenchToastStackOverlay: View {
 public struct WorkbenchTelemetryStatusBar: View {
     @ObservedObject private var localizer = AgentVMLocalizer.shared
     public let hostCapabilities: HostCapabilityReport
+    /// What actually backs the fleet in this window (real Apple VZ, the simulator, or nothing usable).
+    /// Supplied by the view model; the bar never derives it from `VZVirtualMachine.isSupported` alone.
+    public let hypervisorStatusText: String
+    public let isHypervisorReady: Bool
     public let runningVMCount: Int
     public let totalVMCount: Int
     public let totalDirtyCoWBytes: UInt64
@@ -136,6 +140,8 @@ public struct WorkbenchTelemetryStatusBar: View {
 
     public init(
         hostCapabilities: HostCapabilityReport,
+        hypervisorStatusText: String,
+        isHypervisorReady: Bool,
         runningVMCount: Int,
         totalVMCount: Int,
         totalDirtyCoWBytes: UInt64,
@@ -148,6 +154,8 @@ public struct WorkbenchTelemetryStatusBar: View {
         onToggleBottomDrawer: @escaping () -> Void
     ) {
         self.hostCapabilities = hostCapabilities
+        self.hypervisorStatusText = hypervisorStatusText
+        self.isHypervisorReady = isHypervisorReady
         self.runningVMCount = runningVMCount
         self.totalVMCount = totalVMCount
         self.totalDirtyCoWBytes = totalDirtyCoWBytes
@@ -164,13 +172,9 @@ public struct WorkbenchTelemetryStatusBar: View {
         HStack(spacing: 14) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(hostCapabilities.isVirtualizationFrameworkSupported ? RackTheme.linkGreen : RackTheme.amberAccent)
+                    .fill(isHypervisorReady ? RackTheme.linkGreen : RackTheme.amberAccent)
                     .frame(width: 7, height: 7)
-                Text(
-                    hostCapabilities.isVirtualizationFrameworkSupported
-                        ? localizer.L("Hypervisor: Apple VZ (\(hostCapabilities.architecture))", "虚拟化: Apple VZ (\(hostCapabilities.architecture))")
-                        : localizer.L("Hypervisor: Simulation Mode", "虚拟化: 确定性模拟")
-                )
+                Text(hypervisorStatusText)
                     .font(RackTheme.monoSmallFont)
                     .foregroundStyle(RackTheme.inkPrimary)
                     .lineLimit(1)

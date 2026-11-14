@@ -18,12 +18,12 @@ public actor AgentVMMCPServer {
         [
             [
                 "name": "agentvm_list_fleet",
-                "description": "List all sandbox VMs, lifecycle states, IPv4 addresses, and APFS CoW dirty disk deltas.",
+                "description": "List all sandbox VM records as JSON: lifecycle state, IPv4 address, APFS CoW dirty bytes. telemetry.simulated is true when the state was written or is reported by the simulation backend (no real guest behind it).",
                 "inputSchema": ["type": "object", "properties": [:]]
             ],
             [
                 "name": "agentvm_create_vm",
-                "description": "Provision a fresh Apple Silicon microVM with GPT root disk and NoCloud cidata ISO.",
+                "description": "Create a sandbox VM record with an empty sparse GPT root disk and a NoCloud cidata ISO. No guest OS is installed; the name must be unique in the workspace.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -53,7 +53,7 @@ public actor AgentVMMCPServer {
             ],
             [
                 "name": "agentvm_exec_command",
-                "description": "Execute a command inside a sandbox VM over multiplexed AVM1 VirtioSocket with pre-exec JS guardrails.",
+                "description": "Execute a command in a sandbox VM through the AVM1 session after pre-exec JS guardrails. In this build no real guest can be booted, so the call fails on the default backend; under --backend simulation the reply comes from the host-side simulator and every line is marked SIMULATED.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -67,7 +67,7 @@ public actor AgentVMMCPServer {
             ],
             [
                 "name": "agentvm_capture_snapshot",
-                "description": "Capture a live RAM + CoW disk checkpoint of a sandbox VM.",
+                "description": "Capture an APFS CoW disk snapshot of a sandbox VM. Guest RAM state is saved only for a VM actually running on the hardware backend; the simulation backend records disk only.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -90,7 +90,7 @@ public actor AgentVMMCPServer {
             ],
             [
                 "name": "agentvm_query_wiretap",
-                "description": "Query L2 switch packet wiretap using boolean filter expressions (e.g. 'proto == TLS && verdict == DROP').",
+                "description": "Query the in-process L2 switch capture ring with boolean filter expressions (e.g. 'proto == TLS && verdict == DROP'). No guest traffic reaches the switch before M5, so the ring only holds frames injected in this process.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -101,7 +101,7 @@ public actor AgentVMMCPServer {
             ],
             [
                 "name": "agentvm_set_firewall_preset",
-                "description": "Switch the L2 egress firewall between 'strict' coding-agent allowlist and 'airgap' mode.",
+                "description": "Select the workspace firewall preset ('strict' coding-agent allowlist or 'airgap') and save it to the workspace. Not enforced on guest traffic before M5.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -112,7 +112,7 @@ public actor AgentVMMCPServer {
             ],
             [
                 "name": "agentvm_doctor",
-                "description": "Return Apple Virtualization, APFS clonefile, Rosetta, and SQLite WAL diagnostics.",
+                "description": "Return host diagnostics: Virtualization.framework support, whether this executable has the virtualization entitlement, whether it can start VMs, architecture, cores, memory.",
                 "inputSchema": ["type": "object", "properties": [:]]
             ]
         ]
@@ -151,11 +151,29 @@ public actor AgentVMMCPServer {
             case "tools/call":
                 let toolName = (params["name"] as? String) ?? ""
                 let args = (params["arguments"] as? [String: Any]) ?? [:]
-                let text = try await dispatchToolCall(name: toolName, arguments: args)
-                resultObject = [
-                    "content": [["type": "text", "text": text]],
-                    "isError": false
-                ]
+                // Single exit point for tool results: under the simulation backend every result, success or
+                // error, leaves through `markedContent`, so a tool cannot return unmarked simulated output.
+                let isSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
+                do {
+                    let text = try await dispatchToolCall(name: toolName, arguments: args)
+                    resultObject = [
+                        "content": Self.markedContent(
+                            text: text,
+                            isMachineReadableJSON: Self.jsonResultTools.contains(toolName),
+                            isSimulation: isSimulation
+                        ),
+                        "isError": false
+                    ]
+                } catch let err as AgentVMError {
+                    resultObject = [
+                        "content": Self.markedContent(
+                            text: "[\(err.errorCode)] \(err.localizedDescription)",
+                            isMachineReadableJSON: false,
+                            isSimulation: isSimulation
+                        ),
+                        "isError": true
+                    ]
+                }
             default:
                 return encodeError(id: idValue, code: -32601, message: "Method not found: \(method)")
             }
@@ -173,6 +191,29 @@ public actor AgentVMMCPServer {
         }
     }
 
+    /// Tools whose text result is JSON and must stay parseable.
+    static let jsonResultTools: Set<String> = ["agentvm_list_fleet"]
+
+    /// Builds the `content` array of a tool result.
+    /// - Simulation backend, plain text: every line is prefixed with `SIMULATED: `.
+    /// - Simulation backend, JSON: the JSON block is left intact (its records carry `"simulated": true`) and a
+    ///   second, marked text block is appended, so even an empty list comes back with a marker.
+    static func markedContent(text: String, isMachineReadableJSON: Bool, isSimulation: Bool) -> [[String: Any]] {
+        guard isSimulation else {
+            return [["type": "text", "text": text]]
+        }
+        if isMachineReadableJSON {
+            return [
+                ["type": "text", "text": text],
+                ["type": "text", "text": "SIMULATED: the JSON above is reported by the simulation backend; every record has telemetry.simulated = true and its runtime state does not come from a real guest."]
+            ]
+        }
+        let marked = text.isEmpty
+            ? "SIMULATED: (no output)"
+            : AgentVMCLIRunner.prefixSimulatedLines(text)
+        return [["type": "text", "text": marked]]
+    }
+
     public func runStdioLoop() async {
         while let line = readLine(strippingNewline: true) {
             if let resp = await handleJSONRPCLine(line) {
@@ -185,11 +226,7 @@ public actor AgentVMMCPServer {
     private func dispatchToolCall(name: String, arguments: [String: Any]) async throws -> String {
         switch name {
         case "agentvm_list_fleet":
-            let vms = try await coordinator.store.listVMs()
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            encoder.dateEncodingStrategy = .iso8601
-            return String(decoding: try encoder.encode(vms), as: UTF8.self)
+            return try AgentVMCLIRunner.encodeFleetJSON(try await coordinator.listVMsForReporting())
 
         case "agentvm_create_vm":
             let vmName = (arguments["name"] as? String) ?? "mcp-sandbox"
@@ -202,7 +239,7 @@ public actor AgentVMMCPServer {
                 vcpus: cpus,
                 memoryMB: mem
             )
-            return "Created VM \(created.vmRecord.id.rawValue) ('\(created.vmRecord.spec.name)') with root snapshot \(created.rootSnapshot.id.rawValue)."
+            return "Created VM \(created.vmRecord.id.rawValue) ('\(created.vmRecord.spec.name)') with root snapshot \(created.rootSnapshot.id.rawValue) (empty sparse GPT disk, no guest OS installed)."
 
         case "agentvm_fork_cow_branch":
             guard let parentStr = arguments["parentVMID"] as? String,
@@ -212,18 +249,19 @@ public actor AgentVMMCPServer {
             let owner = (arguments["owner"] as? String) ?? "mcp-branch"
             let parentID = VMID(parentStr)
             let parentRecord = try await coordinator.store.fetchVM(parentID)
-            let bootNow = (arguments["bootImmediately"] as? Bool) ?? (parentRecord?.telemetry.state == .running)
+            // Default: follow the parent only when its `running` state belongs to this process's backend.
+            let backendIsSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
+            let parentRunsOnThisBackend = (parentRecord?.telemetry.state == .running)
+                && (backendIsSimulation || parentRecord?.telemetry.simulated == false)
+            let bootNow = (arguments["bootImmediately"] as? Bool) ?? parentRunsOnThisBackend
             let forked = try await coordinator.forkCoWBranch(
                 fromVMID: parentID,
                 branchName: branchName,
                 agentOwnerTag: owner,
                 bootImmediately: bootNow
             )
-            let isSim = await coordinator.currentExecutionBackend() == .deterministicSimulation
-            let prefix = isSim ? "SIMULATED: " : ""
             return String(
-                format: "%@Forked CoW branch %@ ('%@') in %.2f ms from snapshot %@.",
-                prefix,
+                format: "Forked CoW branch %@ ('%@') in %.2f ms from snapshot %@.",
                 forked.childVM.id.rawValue,
                 forked.childVM.spec.name,
                 forked.cloneDurationMilliseconds,
@@ -241,9 +279,7 @@ public actor AgentVMMCPServer {
                 vmID: VMID(vmIDStr),
                 request: GuestExecRequest(executable: exe, arguments: cmdArgs, workingDirectory: cwd)
             )
-            let isSim = await coordinator.currentExecutionBackend() == .deterministicSimulation
-            let prefix = isSim ? "SIMULATED: " : ""
-            return "\(prefix)exitCode=\(res.exitCode)\nstdout:\n\(res.stdoutUTF8)\nstderr:\n\(res.stderrUTF8)"
+            return "exitCode=\(res.exitCode)\nstdout:\n\(res.stdoutUTF8)\nstderr:\n\(res.stderrUTF8)"
 
         case "agentvm_capture_snapshot":
             guard let vmIDStr = arguments["vmID"] as? String,
@@ -264,23 +300,32 @@ public actor AgentVMMCPServer {
             let filter = arguments["filter"] as? String
             let limit = (arguments["limit"] as? Int) ?? 40
             let pkts = await coordinator.l2Switch.recentPackets(limit: limit, filterQuery: filter)
+            if pkts.isEmpty {
+                return "0 packets. The capture ring is in-memory and per-process, and no guest traffic reaches the switch before M5."
+            }
             return pkts.map {
                 "#\($0.sequenceNumber) [\($0.highestProtocol.rawValue)] \($0.sourceIP ?? $0.sourceMAC) -> \($0.destinationIP ?? $0.destinationMAC) [\($0.verdict.rawValue)] \($0.infoSummary)"
             }.joined(separator: "\n")
 
         case "agentvm_set_firewall_preset":
-            let preset = (arguments["preset"] as? String)?.lowercased() ?? "strict"
-            if preset == "airgap" {
-                await coordinator.l2Switch.firewall.updatePolicy(.airgappedPreset())
-                return "Applied Total Air-Gap firewall policy."
-            } else {
-                await coordinator.l2Switch.firewall.updatePolicy(.strictAgentAllowlistPreset())
-                return "Applied Strict Coding-Agent Allowlist firewall policy."
+            guard let preset = (arguments["preset"] as? String)?.lowercased() else {
+                throw AgentVMError.cliUsageError(detail: "preset is required ('strict' or 'airgap').")
+            }
+            let caveat = "Saved to the workspace. No guest traffic passes through this policy before M5, so nothing is enforced on real traffic yet."
+            switch preset {
+            case "airgap":
+                try await coordinator.activateFirewallPolicy(.airgappedPreset())
+                return "Workspace firewall preset set to Total Air-Gap. \(caveat)"
+            case "strict":
+                try await coordinator.activateFirewallPolicy(.strictAgentAllowlistPreset())
+                return "Workspace firewall preset set to Strict Coding-Agent Allowlist. \(caveat)"
+            default:
+                throw AgentVMError.cliUsageError(detail: "Unknown firewall preset '\(preset)' (expected 'strict' or 'airgap').")
             }
 
         case "agentvm_doctor":
             let caps = await coordinator.hostCapabilities()
-            return "VZSupported=\(caps.isVirtualizationFrameworkSupported), arch=\(caps.architecture), cores=\(caps.physicalCores), memory=\(caps.hostMemoryGBFormatted)"
+            return "VZSupported=\(caps.isVirtualizationFrameworkSupported), VZEntitled=\(caps.hasVirtualizationEntitlement), canStartVMs=\(caps.canStartVirtualMachines), arch=\(caps.architecture), cores=\(caps.physicalCores), memory=\(caps.hostMemoryGBFormatted)"
 
         default:
             throw AgentVMError.cliUsageError(detail: "Unknown MCP tool '\(name)'.")

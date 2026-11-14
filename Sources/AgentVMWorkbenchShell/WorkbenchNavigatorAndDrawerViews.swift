@@ -135,7 +135,7 @@ public struct FleetNavigatorRailView: View {
 
                     Spacer(minLength: 4)
 
-                    Text(vm.telemetry.state.localizedBadge)
+                    Text(vm.telemetry.localizedStateBadge)
                         .font(RackTheme.monoSmallFont)
                         .foregroundStyle(RackTheme.signalColor(for: vm.telemetry.state))
                         .lineLimit(1)
@@ -268,7 +268,7 @@ public struct VMHardwareInspectorRailView: View {
                                     .lineLimit(1)
                                 Spacer()
                                 RackStatusPill(
-                                    label: vm.telemetry.state.localizedBadge,
+                                    label: vm.telemetry.localizedStateBadge,
                                     color: RackTheme.signalColor(for: vm.telemetry.state),
                                     monospaced: true
                                 )

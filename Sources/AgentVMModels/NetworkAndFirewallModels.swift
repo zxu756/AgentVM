@@ -493,6 +493,11 @@ public struct FirewallPolicySet: Codable, Hashable, Sendable, Identifiable {
         )
     }
 
+    /// The built-in presets that can be selected by ID (`agentvm policy`, MCP, Policy Studio).
+    public static func builtInPreset(id: PolicySetID) -> FirewallPolicySet? {
+        [strictAgentAllowlistPreset(), airgappedPreset()].first { $0.id == id }
+    }
+
     public static func airgappedPreset() -> FirewallPolicySet {
         FirewallPolicySet(
             id: PolicySetID("pol-airgap"),

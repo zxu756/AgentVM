@@ -104,7 +104,10 @@ public actor AgentVMFleetCoordinator {
         let createdStore = try AgentVMProjectStore(bundleURL: bundleURL, createIfMissing: true)
         self.store = createdStore
         self.undoRedo = UndoRedoController()
-        let firewall = EgressFirewallEngine(policy: .strictAgentAllowlistPreset())
+        // `agentvm policy <preset>` persists its selection in manifest.json; a new process starts from it.
+        let initialPolicy = Self.persistedActiveFirewallPolicy(manifestURL: createdStore.manifestFileURL)
+            ?? .strictAgentAllowlistPreset()
+        let firewall = EgressFirewallEngine(policy: initialPolicy)
         self.l2Switch = UserSpaceL2Switch(
             subnetCIDR: "10.211.55.0/24",
             gatewayIP: "10.211.55.1",
@@ -129,6 +132,94 @@ public actor AgentVMFleetCoordinator {
         self.executionBackend = backend
     }
 
+    private var isSimulationBackend: Bool {
+        executionBackend == .deterministicSimulation
+    }
+
+    // MARK: - Simulated Runtime State Hygiene
+
+    /// VM records as this process should report them (`ps`, `ps --json`, MCP `agentvm_list_fleet`, HTML export).
+    ///
+    /// Lifecycle state written by the simulation backend is stored with `telemetry.simulated == true`, so a
+    /// hardware-backend process that reads it reports it as simulated. Under the simulation backend every
+    /// record's runtime state is, by definition, reported by the simulator, so the flag is set on all of them.
+    public func listVMsForReporting() async throws -> [VMInstanceRecord] {
+        let vms = try await store.listVMs()
+        guard isSimulationBackend else { return vms }
+        return vms.map { record in
+            var marked = record
+            marked.telemetry.simulated = true
+            return marked
+        }
+    }
+
+    /// Loads a VM record for a lifecycle or exec operation.
+    ///
+    /// The hardware backend never acts on a `running` / `paused` state that only the simulator produced:
+    /// such a record is reset to `stopped` (and the reset is persisted and logged) before the operation
+    /// proceeds, so `up`, `exec`, `pause`, `resume`, `branch` and `restore` behave exactly as they would
+    /// on a VM that was never touched by `--backend simulation`.
+    private func loadVMForOperation(_ vmID: VMID) async throws -> VMInstanceRecord {
+        guard let record = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        guard !isSimulationBackend, record.telemetry.simulated else {
+            return record
+        }
+        var reset = record
+        let simulatedState = record.telemetry.state
+        reset.telemetry.state = .stopped
+        reset.telemetry.simulated = false
+        reset.telemetry.guestAgentConnected = false
+        reset.telemetry.hasLiveGuestTelemetry = false
+        reset.telemetry.vsockStreamsOpen = 0
+        reset.telemetry.cpuUsagePercent = 0
+        reset.telemetry.memoryResidentMB = 0
+        try await store.upsertVM(reset)
+        try await store.appendDiagnostic(DiagnosticEvent(
+            severity: .notice,
+            subsystem: "Hypervisor",
+            vmID: vmID,
+            code: "SIMULATED_STATE_DISCARDED",
+            message: "Hardware backend discarded the SIMULATED '\(simulatedState.rawValue)' state of '\(record.spec.name)' left by the simulation backend; no real guest was running. State is now 'stopped'."
+        ))
+        return reset
+    }
+
+    /// Stamps where a lifecycle state came from. Called every time this coordinator writes a state.
+    private func stampRuntimeOrigin(_ record: inout VMInstanceRecord) {
+        record.telemetry.simulated = isSimulationBackend && record.telemetry.state != .stopped
+    }
+
+    private func rejectDuplicateVMName(_ name: String) async throws {
+        let existing = try await store.listVMs()
+        if let clash = existing.first(where: { $0.spec.name.caseInsensitiveCompare(name) == .orderedSame }) {
+            throw AgentVMError.vmNameAlreadyExists(name: name, existingID: clash.id)
+        }
+    }
+
+    // MARK: - Firewall Policy Preset Selection (persisted)
+
+    private static func persistedActiveFirewallPolicy(manifestURL: URL) -> FirewallPolicySet? {
+        guard let data = try? Data(contentsOf: manifestURL),
+              let manifest = try? JSONDecoder().decode(AgentVMProjectManifest.self, from: data),
+              let policyID = manifest.activeFirewallPolicyID else {
+            return nil
+        }
+        return FirewallPolicySet.builtInPreset(id: policyID)
+    }
+
+    /// Selects `policy` for this workspace: the in-process firewall engine switches to it and the selection is
+    /// written to `manifest.json`, so the next process (CLI, MCP, UI) starts from the same preset.
+    /// Until guest NICs are attached to the user-space switch (M5) no guest traffic passes through this engine.
+    public func activateFirewallPolicy(_ policy: FirewallPolicySet) async throws {
+        var manifest = try await store.loadManifest()
+        manifest.activeFirewallPolicyID = policy.id
+        manifest.updatedAt = Date()
+        try await store.saveManifest(manifest)
+        await l2Switch.firewall.updatePolicy(policy)
+    }
+
     // MARK: - Provision New Sandbox VM (Real APFS Sparse Disk + GPT + Cloud-Init ISO + Root Snapshot)
 
     public func createSandboxVM(
@@ -144,6 +235,7 @@ public actor AgentVMFleetCoordinator {
         portForwards: [PortForwardRuleSpec] = [],
         cloudInitOverride: CloudInitSpec? = nil
     ) async throws -> FleetCreationSummary {
+        try await rejectDuplicateVMName(name)
         let vmID = VMID.generate(prefix: "vm")
         let slug = sanitizeFilename(name)
         let rootDiskURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue).raw")
@@ -297,16 +389,22 @@ public actor AgentVMFleetCoordinator {
     // MARK: - Boot, Pause, Resume & Halt Lifecycle
 
     public func bootVM(_ vmID: VMID) async throws -> VMInstanceRecord {
-        guard var record = try await store.fetchVM(vmID) else {
-            throw AgentVMError.vmNotFound(vmID)
-        }
+        var record = try await loadVMForOperation(vmID)
         if record.telemetry.state == .running {
+            if isSimulationBackend && !record.telemetry.simulated {
+                // A `running` record the simulator is asked to drive is simulated from here on; say so in the store.
+                record.telemetry.simulated = true
+                try await store.upsertVM(record)
+            }
             return record
         }
 
         let manifest = try await store.loadManifest()
         let allVMs = try await store.listVMs()
-        let activeCount = allVMs.filter { $0.telemetry.state == .running }.count
+        // Simulated `running` records never count against a hardware-backend quota.
+        let activeCount = allVMs.filter {
+            $0.telemetry.state == .running && (isSimulationBackend || !$0.telemetry.simulated)
+        }.count
         if activeCount >= manifest.preferences.maxConcurrentRunningVMs {
             throw AgentVMError.resourceQuotaExceeded(
                 resource: "maxConcurrentRunningVMs",
@@ -335,6 +433,7 @@ public actor AgentVMFleetCoordinator {
             record.telemetry.hasLiveGuestTelemetry = false
             record.telemetry.guestAgentConnected = true
             record.telemetry.vsockStreamsOpen = await session.openStreamCount()
+            stampRuntimeOrigin(&record)
             try await store.upsertVM(record)
 
             tty.feed("[SIMULATED] Deterministic host-side simulation responder attached for \(record.spec.name).\r\n")
@@ -354,8 +453,11 @@ public actor AgentVMFleetCoordinator {
 
         guard VZVirtualMachine.isSupported else {
             throw AgentVMError.virtualizationUnsupported(
-                reason: "VZVirtualMachine.isSupported returned false (missing com.apple.security.virtualization entitlement or unsupported host)."
+                reason: "VZVirtualMachine.isSupported returned false (this host cannot run Virtualization.framework guests)."
             )
+        }
+        guard HostHypervisorProbe.currentProcessHasBooleanEntitlement(HostHypervisorProbe.virtualizationEntitlementKey) else {
+            throw AgentVMError.virtualizationEntitlementMissing
         }
 
         let nicMAC = record.spec.networkInterfaces.first.flatMap { MACAddress(parsing: $0.macAddress) }
@@ -411,6 +513,7 @@ public actor AgentVMFleetCoordinator {
         record.telemetry.hasLiveGuestTelemetry = false
         record.telemetry.guestAgentConnected = false
         record.telemetry.vsockStreamsOpen = 0
+        stampRuntimeOrigin(&record)
         try await store.upsertVM(record)
 
         try await store.appendDiagnostic(DiagnosticEvent(
@@ -431,7 +534,7 @@ public actor AgentVMFleetCoordinator {
             guard !trimmed.isEmpty, FileManager.default.fileExists(atPath: trimmed) else {
                 throw AgentVMError.noBootableSystem(
                     vmName: spec.name,
-                    detail: "Linux kernel image not found at '\(trimmed)'."
+                    reason: .kernelImageMissing(path: trimmed)
                 )
             }
         case .macOSBoot(let hardwareModelPath, _, let auxiliaryStoragePath):
@@ -439,37 +542,35 @@ public actor AgentVMFleetCoordinator {
                   FileManager.default.fileExists(atPath: hardwareModelPath) else {
                 throw AgentVMError.noBootableSystem(
                     vmName: spec.name,
-                    detail: "macOS auxiliary storage or hardware model missing."
+                    reason: .macOSBootArtifactsMissing
                 )
             }
         case .efiBoot:
             guard let bootDisk = spec.blockDevices.first(where: \.isBootVolume) ?? spec.blockDevices.first else {
                 throw AgentVMError.noBootableSystem(
                     vmName: spec.name,
-                    detail: "No boot block device configured."
+                    reason: .noBootDeviceConfigured
                 )
             }
             let diskURL = URL(fileURLWithPath: bootDisk.imagePath)
             guard FileManager.default.fileExists(atPath: diskURL.path) else {
                 throw AgentVMError.noBootableSystem(
                     vmName: spec.name,
-                    detail: "Boot disk image missing at '\(diskURL.lastPathComponent)'."
+                    reason: .bootDiskImageMissing(fileName: diskURL.lastPathComponent)
                 )
             }
             let forensics = try forensicsAnalyzer.analyzeDiskImage(at: diskURL, maxHeatmapSamples: 1)
             if forensics.detectedFilesystems.isEmpty {
                 throw AgentVMError.noBootableSystem(
                     vmName: spec.name,
-                    detail: "Boot disk '\(diskURL.lastPathComponent)' contains only an empty partition table with no installed EFI bootloader or root OS filesystem."
+                    reason: .emptyPartitionTable(fileName: diskURL.lastPathComponent)
                 )
             }
         }
     }
 
     public func pauseVM(_ vmID: VMID, reason: String = "User requested pause") async throws -> VMInstanceRecord {
-        guard var record = try await store.fetchVM(vmID) else {
-            throw AgentVMError.vmNotFound(vmID)
-        }
+        var record = try await loadVMForOperation(vmID)
         guard record.telemetry.state == .running else {
             throw AgentVMError.invalidLifecycleTransition(
                 vmID: vmID,
@@ -490,21 +591,20 @@ public actor AgentVMFleetCoordinator {
 
         record.telemetry.state = .paused
         record.telemetry.cpuUsagePercent = 0.0
+        stampRuntimeOrigin(&record)
         try await store.upsertVM(record)
         try await store.appendDiagnostic(DiagnosticEvent(
             severity: .notice,
             subsystem: "Hypervisor",
             vmID: vmID,
-            code: "VM_PAUSED",
-            message: "Paused '\(record.spec.name)': \(reason)"
+            code: isSimulationBackend ? "VM_PAUSED_SIMULATED" : "VM_PAUSED",
+            message: "\(isSimulationBackend ? "[SIMULATED] " : "")Paused '\(record.spec.name)': \(reason)"
         ))
         return record
     }
 
     public func resumeVM(_ vmID: VMID) async throws -> VMInstanceRecord {
-        guard var record = try await store.fetchVM(vmID) else {
-            throw AgentVMError.vmNotFound(vmID)
-        }
+        var record = try await loadVMForOperation(vmID)
         guard record.telemetry.state == .paused else {
             throw AgentVMError.invalidLifecycleTransition(
                 vmID: vmID,
@@ -524,6 +624,7 @@ public actor AgentVMFleetCoordinator {
         }
 
         record.telemetry.state = .running
+        stampRuntimeOrigin(&record)
         try await store.upsertVM(record)
         return record
     }
@@ -557,6 +658,8 @@ public actor AgentVMFleetCoordinator {
         record.telemetry.memoryResidentMB = 0
         record.telemetry.hasLiveGuestTelemetry = false
         record.telemetry.guestAgentConnected = false
+        record.telemetry.vsockStreamsOpen = 0
+        stampRuntimeOrigin(&record)
         try await store.upsertVM(record)
         return record
     }
@@ -572,9 +675,7 @@ public actor AgentVMFleetCoordinator {
         isPinned: Bool = false,
         triggerCommand: String? = nil
     ) async throws -> SnapshotNode {
-        guard var record = try await store.fetchVM(vmID) else {
-            throw AgentVMError.vmNotFound(vmID)
-        }
+        var record = try await loadVMForOperation(vmID)
         guard let bootDisk = record.spec.blockDevices.first else {
             throw AgentVMError.diskImageOperationFailed(
                 path: record.spec.name,
@@ -607,10 +708,9 @@ public actor AgentVMFleetCoordinator {
                         }
                     }
                 }
-            } else if executionBackend == .deterministicSimulation {
-                let stateMeta = Data("SIMULATED-AVMSTATE1:\(vmID.rawValue)".utf8)
-                try stateMeta.write(to: stateFileURL, options: .atomic)
             }
+            // The simulation backend has no guest RAM. It records a disk-only snapshot and writes no
+            // placeholder memory-state file, so nothing simulated ends up in the snapshot lineage.
             if let attrs = try? FileManager.default.attributesOfItem(atPath: stateFileURL.path),
                let sz = attrs[.size] as? UInt64 {
                 ramPath = stateFileURL.path
@@ -628,6 +728,10 @@ public actor AgentVMFleetCoordinator {
             resolvedBranch = "main"
         }
 
+        // "Live RAM + Disk" is recorded only when a guest memory state was actually saved. A request for it
+        // on a stopped VM, or under the simulator, yields a disk snapshot and is labelled as one.
+        let recordedKind: SnapshotKind = (kind == .liveMemoryAndDisk && ramPath == nil) ? .coldDiskOnly : kind
+
         let node = SnapshotNode(
             id: snapID,
             vmID: vmID,
@@ -635,7 +739,7 @@ public actor AgentVMFleetCoordinator {
             branchName: resolvedBranch,
             title: title,
             notes: notes,
-            kind: kind,
+            kind: recordedKind,
             diskClonePath: cloneURL.path,
             memoryStatePath: ramPath,
             virtualDiskBytes: alloc.virtualSizeBytes,
@@ -668,9 +772,8 @@ public actor AgentVMFleetCoordinator {
         bootImmediately: Bool = true
     ) async throws -> CoWBranchForkResult {
         let startNs = DispatchTime.now().uptimeNanoseconds
-        guard let parentRecord = try await store.fetchVM(parentVMID) else {
-            throw AgentVMError.vmNotFound(parentVMID)
-        }
+        let parentRecord = try await loadVMForOperation(parentVMID)
+        try await rejectDuplicateVMName(branchName)
         guard let parentDisk = parentRecord.spec.blockDevices.first else {
             throw AgentVMError.diskImageOperationFailed(
                 path: parentRecord.spec.name,
@@ -783,9 +886,7 @@ public actor AgentVMFleetCoordinator {
         guard let snap = try await store.fetchSnapshot(snapshotID) else {
             throw AgentVMError.snapshotNotFound(snapshotID)
         }
-        guard var record = try await store.fetchVM(snap.vmID) else {
-            throw AgentVMError.vmNotFound(snap.vmID)
-        }
+        var record = try await loadVMForOperation(snap.vmID)
 
         let wasRunning = (record.telemetry.state == .running)
         if wasRunning {
@@ -821,17 +922,21 @@ public actor AgentVMFleetCoordinator {
     // MARK: - Guarded Guest Command Execution & Network Packet Processing
 
     public func executeInGuest(vmID: VMID, request: GuestExecRequest) async throws -> GuestExecResult {
-        guard let record = try await store.fetchVM(vmID) else {
-            throw AgentVMError.vmNotFound(vmID)
-        }
+        var record = try await loadVMForOperation(vmID)
         if record.telemetry.state != .running {
             _ = try await bootVM(vmID)
         } else if executionBackend == .deterministicSimulation && vsockSessions[vmID] == nil {
+            // Only the explicit simulation backend may answer with the simulated responder. A `running`
+            // record under the hardware backend with no live session falls through to ERR_GUEST_AGENT_UNAVAILABLE.
             let tty = ensureTerminalBuffer(for: vmID)
             let session = VsockMultiplexSession(vmID: vmID)
             await session.attachSimulatedGuestResponder()
             await session.attachTerminalScreenBuffer(tty)
             vsockSessions[vmID] = session
+            if !record.telemetry.simulated {
+                record.telemetry.simulated = true
+                try await store.upsertVM(record)
+            }
         }
 
         // Dispatch JavaScriptCore pre-exec plugins (Secret Leak Veto + Auto Pre-Destructive Checkpoint)
@@ -872,12 +977,26 @@ public actor AgentVMFleetCoordinator {
         }
         tty.feed("\u{001B}[1;32magent@\(record.spec.name)\u{001B}[0m:\u{001B}[1;34m\(request.workingDirectory)\u{001B}[0m$ ")
 
-        try await store.appendExecResult(execResult)
+        // The exec ledger is read by every backend. A simulated result is stored with the marker in the
+        // command line itself, the one field every ledger view prints.
+        var ledgerEntry = execResult
+        if isSimulationBackend {
+            ledgerEntry.commandLine = "[SIMULATED] \(execResult.commandLine)"
+        }
+        try await store.appendExecResult(ledgerEntry)
         return execResult
     }
 
-    public func processOutboundGuestFrame(vmID: VMID, rawFrame: Data) async throws -> CapturedPacket {
-        var (packet, _) = try await l2Switch.injectFrameFromGuest(vmID: vmID, rawFrame: rawFrame)
+    public func processOutboundGuestFrame(
+        vmID: VMID,
+        rawFrame: Data,
+        syntheticOriginLabel: String? = nil
+    ) async throws -> CapturedPacket {
+        var (packet, _) = try await l2Switch.injectFrameFromGuest(
+            vmID: vmID,
+            rawFrame: rawFrame,
+            syntheticOriginLabel: syntheticOriginLabel
+        )
         let pluginSummary = try await pluginEngine.dispatchPacketHook(packet)
         if case let .overrideVerdict(overrideVerdict, reason) = pluginSummary.packetDecision {
             packet.verdict = overrideVerdict

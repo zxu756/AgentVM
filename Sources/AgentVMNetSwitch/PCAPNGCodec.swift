@@ -118,14 +118,21 @@ public struct PCAPNGCodec: Sendable {
 
     // MARK: - Encoding (.pcapng Binary Stream)
 
+    /// `sectionComment` is written as the Section Header Block `opt_comment`, which capture tools show as the
+    /// file comment. AgentVM uses it to label captures whose frames do not come from a real guest.
     public func encodeCapture(
         packets: [CapturedPacket],
-        hardwareDescription: String = "AgentVM UserSpace L2 Switch"
+        hardwareDescription: String = "AgentVM UserSpace L2 Switch",
+        sectionComment: String? = nil
     ) -> Data {
         var stream = BinaryBufferWriter(capacity: 256 + packets.count * 160)
 
         // 1. Section Header Block (SHB - 0x0A0D0D0A)
-        appendSectionHeaderBlock(to: &stream, hardwareDescription: hardwareDescription)
+        appendSectionHeaderBlock(
+            to: &stream,
+            hardwareDescription: hardwareDescription,
+            sectionComment: sectionComment
+        )
 
         // 2. Interface Description Block (IDB - 0x00000001, LinkType=1 Ethernet, if_tsresol=6 us)
         appendInterfaceDescriptionBlock(to: &stream)
@@ -141,9 +148,14 @@ public struct PCAPNGCodec: Sendable {
     public func writeCaptureFile(
         packets: [CapturedPacket],
         to url: URL,
-        hardwareDescription: String = "AgentVM UserSpace L2 Switch"
+        hardwareDescription: String = "AgentVM UserSpace L2 Switch",
+        sectionComment: String? = nil
     ) throws {
-        let encoded = encodeCapture(packets: packets, hardwareDescription: hardwareDescription)
+        let encoded = encodeCapture(
+            packets: packets,
+            hardwareDescription: hardwareDescription,
+            sectionComment: sectionComment
+        )
         let directory = url.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -159,7 +171,8 @@ public struct PCAPNGCodec: Sendable {
 
     private func appendSectionHeaderBlock(
         to stream: inout BinaryBufferWriter,
-        hardwareDescription: String
+        hardwareDescription: String,
+        sectionComment: String?
     ) {
         var body = BinaryBufferWriter(capacity: 128)
         body.appendUInt32LE(Self.byteOrderMagic)
@@ -167,6 +180,9 @@ public struct PCAPNGCodec: Sendable {
         body.appendUInt16LE(0) // Minor Version 0
         body.appendUInt64LE(0xFFFF_FFFF_FFFF_FFFF) // Unspecified Section Length (-1)
 
+        if let sectionComment, !sectionComment.isEmpty {
+            Self.appendUTF8Option(to: &body, code: OptionCode.comment, text: sectionComment)
+        }
         Self.appendUTF8Option(to: &body, code: OptionCode.shbHardware, text: hardwareDescription)
         Self.appendUTF8Option(to: &body, code: OptionCode.shbOS, text: "macOS arm64 (Apple Silicon)")
         Self.appendUTF8Option(to: &body, code: OptionCode.shbUserAppl, text: "AgentVM NetSwitch 1.0")

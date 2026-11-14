@@ -565,7 +565,7 @@ struct ModelsAndBinaryPrimitivesTests {
                 )
             ],
             virtioFSMounts: [
-                VirtioFSMountSpec(mountTag: "workspace", hostDirectoryPath: "/Users/Shared/repo", guestMountPoint: "/workspace", readOnly: false),
+                VirtioFSMountSpec(mountTag: "workspace", hostDirectoryPath: "/srv/shared/repo", guestMountPoint: "/workspace", readOnly: false),
                 VirtioFSMountSpec(mountTag: "toolchains", hostDirectoryPath: "/opt/toolchains", guestMountPoint: "/mnt/toolchains", readOnly: true)
             ],
             networkInterfaces: [

@@ -10,13 +10,13 @@ import Virtualization
 // MARK: - Unified Fleet Hypervisor, CoW Branching & Network DPI Coordinator
 
 public enum HypervisorExecutionBackend: String, Codable, Hashable, Sendable {
-    /// Uses real `VZVirtualMachine` when bootable guest kernel/EFI media exists on disk,
-    /// otherwise transparently runs real APFS CoW disk + ISO-9660 + L2 DPI Switch + Vsock RPC simulation.
+    /// Legacy alias preserved for binary/source compatibility; behaves identically to `strictHardwareVZ`
+    /// (never silently falls back to `SimulatedGuestEngine`).
     case automaticHybrid
-    /// Strictly requires `VZVirtualMachine` hardware execution.
+    /// Default honest backend: requires a bootable guest OS/kernel and real `VZVirtualMachine` execution.
     case strictHardwareVZ
-    /// Deterministic headless hypervisor simulation backed by real APFS CoW disks, real ISO-9660 images,
-    /// real `UserSpaceL2Switch` packets, and real `VsockMultiplexSession` wire frames.
+    /// Explicit simulation backend (`--backend simulation` or `--demo`): uses `SimulatedGuestEngine`
+    /// over `VsockMultiplexSession` wire frames alongside APFS CoW disks and ISO-9660 images.
     case deterministicSimulation
 }
 
@@ -99,7 +99,7 @@ public actor AgentVMFleetCoordinator {
 
     public init(
         bundleURL: URL,
-        executionBackend: HypervisorExecutionBackend = .automaticHybrid
+        executionBackend: HypervisorExecutionBackend = .strictHardwareVZ
     ) throws {
         let createdStore = try AgentVMProjectStore(bundleURL: bundleURL, createIfMissing: true)
         self.store = createdStore
@@ -118,7 +118,11 @@ public actor AgentVMFleetCoordinator {
     }
 
     public func hostCapabilities() -> HostCapabilityReport {
-        HostHypervisorProbe.probeCapabilities()
+        HostHypervisorProbe.probeCapabilities(probeDirectoryURL: store.bundleURL)
+    }
+
+    public func currentExecutionBackend() -> HypervisorExecutionBackend {
+        executionBackend
     }
 
     public func setExecutionBackend(_ backend: HypervisorExecutionBackend) {
@@ -312,27 +316,59 @@ public actor AgentVMFleetCoordinator {
         }
 
         let tty = ensureTerminalBuffer(for: vmID)
-        tty.feed("\u{001B}[1;32m[VZBoot]\u{001B}[0m Initializing Apple Virtualization topology for \(record.spec.name)...\r\n")
 
-        let canBootRealKernel: Bool = {
-            if executionBackend == .deterministicSimulation { return false }
-            if !VZVirtualMachine.isSupported { return false }
-            if case let .linuxKernel(kpath, _, _) = record.spec.bootLoader {
-                return FileManager.default.fileExists(atPath: kpath)
+        if executionBackend == .deterministicSimulation {
+            let session = VsockMultiplexSession(vmID: vmID)
+            await session.attachSimulatedGuestResponder()
+            await session.attachTerminalScreenBuffer(tty)
+            vsockSessions[vmID] = session
+
+            for rule in record.spec.portForwards where rule.enabled {
+                _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
             }
-            return executionBackend == .strictHardwareVZ
-        }()
 
-        if canBootRealKernel {
-            let nicMAC = record.spec.networkInterfaces.first.flatMap { MACAddress(parsing: $0.macAddress) }
-                ?? MACAddress.deterministicGuestMAC(seed: vmID.rawValue)
-            let (vmFD, _) = try await l2Switch.createPortSocketPair(for: vmID, macAddress: nicMAC)
-            let readPipe = Pipe()
-            let writePipe = Pipe()
-            let specCopy = record.spec
-            let translator = vzTranslator
-            let vmQueue = DispatchQueue(label: "io.zxu756.agentvm.vz.\(vmID.rawValue)")
-            let box: HardwareVZBox = try await withCheckedThrowingContinuation { cont in
+            bootTimestamps[vmID] = Date()
+            record.lastBootedAt = Date()
+            record.telemetry.state = .running
+            record.telemetry.cpuUsagePercent = 0.0
+            record.telemetry.memoryResidentMB = 0
+            record.telemetry.hasLiveGuestTelemetry = false
+            record.telemetry.guestAgentConnected = true
+            record.telemetry.vsockStreamsOpen = await session.openStreamCount()
+            try await store.upsertVM(record)
+
+            tty.feed("[SIMULATED] Deterministic host-side simulation responder attached for \(record.spec.name).\r\n")
+            tty.feed("\u{001B}[1;32magent@\(record.spec.name)\u{001B}[0m:\u{001B}[1;34m/workspace\u{001B}[0m$ ")
+
+            try await store.appendDiagnostic(DiagnosticEvent(
+                severity: .info,
+                subsystem: "Hypervisor",
+                vmID: vmID,
+                code: "VM_BOOTED_SIMULATED",
+                message: "[SIMULATED] VM '\(record.spec.name)' entered simulated RUNNING state."
+            ))
+            return record
+        }
+
+        try verifyBootableGuestSystem(for: record.spec)
+
+        guard VZVirtualMachine.isSupported else {
+            throw AgentVMError.virtualizationUnsupported(
+                reason: "VZVirtualMachine.isSupported returned false (missing com.apple.security.virtualization entitlement or unsupported host)."
+            )
+        }
+
+        let nicMAC = record.spec.networkInterfaces.first.flatMap { MACAddress(parsing: $0.macAddress) }
+            ?? MACAddress.deterministicGuestMAC(seed: vmID.rawValue)
+        let (vmFD, _) = try await l2Switch.createPortSocketPair(for: vmID, macAddress: nicMAC)
+        let readPipe = Pipe()
+        let writePipe = Pipe()
+        let specCopy = record.spec
+        let translator = vzTranslator
+        let vmQueue = DispatchQueue(label: "io.zxu756.agentvm.vz.\(vmID.rawValue)")
+        let box: HardwareVZBox
+        do {
+            box = try await withCheckedThrowingContinuation { cont in
                 vmQueue.async {
                     do {
                         let vzConfig = try translator.buildVZConfiguration(
@@ -360,43 +396,74 @@ public actor AgentVMFleetCoordinator {
                     }
                 }
             }
-            hardwareBoxes[vmID] = box
-        } else if executionBackend == .strictHardwareVZ {
-            throw AgentVMError.virtualizationUnsupported(reason: "Bootable guest kernel binary not present for strictHardwareVZ mode.")
+        } catch {
+            await l2Switch.detachPort(for: vmID)
+            throw error
         }
-
-        // Attach multiplexed AVM1 VirtioSocket session + simulated responder when running hybrid/simulation
-        let session = VsockMultiplexSession(vmID: vmID)
-        await session.attachSimulatedGuestResponder()
-        await session.attachTerminalScreenBuffer(tty)
-        vsockSessions[vmID] = session
-
-        // Activate enabled port-forward rules
-        for rule in record.spec.portForwards where rule.enabled {
-            _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
-        }
+        hardwareBoxes[vmID] = box
+        tty.feed("[VZBoot] Started Apple Virtualization.framework guest '\(record.spec.name)'.\r\n")
 
         bootTimestamps[vmID] = Date()
         record.lastBootedAt = Date()
         record.telemetry.state = .running
-        record.telemetry.cpuUsagePercent = 14.5
-        record.telemetry.memoryResidentMB = min(record.spec.compute.memoryMB, 640)
-        record.telemetry.guestAgentConnected = true
-        record.telemetry.vsockStreamsOpen = await session.openStreamCount()
+        record.telemetry.cpuUsagePercent = 0.0
+        record.telemetry.memoryResidentMB = 0
+        record.telemetry.hasLiveGuestTelemetry = false
+        record.telemetry.guestAgentConnected = false
+        record.telemetry.vsockStreamsOpen = 0
         try await store.upsertVM(record)
-
-        tty.feed("\u{001B}[1;36m[systemd]\u{001B}[0m Started agentvm-guestd.service (AVM1 vsock port 1025).\r\n")
-        tty.feed("\u{001B}[1;32magent@\(record.spec.name)\u{001B}[0m:\u{001B}[1;34m/workspace\u{001B}[0m$ ")
 
         try await store.appendDiagnostic(DiagnosticEvent(
             severity: .info,
             subsystem: "Hypervisor",
             vmID: vmID,
             code: "VM_BOOTED",
-            message: "VM '\(record.spec.name)' entered RUNNING state with AVM1 Guest Agent connected."
+            message: "Booted VM '\(record.spec.name)' via Virtualization.framework."
         ))
 
         return record
+    }
+
+    private func verifyBootableGuestSystem(for spec: VMSpec) throws {
+        switch spec.bootLoader {
+        case .linuxKernel(let vmlinuzPath, _, _):
+            let trimmed = vmlinuzPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, FileManager.default.fileExists(atPath: trimmed) else {
+                throw AgentVMError.noBootableSystem(
+                    vmName: spec.name,
+                    detail: "Linux kernel image not found at '\(trimmed)'."
+                )
+            }
+        case .macOSBoot(let hardwareModelPath, _, let auxiliaryStoragePath):
+            guard FileManager.default.fileExists(atPath: auxiliaryStoragePath),
+                  FileManager.default.fileExists(atPath: hardwareModelPath) else {
+                throw AgentVMError.noBootableSystem(
+                    vmName: spec.name,
+                    detail: "macOS auxiliary storage or hardware model missing."
+                )
+            }
+        case .efiBoot:
+            guard let bootDisk = spec.blockDevices.first(where: \.isBootVolume) ?? spec.blockDevices.first else {
+                throw AgentVMError.noBootableSystem(
+                    vmName: spec.name,
+                    detail: "No boot block device configured."
+                )
+            }
+            let diskURL = URL(fileURLWithPath: bootDisk.imagePath)
+            guard FileManager.default.fileExists(atPath: diskURL.path) else {
+                throw AgentVMError.noBootableSystem(
+                    vmName: spec.name,
+                    detail: "Boot disk image missing at '\(diskURL.lastPathComponent)'."
+                )
+            }
+            let forensics = try forensicsAnalyzer.analyzeDiskImage(at: diskURL, maxHeatmapSamples: 1)
+            if forensics.detectedFilesystems.isEmpty {
+                throw AgentVMError.noBootableSystem(
+                    vmName: spec.name,
+                    detail: "Boot disk '\(diskURL.lastPathComponent)' contains only an empty partition table with no installed EFI bootloader or root OS filesystem."
+                )
+            }
+        }
     }
 
     public func pauseVM(_ vmID: VMID, reason: String = "User requested pause") async throws -> VMInstanceRecord {
@@ -457,7 +524,6 @@ public actor AgentVMFleetCoordinator {
         }
 
         record.telemetry.state = .running
-        record.telemetry.cpuUsagePercent = 11.2
         try await store.upsertVM(record)
         return record
     }
@@ -489,6 +555,7 @@ public actor AgentVMFleetCoordinator {
         record.telemetry.state = .stopped
         record.telemetry.cpuUsagePercent = 0
         record.telemetry.memoryResidentMB = 0
+        record.telemetry.hasLiveGuestTelemetry = false
         record.telemetry.guestAgentConnected = false
         try await store.upsertVM(record)
         return record
@@ -540,9 +607,8 @@ public actor AgentVMFleetCoordinator {
                         }
                     }
                 }
-            } else {
-                // Persist deterministic VM RAM metadata frame for hybrid inspection
-                let stateMeta = Data("AVMSTATE1:\(vmID.rawValue):\(record.telemetry.memoryResidentMB)MB".utf8)
+            } else if executionBackend == .deterministicSimulation {
+                let stateMeta = Data("SIMULATED-AVMSTATE1:\(vmID.rawValue)".utf8)
                 try stateMeta.write(to: stateFileURL, options: .atomic)
             }
             if let attrs = try? FileManager.default.attributesOfItem(atPath: stateFileURL.path),
@@ -760,6 +826,12 @@ public actor AgentVMFleetCoordinator {
         }
         if record.telemetry.state != .running {
             _ = try await bootVM(vmID)
+        } else if executionBackend == .deterministicSimulation && vsockSessions[vmID] == nil {
+            let tty = ensureTerminalBuffer(for: vmID)
+            let session = VsockMultiplexSession(vmID: vmID)
+            await session.attachSimulatedGuestResponder()
+            await session.attachTerminalScreenBuffer(tty)
+            vsockSessions[vmID] = session
         }
 
         // Dispatch JavaScriptCore pre-exec plugins (Secret Leak Veto + Auto Pre-Destructive Checkpoint)
@@ -781,7 +853,10 @@ public actor AgentVMFleetCoordinator {
         }
 
         guard let session = vsockSessions[vmID] else {
-            throw AgentVMError.vsockProtocolViolation(detail: "No active VsockMultiplexSession for \(vmID.rawValue).")
+            throw AgentVMError.guestAgentNotConnected(
+                vmName: record.spec.name,
+                state: record.telemetry.state.rawValue
+            )
         }
 
         let tty = ensureTerminalBuffer(for: vmID)
@@ -829,8 +904,18 @@ public actor AgentVMFleetCoordinator {
     // MARK: - Rich Deterministic Workspace Seeding (Real APFS CoW + Real L2 Packets + Real Snapshots)
 
     public func seedIndustrialDemonstrationFleetIfEmpty() async throws {
+        var manifest = try await store.loadManifest()
+        if !manifest.isDemonstrationWorkspace {
+            manifest.isDemonstrationWorkspace = true
+            try await store.saveManifest(manifest)
+        }
+
         let existing = try await store.listVMs()
         guard existing.isEmpty else { return }
+
+        let previousBackend = executionBackend
+        executionBackend = .deterministicSimulation
+        defer { executionBackend = previousBackend }
 
         // 1. Primary Golden Sandbox Blade
         let baseSummary = try await createSandboxVM(
@@ -864,7 +949,7 @@ public actor AgentVMFleetCoordinator {
             try handle.close()
         }
 
-        // 2. Fork two concurrent CoW Agent Branches (< 20 ms each!)
+        // 2. Fork two concurrent CoW Agent Branches (demo topology)
         let claudeFork = try await forkCoWBranch(
             fromVMID: baseID,
             branchName: "claude-refactor-auth",

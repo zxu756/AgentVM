@@ -43,9 +43,12 @@ enum AgentVMEntryPoint {
         }
 
         // 2. JSON-RPC 2.0 Model Context Protocol Server (`agentvm mcp`)
-        if let mcpBundleURL = extractMCPServerInvocation(from: rawArgs) {
+        if let mcpInvocation = extractMCPServerInvocation(from: rawArgs) {
             do {
-                let coordinator = try AgentVMFleetCoordinator(bundleURL: mcpBundleURL)
+                let coordinator = try AgentVMFleetCoordinator(
+                    bundleURL: mcpInvocation.bundleURL,
+                    executionBackend: mcpInvocation.backend
+                )
                 let server = AgentVMMCPServer(coordinator: coordinator)
                 await server.runStdioLoop()
                 Darwin.exit(0)
@@ -94,9 +97,12 @@ enum AgentVMEntryPoint {
         return nil
     }
 
-    private static func extractMCPServerInvocation(from args: [String]) -> URL? {
+    private static func extractMCPServerInvocation(
+        from args: [String]
+    ) -> (bundleURL: URL, backend: HypervisorExecutionBackend)? {
         let stripped = AppLanguage.strippingLanguageArguments(from: args)
         var resolvedURL = AgentVMCLIRunner.defaultWorkspaceBundleURL()
+        var backend: HypervisorExecutionBackend = .strictHardwareVZ
         var idx = 0
         var sawMCP = false
         while idx < stripped.count {
@@ -104,6 +110,30 @@ enum AgentVMEntryPoint {
             if (token == "--workspace" || token == "-w"), idx + 1 < stripped.count {
                 resolvedURL = URL(fileURLWithPath: stripped[idx + 1], isDirectory: true)
                 idx += 2
+            } else if token.hasPrefix("--workspace=") {
+                let path = String(token.dropFirst("--workspace=".count))
+                resolvedURL = URL(fileURLWithPath: path, isDirectory: true)
+                idx += 1
+            } else if token == "--backend", idx + 1 < stripped.count {
+                let raw = stripped[idx + 1].lowercased()
+                if raw == "simulation" {
+                    backend = .deterministicSimulation
+                } else if raw == "hardware" || raw == "vz" || raw == "default" {
+                    backend = .strictHardwareVZ
+                } else {
+                    return nil
+                }
+                idx += 2
+            } else if token.hasPrefix("--backend=") {
+                let raw = String(token.dropFirst("--backend=".count)).lowercased()
+                if raw == "simulation" {
+                    backend = .deterministicSimulation
+                } else if raw == "hardware" || raw == "vz" || raw == "default" {
+                    backend = .strictHardwareVZ
+                } else {
+                    return nil
+                }
+                idx += 1
             } else if token == "mcp" {
                 sawMCP = true
                 idx += 1
@@ -111,7 +141,7 @@ enum AgentVMEntryPoint {
                 return nil
             }
         }
-        return sawMCP ? resolvedURL : nil
+        return sawMCP ? (resolvedURL, backend) : nil
     }
 
     private static func isCLIInvocation(_ args: [String]) -> Bool {
@@ -128,15 +158,23 @@ enum AgentVMEntryPoint {
 
         var idx = 0
         while idx < filtered.count {
-            if (filtered[idx] == "--workspace" || filtered[idx] == "-w"), idx + 1 < filtered.count {
+            let token = filtered[idx]
+            if (token == "--workspace" || token == "-w"), idx + 1 < filtered.count {
                 idx += 2
+            } else if token.hasPrefix("--workspace=") {
+                idx += 1
+            } else if token == "--demo" {
+                idx += 1
+            } else if token == "--backend", idx + 1 < filtered.count {
+                idx += 2
+            } else if token.hasPrefix("--backend=") {
+                idx += 1
             } else {
-                let candidate = filtered[idx]
-                if cliSubcommands.contains(candidate) {
+                if cliSubcommands.contains(token) {
                     return true
                 }
                 // Any explicit non-system flag/subcommand routes to CLI for helpful usage reporting
-                return !candidate.hasPrefix("-NS")
+                return !token.hasPrefix("-NS")
             }
         }
         return false
@@ -170,7 +208,8 @@ enum AgentVMEntryPoint {
         )
         let viewModel = AgentVMStudioViewModel(
             bundleURL: tempBundleURL,
-            coordinator: coordinator
+            coordinator: coordinator,
+            isDemoMode: true
         )
 
         // Hydrate 3 VMs, CoW branches, snapshots, L2 dissected packets, ext4 superblocks, ISO-9660 & 4 JS plugins

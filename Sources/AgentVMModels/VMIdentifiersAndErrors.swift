@@ -236,6 +236,8 @@ public struct ValidationIssue: Codable, Hashable, Sendable, Identifiable {
 
 public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case virtualizationUnsupported(reason: String)
+    case noBootableSystem(vmName: String, detail: String)
+    case guestAgentNotConnected(vmName: String, state: String)
     case invalidConfiguration(issues: [ValidationIssue])
     case vmNotFound(VMID)
     case snapshotNotFound(SnapshotID)
@@ -266,6 +268,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     public var errorCode: String {
         switch self {
         case .virtualizationUnsupported: return "ERR_VZ_UNSUPPORTED"
+        case .noBootableSystem: return "ERR_NO_BOOTABLE_SYSTEM"
+        case .guestAgentNotConnected: return "ERR_GUEST_AGENT_UNAVAILABLE"
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
         case .vmNotFound: return "ERR_VM_NOT_FOUND"
         case .snapshotNotFound: return "ERR_SNAPSHOT_NOT_FOUND"
@@ -296,63 +300,126 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     }
 
     public var errorDescription: String? {
+        localizedMessage(in: .en)
+    }
+
+    public func localizedMessage(in language: AppLanguage) -> String {
+        let isZh = (language == .zhHans)
         switch self {
         case let .virtualizationUnsupported(reason):
-            return "Apple Virtualization.framework unavailable: \(reason)"
+            return isZh
+                ? "Apple Virtualization.framework 不可用：\(reason)"
+                : "Apple Virtualization.framework unavailable: \(reason)"
+        case let .noBootableSystem(vmName, detail):
+            return isZh
+                ? "虚拟机「\(vmName)」磁盘上没有可引导的客户机系统（内核或根文件系统缺失）：\(detail) 若仅需验证主机侧协议演练，请显式传入 --backend simulation。"
+                : "VM '\(vmName)' has no bootable guest OS or kernel on its disk: \(detail) Pass --backend simulation explicitly if you want to run the host-side simulation responder."
+        case let .guestAgentNotConnected(vmName, state):
+            return isZh
+                ? "虚拟机「\(vmName)」当前状态为 \(state)，尚未连接真实客户机代理（agentvm-guestd），无法执行客户机命令。"
+                : "VM '\(vmName)' is in state '\(state)' with no live guest agent connection; cannot execute guest command."
         case let .invalidConfiguration(issues):
             let summary = issues.map { "\($0.fieldPath): \($0.message)" }.joined(separator: "; ")
-            return "VM specification failed validation (\(issues.count) issue(s)): \(summary)"
+            return isZh
+                ? "虚拟机配置校验未通过（共 \(issues.count) 项）：\(summary)"
+                : "VM specification failed validation (\(issues.count) issue(s)): \(summary)"
         case let .vmNotFound(id):
-            return "Virtual machine '\(id.rawValue)' was not found in workspace."
+            return isZh
+                ? "工作区中未找到虚拟机「\(id.rawValue)」。"
+                : "Virtual machine '\(id.rawValue)' was not found in workspace."
         case let .snapshotNotFound(id):
-            return "Snapshot '\(id.rawValue)' does not exist in lineage DAG."
+            return isZh
+                ? "血缘 DAG 中不存在快照「\(id.rawValue)」。"
+                : "Snapshot '\(id.rawValue)' does not exist in lineage DAG."
         case let .invalidLifecycleTransition(vmID, from, requested):
-            return "Cannot perform '\(requested)' on VM '\(vmID.rawValue)' while in state '\(from)'."
+            return isZh
+                ? "虚拟机「\(vmID.rawValue)」处于「\(from)」状态时无法执行「\(requested)」。"
+                : "Cannot perform '\(requested)' on VM '\(vmID.rawValue)' while in state '\(from)'."
         case let .diskImageOperationFailed(path, errnoCode, detail):
-            return "Disk operation failed on '\(path)' (errno=\(errnoCode)): \(detail)"
+            return isZh
+                ? "磁盘操作失败「\(path)」（errno=\(errnoCode)）：\(detail)"
+                : "Disk operation failed on '\(path)' (errno=\(errnoCode)): \(detail)"
         case let .cowCloneFailed(source, destination, errnoCode):
-            return "APFS clonefile failed from '\(source)' to '\(destination)' (errno=\(errnoCode))."
+            return isZh
+                ? "APFS clonefile 克隆失败：从「\(source)」到「\(destination)」（errno=\(errnoCode)）。"
+                : "APFS clonefile failed from '\(source)' to '\(destination)' (errno=\(errnoCode))."
         case let .iso9660BuildFailed(detail):
-            return "Cloud-Init ISO-9660 image build error: \(detail)"
+            return isZh
+                ? "Cloud-Init ISO-9660 镜像构建错误：\(detail)"
+                : "Cloud-Init ISO-9660 image build error: \(detail)"
         case let .partitionTableInvalid(detail):
-            return "Disk partition header verification failed: \(detail)"
+            return isZh
+                ? "磁盘分区表校验失败：\(detail)"
+                : "Disk partition header verification failed: \(detail)"
         case let .networkFrameMalformed(layer, detail):
-            return "Malformed \(layer) network frame: \(detail)"
+            return isZh
+                ? "\(layer) 网络帧格式错误：\(detail)"
+                : "Malformed \(layer) network frame: \(detail)"
         case let .pcapCorrupted(detail):
-            return "PCAPNG capture stream error: \(detail)"
+            return isZh
+                ? "PCAPNG 抓包流错误：\(detail)"
+                : "PCAPNG capture stream error: \(detail)"
         case let .firewallBlocked(ruleID, reason):
             let tag = ruleID?.rawValue ?? "implicit-deny"
-            return "Packet blocked by firewall rule '\(tag)': \(reason)"
+            return isZh
+                ? "数据包已被防火墙规则「\(tag)」阻断：\(reason)"
+                : "Packet blocked by firewall rule '\(tag)': \(reason)"
         case let .vsockProtocolViolation(detail):
-            return "VirtioSocket RPC framing violation: \(detail)"
+            return isZh
+                ? "VirtioSocket RPC 帧协议错误：\(detail)"
+                : "VirtioSocket RPC framing violation: \(detail)"
         case let .vsockCRCMismatch(expected, actual):
-            return String(format: "Vsock frame CRC32 mismatch (expected 0x%08X, got 0x%08X).", expected, actual)
+            return isZh
+                ? String(format: "Vsock 帧 CRC32 校验不匹配（期望 0x%08X，实际 0x%08X）。", expected, actual)
+                : String(format: "Vsock frame CRC32 mismatch (expected 0x%08X, got 0x%08X).", expected, actual)
         case let .portForwardBindFailed(port, errnoCode):
-            return "Failed to bind localhost TCP port \(port) (errno=\(errnoCode))."
+            return isZh
+                ? "绑定本地 TCP 端口 \(port) 失败（errno=\(errnoCode)）。"
+                : "Failed to bind localhost TCP port \(port) (errno=\(errnoCode))."
         case let .snapshotCycleDetected(id):
-            return "Snapshot lineage cycle detected at node '\(id.rawValue)'."
+            return isZh
+                ? "在节点「\(id.rawValue)」处检测到快照血缘环路。"
+                : "Snapshot lineage cycle detected at node '\(id.rawValue)'."
         case let .storageDatabaseError(code, sql, detail):
-            return "SQLite error (\(code)) executing '\(sql)': \(detail)"
+            return isZh
+                ? "执行「\(sql)」时发生 SQLite 错误（\(code)）：\(detail)"
+                : "SQLite error (\(code)) executing '\(sql)': \(detail)"
         case let .storageMigrationFailed(fromVersion, toVersion, detail):
-            return "Schema migration v\(fromVersion)->v\(toVersion) failed: \(detail)"
+            return isZh
+                ? "数据库模式迁移 v\(fromVersion)->v\(toVersion) 失败：\(detail)"
+                : "Schema migration v\(fromVersion)->v\(toVersion) failed: \(detail)"
         case let .bundleIntegrityError(path, detail):
-            return "Workspace bundle integrity error at '\(path)': \(detail)"
+            return isZh
+                ? "工作区包完整性错误「\(path)」：\(detail)"
+                : "Workspace bundle integrity error at '\(path)': \(detail)"
         case .undoStackEmpty:
-            return "No reversible operation available to undo."
+            return isZh ? "当前没有可撤销的操作。" : "No reversible operation available to undo."
         case .redoStackEmpty:
-            return "No undone operation available to redo."
+            return isZh ? "当前没有可重做的操作。" : "No undone operation available to redo."
         case let .pluginPermissionDenied(pluginID, capability):
-            return "Plugin '\(pluginID.rawValue)' lacks required capability '\(capability)'."
+            return isZh
+                ? "插件「\(pluginID.rawValue)」缺少所需权限「\(capability)」。"
+                : "Plugin '\(pluginID.rawValue)' lacks required capability '\(capability)'."
         case let .pluginExecutionFailed(pluginID, detail):
-            return "Plugin '\(pluginID.rawValue)' threw runtime error: \(detail)"
+            return isZh
+                ? "插件「\(pluginID.rawValue)」运行时报错：\(detail)"
+                : "Plugin '\(pluginID.rawValue)' threw runtime error: \(detail)"
         case let .pluginTimedOut(pluginID, limitMs):
-            return "Plugin '\(pluginID.rawValue)' exceeded execution watchdog (\(limitMs) ms)."
+            return isZh
+                ? "插件「\(pluginID.rawValue)」超过看门狗执行时限（\(limitMs) ms）。"
+                : "Plugin '\(pluginID.rawValue)' exceeded execution watchdog (\(limitMs) ms)."
         case let .cliUsageError(detail):
-            return "CLI argument error: \(detail)"
+            return isZh
+                ? "命令行参数错误：\(detail)"
+                : "CLI argument error: \(detail)"
         case let .ipcDaemonUnavailable(socketPath, detail):
-            return "AgentVM daemon socket '\(socketPath)' unreachable: \(detail)"
+            return isZh
+                ? "无法连接 AgentVM 守护套接字「\(socketPath)」：\(detail)"
+                : "AgentVM daemon socket '\(socketPath)' unreachable: \(detail)"
         case let .resourceQuotaExceeded(resource, requested, limit):
-            return "Fleet quota exceeded for \(resource): requested \(requested), limit \(limit)."
+            return isZh
+                ? "超出集群配额（\(resource)）：请求 \(requested)，上限 \(limit)。"
+                : "Fleet quota exceeded for \(resource): requested \(requested), limit \(limit)."
         }
     }
 

@@ -5,7 +5,7 @@ import AgentVMWorkbenchShell
 import Foundation
 import Testing
 
-@Suite("M12 Bilingual Localization (`中文` / `EN`), Locale Priority & HTML Dossier")
+@Suite("M12 Bilingual Localization (`中文` / `EN`), Locale Priority & HTML Dossier", .timeLimit(.minutes(1)))
 struct BilingualLocalizationTests {
 
     private func makeIsolatedDefaults() throws -> (UserDefaults, String) {
@@ -143,7 +143,7 @@ struct BilingualLocalizationTests {
         #expect(WorkbenchDocumentKind.packetWiretap.localizedDefaultTitle == "L2 Packet Wiretap")
     }
 
-    @Test("AgentVMCLIRunner honors --lang flag and HtmlFleetReportExporter emits Hallmark-clean bilingual dossier")
+    @Test("AgentVMCLIRunner honors --lang flag and simulated demo HtmlFleetReportExporter emits Hallmark-clean bilingual dossier")
     func cliLanguageFlagAndBilingualHtmlDossierMarkers() async throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("avm-bilingual-html-\(UUID().uuidString)", isDirectory: true)

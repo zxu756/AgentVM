@@ -3,7 +3,7 @@ import AgentVMStore
 import Foundation
 import Testing
 
-@Suite("M02 SQLite WAL Store, v1->v4 Migrations, Undo/Redo, Catalog & Snapshot DAG")
+@Suite("M02 SQLite WAL Store, v1->v4 Migrations, Undo/Redo, Catalog & Snapshot DAG", .timeLimit(.minutes(1)))
 struct StoreMigrationsAndUndoTests {
 
     // MARK: - Helpers
@@ -162,6 +162,25 @@ struct StoreMigrationsAndUndoTests {
                 bindables: ["snap-orphan", "vm-does-not-exist"]
             )
         }
+    }
+
+    @Test("SQLiteWALDatabase(inMemoryNamed:) uses SQLite URI memory mode and creates zero files in working directory")
+    func sqliteNamedInMemoryDatabaseCreatesZeroFilesOnDisk() throws {
+        let uniqueName = "inmem-cwd-guard-\(UUID().uuidString)"
+        let cwdURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let leakedCandidate = cwdURL.appendingPathComponent(uniqueName)
+        defer {
+            try? FileManager.default.removeItem(at: leakedCandidate)
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: leakedCandidate.path + "-wal"))
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: leakedCandidate.path + "-shm"))
+        }
+
+        let db = try SQLiteWALDatabase(inMemoryNamed: uniqueName, runMigrations: true)
+        _ = try db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t (id) VALUES (1);")
+        #expect(FileManager.default.fileExists(atPath: leakedCandidate.path) == false)
+        #expect(FileManager.default.fileExists(atPath: leakedCandidate.path + "-wal") == false)
+        #expect(FileManager.default.fileExists(atPath: leakedCandidate.path + "-shm") == false)
+        db.close()
     }
 
     // MARK: - 2. AgentVMProjectStore Full CRUD Round-Trips & Integrity/Stats

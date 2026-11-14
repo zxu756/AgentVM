@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="en" data-title-en="avm-demo-audit: AgentVM Security Audit" data-title-zh="avm-demo-audit: AgentVM 安全合规审计档案">
+<html lang="en" data-title-en="[DEMO] SandboxFleet: AgentVM Security Audit" data-title-zh="[演示数据] SandboxFleet: AgentVM 安全合规审计档案">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="AgentVM microVM fleet security, Copy-on-Write storage lineage, and Layer-2 DPI firewall audit report.">
-<title>avm-demo-audit: AgentVM Security Audit</title>
+<title>[DEMO] SandboxFleet: AgentVM Security Audit</title>
 <style>
 /* Hallmark · v2.0.0 · scope: app · genre: modern-minimal · posture: restrained · shape: app screen · surface: absolute */
 /* hallmark · rack-graphite dark telemetry surface with tabular monospace counters */
@@ -125,6 +125,17 @@ p.lead {
   font-size: 0.95rem;
   color: var(--ink-secondary);
 }
+.demo-banner {
+  background: var(--signal-amber-soft);
+  border: 1px solid var(--signal-amber);
+  color: var(--signal-amber);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
 .metrics {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -244,7 +255,7 @@ footer {
 <main class="shell">
   <header class="mast">
     <div>
-      <h1>avm-demo-audit</h1>
+      <h1 data-en="[DEMO] SandboxFleet" data-zh="[演示数据] SandboxFleet">[DEMO] SandboxFleet</h1>
       <p class="lead" data-en="Apple Virtualization (arm64) Fleet, APFS Copy-on-Write Lineage &amp; Layer-2 DPI Firewall Audit" data-zh="Apple Virtualization (arm64) 微虚拟机集群、APFS 写时复制血统与二层深度包检测防火墙审计">Apple Virtualization (arm64) Fleet, APFS Copy-on-Write Lineage &amp; Layer-2 DPI Firewall Audit</p>
     </div>
     <div class="mast-actions">
@@ -257,6 +268,7 @@ footer {
       <button class="filter-btn" type="button" onclick="window.print()" data-en="Print Compliance Snapshot" data-zh="打印合规审计快照">Print Compliance Snapshot</button>
     </div>
   </header>
+    <div class="demo-banner" role="note" data-en="[DEMO] Synthetic demonstration dataset: simulated microVMs, crafted Layer-2 frames, and sample audit metrics (not captured from live guest VMs)." data-zh="[演示数据] 合成演示数据集：模拟微虚拟机、构造的二层数据帧与示例审计指标（非真实客户机运行采集）。">[DEMO] Synthetic demonstration dataset: simulated microVMs, crafted Layer-2 frames, and sample audit metrics (not captured from live guest VMs).</div>
 
   <section class="metrics" aria-label="Fleet telemetry summary">
     <div class="metric-box">
@@ -337,7 +349,7 @@ footer {
   <td class="mono">0.0.0.0</td>
   <td class="mono">255.255.255.255</td>
   <td><span class="pill pill-allow" data-en="Allowed" data-zh="放行">Allowed</span></td>
-  <td>DHCP Discover - Transaction ID 0x41562026 (52:54:00:30:0b:d0)</td>
+  <td>DHCP Discover - Transaction ID 0x41562026 (52:54:00:2e:f1:4a)</td>
 </tr><tr>
   <td class="mono">#2</td>
   <td class="mono">DHCP</td>

@@ -168,10 +168,10 @@ public final class CommandPaletteController: ObservableObject {
         [
             CommandPaletteActionItem(
                 id: "vm.branch.cow",
-                title: L("Fork Instant APFS Copy-on-Write Branch", "分叉瞬时 APFS 写时复制 (CoW) 分支"),
+                title: L("Fork APFS Copy-on-Write Branch", "分叉 APFS 写时复制 (CoW) 分支"),
                 subtitle: L(
-                    "Clones active VM disk via clonefile(2) in < 20 ms without halting parent",
-                    "基于 clonefile(2) 在 20ms 内零拷贝克隆虚拟机磁盘，无需停机父节点"
+                    "Clones VM disk via APFS clonefile(2) Copy-on-Write",
+                    "基于 APFS clonefile(2) 写时复制克隆虚拟机磁盘"
                 ),
                 category: .cowBranching,
                 keyEquivalentDisplay: "⌘B",

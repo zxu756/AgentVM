@@ -376,6 +376,7 @@ public struct AgentVMProjectManifest: Codable, Hashable, Sendable {
     public var createdAt: Date
     public var updatedAt: Date
     public var preferences: WorkspacePreferences
+    public var isDemonstrationWorkspace: Bool
 
     public init(
         formatVersion: Int = 4,
@@ -384,7 +385,8 @@ public struct AgentVMProjectManifest: Codable, Hashable, Sendable {
         createdByVersion: SemanticVersion = .current,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
-        preferences: WorkspacePreferences = WorkspacePreferences()
+        preferences: WorkspacePreferences = WorkspacePreferences(),
+        isDemonstrationWorkspace: Bool = false
     ) {
         self.formatVersion = formatVersion
         self.workspaceID = workspaceID
@@ -393,5 +395,29 @@ public struct AgentVMProjectManifest: Codable, Hashable, Sendable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.preferences = preferences
+        self.isDemonstrationWorkspace = isDemonstrationWorkspace
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case formatVersion
+        case workspaceID
+        case title
+        case createdByVersion
+        case createdAt
+        case updatedAt
+        case preferences
+        case isDemonstrationWorkspace
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.formatVersion = try container.decode(Int.self, forKey: .formatVersion)
+        self.workspaceID = try container.decode(WorkspaceID.self, forKey: .workspaceID)
+        self.title = try container.decode(String.self, forKey: .title)
+        self.createdByVersion = try container.decode(SemanticVersion.self, forKey: .createdByVersion)
+        self.createdAt = try container.decode(Date.self, forKey: .createdAt)
+        self.updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        self.preferences = try container.decode(WorkspacePreferences.self, forKey: .preferences)
+        self.isDemonstrationWorkspace = try container.decodeIfPresent(Bool.self, forKey: .isDemonstrationWorkspace) ?? false
     }
 }

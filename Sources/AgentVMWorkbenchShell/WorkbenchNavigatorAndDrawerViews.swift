@@ -166,7 +166,7 @@ public struct FleetNavigatorRailView: View {
                 }
 
                 HStack(spacing: 6) {
-                    Text("CPU \(Int(vm.telemetry.cpuUsagePercent.rounded()))%")
+                    Text(vm.telemetry.hasLiveGuestTelemetry ? "CPU \(Int(vm.telemetry.cpuUsagePercent.rounded()))%" : "CPU —")
                         .font(RackTheme.monoSmallFont)
                         .monospacedDigit()
                         .foregroundStyle(RackTheme.inkSecondary)
@@ -294,9 +294,16 @@ public struct VMHardwareInspectorRailView: View {
                         inspectorGroup(title: localizer.L("Compute & Memory", "计算与内存")) {
                             kvRow(localizer.L("vCPU Topology", "vCPU 拓扑"), localizer.L("\(vm.spec.compute.vcpuCount) Apple VZ Cores", "\(vm.spec.compute.vcpuCount) 核 Apple VZ"))
                             kvRow(localizer.L("Allocated RAM", "分配内存"), "\(vm.spec.compute.memoryMB) MB")
-                            kvRow(localizer.L("Resident RSS", "常驻内存"), "\(vm.telemetry.memoryResidentMB) MB")
-                            kvRow(localizer.L("Balloon Reclaim", "气球回收"), "\(vm.telemetry.balloonReclaimedMB) MB")
-                            kvRow(localizer.L("Guest Agent", "客户机代理"), vm.telemetry.guestAgentConnected ? localizer.L("AVM1 Connected", "AVM1 已连接") : localizer.L("Standby", "待命"))
+                            kvRow(localizer.L("Resident RSS", "常驻内存"), vm.telemetry.formattedMemoryResident)
+                            kvRow(localizer.L("Balloon Reclaim", "气球回收"), vm.telemetry.formattedBalloonReclaimed)
+                            kvRow(
+                                localizer.L("Guest Agent", "客户机代理"),
+                                vm.telemetry.guestAgentConnected
+                                    ? (vm.telemetry.hasLiveGuestTelemetry
+                                        ? localizer.L("AVM1 Connected", "AVM1 已连接")
+                                        : localizer.L("Simulated (AVM1)", "模拟连接 (AVM1)"))
+                                    : localizer.L("Standby", "待命")
+                            )
                         }
 
                         inspectorGroup(title: localizer.L("APFS Storage & VirtioFS", "APFS 存储与 VirtioFS")) {

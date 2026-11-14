@@ -136,12 +136,30 @@ public struct AgentVMMainWindowView: View {
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
 
+                if viewModel.isDemoMode {
+                    RackStatusPill(
+                        label: localizer.L("DEMO · SYNTHETIC DATA", "演示数据 · 合成样本"),
+                        color: RackTheme.amberAccent,
+                        monospaced: true
+                    )
+                }
+
                 if let vm = viewModel.selectedVM {
                     RackStatusPill(
                         label: "\(vm.spec.name) · \(vm.telemetry.state.localizedBadge)",
                         color: RackTheme.signalColor(for: vm.telemetry.state),
                         monospaced: true
                     )
+                }
+
+                if !viewModel.isDemoMode {
+                    Button {
+                        viewModel.loadDemonstrationFleet()
+                    } label: {
+                        Label(localizer.L("Load Demo", "载入演示"), systemImage: "sparkles.rectangle.stack")
+                    }
+                    .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
+                    .help(localizer.L("Populate workspace with synthetic [DEMO] VMs and packets", "填充带 [演示数据] 标记的合成演示虚拟机与数据包"))
                 }
             }
 

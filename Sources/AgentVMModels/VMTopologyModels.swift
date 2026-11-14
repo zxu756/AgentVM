@@ -571,6 +571,7 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
     public var activeTCPFlows: Int
     public var vsockStreamsOpen: Int
     public var guestAgentConnected: Bool
+    public var hasLiveGuestTelemetry: Bool
     public var uptimeSeconds: TimeInterval
     public var sampledAt: Date
 
@@ -591,6 +592,7 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         activeTCPFlows: Int = 0,
         vsockStreamsOpen: Int = 0,
         guestAgentConnected: Bool = false,
+        hasLiveGuestTelemetry: Bool = false,
         uptimeSeconds: TimeInterval = 0,
         sampledAt: Date = Date()
     ) {
@@ -610,8 +612,74 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         self.activeTCPFlows = activeTCPFlows
         self.vsockStreamsOpen = vsockStreamsOpen
         self.guestAgentConnected = guestAgentConnected
+        self.hasLiveGuestTelemetry = hasLiveGuestTelemetry
         self.uptimeSeconds = uptimeSeconds
         self.sampledAt = sampledAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case vmID
+        case state
+        case cpuUsagePercent
+        case memoryResidentMB
+        case balloonReclaimedMB
+        case diskReadBytesTotal
+        case diskWriteBytesTotal
+        case cowDirtyBytes
+        case netRxBytesTotal
+        case netTxBytesTotal
+        case netRxPackets
+        case netTxPackets
+        case firewallDroppedPackets
+        case activeTCPFlows
+        case vsockStreamsOpen
+        case guestAgentConnected
+        case hasLiveGuestTelemetry
+        case uptimeSeconds
+        case sampledAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.vmID = try container.decode(VMID.self, forKey: .vmID)
+        self.state = try container.decode(VMLifecycleState.self, forKey: .state)
+        self.cpuUsagePercent = try container.decode(Double.self, forKey: .cpuUsagePercent)
+        self.memoryResidentMB = try container.decode(UInt64.self, forKey: .memoryResidentMB)
+        self.balloonReclaimedMB = try container.decode(UInt64.self, forKey: .balloonReclaimedMB)
+        self.diskReadBytesTotal = try container.decode(UInt64.self, forKey: .diskReadBytesTotal)
+        self.diskWriteBytesTotal = try container.decode(UInt64.self, forKey: .diskWriteBytesTotal)
+        self.cowDirtyBytes = try container.decode(UInt64.self, forKey: .cowDirtyBytes)
+        self.netRxBytesTotal = try container.decode(UInt64.self, forKey: .netRxBytesTotal)
+        self.netTxBytesTotal = try container.decode(UInt64.self, forKey: .netTxBytesTotal)
+        self.netRxPackets = try container.decode(UInt64.self, forKey: .netRxPackets)
+        self.netTxPackets = try container.decode(UInt64.self, forKey: .netTxPackets)
+        self.firewallDroppedPackets = try container.decode(UInt64.self, forKey: .firewallDroppedPackets)
+        self.activeTCPFlows = try container.decode(Int.self, forKey: .activeTCPFlows)
+        self.vsockStreamsOpen = try container.decode(Int.self, forKey: .vsockStreamsOpen)
+        self.guestAgentConnected = try container.decode(Bool.self, forKey: .guestAgentConnected)
+        self.hasLiveGuestTelemetry = try container.decodeIfPresent(Bool.self, forKey: .hasLiveGuestTelemetry) ?? false
+        self.uptimeSeconds = try container.decode(TimeInterval.self, forKey: .uptimeSeconds)
+        self.sampledAt = try container.decode(Date.self, forKey: .sampledAt)
+    }
+
+    public var formattedCPUUsage: String {
+        guard hasLiveGuestTelemetry, state == .running else { return "—" }
+        return String(format: "%.1f%%", cpuUsagePercent)
+    }
+
+    public var formattedMemoryResident: String {
+        guard hasLiveGuestTelemetry else { return "—" }
+        return "\(memoryResidentMB) MB"
+    }
+
+    public func formattedMemoryResident(ofTotalMB totalMB: UInt64) -> String {
+        guard hasLiveGuestTelemetry else { return "— / \(totalMB) MB" }
+        return "\(memoryResidentMB) / \(totalMB) MB"
+    }
+
+    public var formattedBalloonReclaimed: String {
+        guard hasLiveGuestTelemetry else { return "—" }
+        return "\(balloonReclaimedMB) MB"
     }
 }
 

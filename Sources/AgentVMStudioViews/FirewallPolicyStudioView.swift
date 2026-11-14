@@ -26,6 +26,8 @@ public struct FirewallPolicyStudioView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            liveTrafficM5NoticeBanner
+
             presetAndLintHeaderBar
 
             if showAddRuleComposer {
@@ -37,13 +39,43 @@ public struct FirewallPolicyStudioView: View {
             }
 
             priorityRulesTablePanel
-                .frame(minHeight: 215, maxHeight: .infinity)
+                .frame(minHeight: 200, maxHeight: .infinity)
 
             interactivePolicySimulatorPanel
-                .frame(minHeight: 225, maxHeight: .infinity)
+                .frame(minHeight: 215, maxHeight: .infinity)
         }
         .padding(10)
         .background(RackTheme.chassisBackground)
+    }
+
+    private var liveTrafficM5NoticeBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "info.circle.fill")
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(RackTheme.amberAccent)
+            if viewModel.isDemoMode {
+                RackStatusPill(
+                    label: viewModel.demoBadgeText,
+                    color: RackTheme.amberAccent,
+                    monospaced: true
+                )
+            }
+            Text(viewModel.liveTrafficStatusNotice)
+                .font(RackTheme.captionFont)
+                .foregroundStyle(RackTheme.inkPrimary)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
+                .fill(RackTheme.amberSoft)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
+                .strokeBorder(RackTheme.amberAccent.opacity(0.55), lineWidth: 1)
+        )
     }
 
     // MARK: - Top Preset Switcher & Conflict Linter Status

@@ -81,7 +81,7 @@ public struct SnapshotLineageDAGCanvasView: View {
             )
             RackMetricTile(
                 label: localizer.L("CoW Space Saved", "CoW 节省空间"),
-                value: String(format: "%.1f%%", viewModel.fleetCoWSpaceSavedPercent),
+                value: viewModel.fleetCoWSpaceSavedPercent.map { String(format: "%.1f%%", $0) } ?? "—",
                 detail: localizer.L(
                     "\(ByteMetricsFormatter.formatBytes(viewModel.totalDirtyCoWBytes)) Dirty Delta",
                     "\(ByteMetricsFormatter.formatBytes(viewModel.totalDirtyCoWBytes)) 脏块增量"
@@ -90,7 +90,7 @@ public struct SnapshotLineageDAGCanvasView: View {
             )
             RackMetricTile(
                 label: localizer.L("Branch Fork Latency", "分支克隆延迟"),
-                value: String(format: "%.1f ms", viewModel.lastForkLatencyMs),
+                value: viewModel.lastForkLatencyMs.map { String(format: "%.1f ms", $0) } ?? "—",
                 detail: "APFS clonefile(2)",
                 accent: RackTheme.checkpointGold
             )
@@ -207,39 +207,84 @@ public struct SnapshotLineageDAGCanvasView: View {
                 }
             },
             content: {
-                GeometryReader { proxy in
-                    let layout = computeDAGLayout(availableSize: proxy.size)
-                    ScrollView([.horizontal, .vertical], showsIndicators: true) {
-                        ZStack(alignment: .topLeading) {
-                            dagVectorBackdropCanvas(layout: layout)
-                                .frame(width: layout.canvasSize.width, height: layout.canvasSize.height)
-
-                            // Branch Lane Headers
-                            ForEach(Array(layout.branchNames.enumerated()), id: \.offset) { idx, laneName in
-                                let centerX = layout.columnCentersX[idx]
-                                branchLaneHeaderBadge(name: laneName, laneIndex: idx)
-                                    .position(x: centerX, y: 20)
+                if viewModel.vms.isEmpty && viewModel.snapshots.isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "externaldrive.badge.plus")
+                            .font(.system(size: 24))
+                            .foregroundStyle(RackTheme.inkMuted)
+                        Text(localizer.L("No virtual machines in this workspace", "当前工作区尚无虚拟机"))
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundStyle(RackTheme.inkPrimary)
+                        Text(localizer.L(
+                            "Create an empty APFS sparse VM record or explicitly load synthetic demonstration data.",
+                            "可新建空 APFS 稀疏虚拟机配置，或显式点击「载入演示」查看合成演示数据。"
+                        ))
+                            .font(RackTheme.captionFont)
+                            .foregroundStyle(RackTheme.inkMuted)
+                            .multilineTextAlignment(.center)
+                        HStack(spacing: 8) {
+                            Button {
+                                viewModel.createNewSandboxBlade()
+                            } label: {
+                                Label(localizer.L("New Sandbox VM", "新建虚拟机"), systemImage: "plus")
                             }
+                            .buttonStyle(RackActionButtonStyle(prominence: .primaryAmber, compact: true))
 
-                            // Interactive Node Cards
-                            ForEach(layout.nodes) { item in
-                                dagSnapshotNodeCard(item: item)
-                                    .frame(width: item.frame.width, height: item.frame.height)
-                                    .position(x: item.center.x, y: item.center.y)
+                            if !viewModel.isDemoMode {
+                                Button {
+                                    viewModel.loadDemonstrationFleet()
+                                } label: {
+                                    Label(localizer.L("Load Demo", "载入演示"), systemImage: "sparkles.rectangle.stack")
+                                }
+                                .buttonStyle(RackActionButtonStyle(prominence: .secondaryModule, compact: true))
                             }
                         }
-                        .frame(width: layout.canvasSize.width, height: layout.canvasSize.height)
                     }
+                    .padding(20)
+                    .frame(maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
+                    .background(
+                        RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
+                            .fill(RackTheme.terminalWell)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
+                            .strokeBorder(RackTheme.hairline, lineWidth: 1)
+                    )
+                } else {
+                    GeometryReader { proxy in
+                        let layout = computeDAGLayout(availableSize: proxy.size)
+                        ScrollView([.horizontal, .vertical], showsIndicators: true) {
+                            ZStack(alignment: .topLeading) {
+                                dagVectorBackdropCanvas(layout: layout)
+                                    .frame(width: layout.canvasSize.width, height: layout.canvasSize.height)
+
+                                // Branch Lane Headers
+                                ForEach(Array(layout.branchNames.enumerated()), id: \.offset) { idx, laneName in
+                                    let centerX = layout.columnCentersX[idx]
+                                    branchLaneHeaderBadge(name: laneName, laneIndex: idx)
+                                        .position(x: centerX, y: 20)
+                                }
+
+                                // Interactive Node Cards
+                                ForEach(layout.nodes) { item in
+                                    dagSnapshotNodeCard(item: item)
+                                        .frame(width: item.frame.width, height: item.frame.height)
+                                        .position(x: item.center.x, y: item.center.y)
+                                }
+                            }
+                            .frame(width: layout.canvasSize.width, height: layout.canvasSize.height)
+                        }
+                    }
+                    .frame(minHeight: 320)
+                    .background(
+                        RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
+                            .fill(RackTheme.terminalWell)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
+                            .strokeBorder(RackTheme.hairline, lineWidth: 1)
+                    )
                 }
-                .frame(minHeight: 320)
-                .background(
-                    RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
-                        .fill(RackTheme.terminalWell)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: RackTheme.innerCornerRadius, style: .continuous)
-                        .strokeBorder(RackTheme.hairline, lineWidth: 1)
-                )
             }
         )
     }

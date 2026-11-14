@@ -4,7 +4,7 @@ import AgentVMPluginHost
 import Foundation
 import Testing
 
-@Suite("M06 JavaScriptCore Sandboxed Security Plugins, Capability Enforcement & IaC HCL/Compose Codec")
+@Suite("M06 JavaScriptCore Sandboxed Security Plugins, Capability Enforcement & IaC HCL/Compose Codec", .timeLimit(.minutes(1)))
 struct PluginSandboxAndIACTests {
 
     // MARK: - Helpers
@@ -572,5 +572,52 @@ struct PluginSandboxAndIACTests {
         await engine.setPluginEnabled(BuiltInAgentPlugins.autoGitCheckpointID, enabled: true)
         let reenabled = try await engine.dispatchBeforeExecHook(rmReq, vmID: VMID("vm-toggle"))
         #expect(reenabled != .allow)
+    }
+
+    @Test("M0 A13: Built-in plugin manifests contain zero sub-20ms claims and watchdog preempts runaway JS hooks without blocking actor")
+    func builtInManifestHonestyAndPreemptiveWatchdogTimeout() async throws {
+        for manifest in BuiltInAgentPlugins.allManifests() {
+            #expect(!manifest.summary.contains("20ms"))
+            #expect(!manifest.summary.contains("20 ms"))
+        }
+
+        let engine = AgentVMPluginEngine(loadBuiltIns: false)
+        let runawayID = PluginID("custom.runaway-loop")
+        let runawayManifest = PluginManifest(
+            id: runawayID,
+            name: "Runaway Loop Probe",
+            author: "M0 Audit",
+            summary: "Spins in JS for 650ms while watchdog limit is 40ms",
+            requestedCapabilities: [.networkInspect],
+            timeoutMilliseconds: 40,
+            entryPointSource: """
+            function onPacket(pkt) {
+                const start = Date.now();
+                while (Date.now() - start < 650) {}
+                return { action: "allow" };
+            }
+            """
+        )
+        try await engine.registerPlugin(runawayManifest, enableImmediately: true)
+
+        let arpFrame = PacketFrameCrafter().buildARPPacket(
+            isReply: false,
+            senderMAC: guestMAC,
+            senderIP: guestIP,
+            targetMAC: .broadcast,
+            targetIP: gatewayIP
+        )
+        let pkt = try makeDissectedPacket(arpFrame)
+
+        let wallStartNs = DispatchTime.now().uptimeNanoseconds
+        do {
+            _ = try await engine.dispatchPacketHook(pkt)
+            Issue.record("Expected ERR_PLUGIN_TIMEOUT for 650ms busy-loop under 40ms watchdog")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_PLUGIN_TIMEOUT")
+        }
+        let wallElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - wallStartNs) / 1_000_000.0
+        // Preemptive watchdog must return promptly around 40ms rather than blocking for the full 650ms spin
+        #expect(wallElapsedMs < 250.0)
     }
 }

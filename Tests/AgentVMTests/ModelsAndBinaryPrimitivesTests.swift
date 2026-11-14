@@ -2,7 +2,7 @@ import AgentVMModels
 import Foundation
 import Testing
 
-@Suite("M01 Models, Identifiers, Networking Primitives & Binary Checksums")
+@Suite("M01 Models, Identifiers, Networking Primitives & Binary Checksums", .timeLimit(.minutes(1)))
 struct ModelsAndBinaryPrimitivesTests {
 
     // MARK: - Helpers

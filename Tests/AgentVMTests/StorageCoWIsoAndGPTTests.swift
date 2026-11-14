@@ -4,7 +4,7 @@ import Darwin
 import Foundation
 import Testing
 
-@Suite("M03 Storage CoW, AVMPATCH, ISO-9660 Rock Ridge, GPT/QCOW2 & Forensics")
+@Suite("M03 Storage CoW, AVMPATCH, ISO-9660 Rock Ridge, GPT/QCOW2 & Forensics", .timeLimit(.minutes(1)))
 struct StorageCoWIsoAndGPTTests {
 
     private func makeTemporaryDirectory(prefix: String) throws -> URL {

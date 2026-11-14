@@ -6,7 +6,7 @@ import Virtualization
 // MARK: - Native Apple Silicon Host Capability Probe & VZVirtualMachineConfiguration Builder
 
 public enum HostHypervisorProbe {
-    public static func probeCapabilities() -> HostCapabilityReport {
+    public static func probeCapabilities(probeDirectoryURL: URL? = nil) -> HostCapabilityReport {
         let info = ProcessInfo.processInfo
         let osVer = info.operatingSystemVersion
         let versionString = "\(osVer.majorVersion).\(osVer.minorVersion).\(osVer.patchVersion)"
@@ -35,6 +35,9 @@ public enum HostHypervisorProbe {
             nestedSupported = VZGenericPlatformConfiguration.isNestedVirtualizationSupported
         }
 
+        let targetDir = probeDirectoryURL ?? FileManager.default.temporaryDirectory
+        let clonefileSupported = performRealClonefileProbe(in: targetDir)
+
         return HostCapabilityReport(
             architecture: currentArchName(),
             macOSVersion: versionString,
@@ -44,10 +47,35 @@ public enum HostHypervisorProbe {
             isVirtualizationFrameworkSupported: vzSupported,
             isNestedVirtualizationSupported: nestedSupported,
             isRosettaLinuxShareAvailable: rosettaAvailable,
-            isAPFSClonefileSupported: true,
+            isAPFSClonefileSupported: clonefileSupported,
             maxSupportedVCPUs: maxCPU,
             maxSupportedMemoryMB: maxMemMB
         )
+    }
+
+    private static func performRealClonefileProbe(in directoryURL: URL) -> Bool {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directoryURL.path, isDirectory: &isDir),
+              isDir.boolValue else {
+            return false
+        }
+        let token = UUID().uuidString.lowercased()
+        let srcURL = directoryURL.appendingPathComponent(".agentvm-clonefile-src-\(token)")
+        let dstURL = directoryURL.appendingPathComponent(".agentvm-clonefile-dst-\(token)")
+        defer {
+            _ = Darwin.unlink(srcURL.path)
+            _ = Darwin.unlink(dstURL.path)
+        }
+        do {
+            try Data("avm-clonefile-probe".utf8).write(to: srcURL, options: .atomic)
+        } catch {
+            return false
+        }
+        let rc = Darwin.clonefile(srcURL.path, dstURL.path, 0)
+        guard rc == 0 else {
+            return false
+        }
+        return FileManager.default.fileExists(atPath: dstURL.path)
     }
 
     private static func currentArchName() -> String {

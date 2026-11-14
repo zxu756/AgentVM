@@ -1,0 +1,38 @@
+==================================================================
+ AgentVM Milestone M0 Acceptance Suite (01-agentvm.md Rows 1..8)
+==================================================================
+
+[Row 1/8] Running 20 cold workspace iterations x 7 commands (140 invocations)...
+PASS [Row 1/8]: 20/20 iterations (140 cold CLI runs across en & zh) exited 0 with 0 crashes and 0 timeouts.
+
+[Row 2/8] Verifying 'agentvm up a' on empty disk fails honestly (en & zh)...
+PASS [Row 2/8]: 'agentvm up a' exits non-zero with localized no-bootable-OS stderr and leaves state != running.
+
+[Row 3/8] Verifying 'agentvm doctor' live clonefile(2) probe and zero '< 20ms' strings (en & zh)...
+PASS [Row 3/8]: 'agentvm doctor' runs a live clonefile(2) probe with zero '< 20ms' claims and zero temp leftovers.
+
+[Row 4/8] Verifying 'swift test' creates zero files in repository root...
+PASS [Row 4/8]: Repository root has zero new or leaked SQLite files after swift test.
+
+[Row 5/8] Verifying 'agentvm exec a -- uname -a' fails honestly with zero Linux strings (en & zh)...
+PASS [Row 5/8]: 'agentvm exec a -- uname -a' exits non-zero and emits zero Linux kernel strings.
+
+[Row 6/8] Verifying 'agentvm --backend simulation exec a -- uname -a' prefixes SIMULATED (en & zh)...
+PASS [Row 6/8]: Explicit '--backend simulation' outputs carry SIMULATED: prefix on every line.
+
+[Row 7/8] Running Scripts/acceptance/readme-commands.sh...
+==> [readme-commands] Checking README.md & README.zh-CN.md for banned claims...
+PASS: Zero banned claims in README.md and README.zh-CN.md
+==> [readme-commands] Replaying Quick-Start workflow (--lang en) in isolated temp workspace
+PASS: README Quick-Start verified for --lang en
+==> [readme-commands] Replaying Quick-Start workflow (--lang zh) in isolated temp workspace
+PASS: README Quick-Start verified for --lang zh
+ALL README COMMAND CHECKS PASSED.
+PASS [Row 7/8]: readme-commands.sh verified all EN & ZH README commands.
+
+[Row 8/8] Launching AgentVM GUI binary without --demo on empty workspace...
+PASS [Row 8/8]: GUI launched cleanly without --demo -> 0 VMs, 0 snapshots, 0 packets, 0 alerts.
+
+==================================================================
+ ALL 8 M0 ACCEPTANCE CHECKS PASSED
+==================================================================

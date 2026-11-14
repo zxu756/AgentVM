@@ -60,6 +60,9 @@ public enum AppLanguage: String, Codable, Hashable, CaseIterable, Sendable, Iden
         var idx = 0
         while idx < arguments.count {
             let arg = arguments[idx]
+            if arg == "--" {
+                break
+            }
             if arg == "--lang" {
                 if idx + 1 < arguments.count, let parsed = parse(arguments[idx + 1]) {
                     return parsed
@@ -84,6 +87,10 @@ public enum AppLanguage: String, Codable, Hashable, CaseIterable, Sendable, Iden
         var idx = 0
         while idx < arguments.count {
             let arg = arguments[idx]
+            if arg == "--" {
+                remaining.append(contentsOf: arguments[idx...])
+                break
+            }
             if arg == "--lang" {
                 idx += (idx + 1 < arguments.count) ? 2 : 1
                 continue
@@ -377,7 +384,7 @@ extension PluginManifest {
         case "builtin.runaway-budget-breaker":
             return L(summary, "当自治循环超出 CoW 脏盘配额、触发防火墙丢包风暴或运行超时时自动冻结虚拟机。")
         case "builtin.auto-git-checkpoint":
-            return L(summary, "在执行破坏性 Shell、软件包变更或数据库删表命令前自动分叉 <20ms APFS 快照。")
+            return L(summary, "当通过受控执行入口匹配到破坏性 Shell、软件包变更或数据库删表命令时，在执行前创建 APFS CoW 快照。")
         case "builtin.iac-compose-bridge":
             return L(summary, "将多虚拟机沙盒集群导入或导出为声明式 .avm.hcl 规范或 Docker Compose 清单。")
         default:

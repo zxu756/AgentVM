@@ -763,7 +763,16 @@ public final class SQLiteWALDatabase: @unchecked Sendable {
     }
 
     public convenience init(inMemoryNamed name: String = ":memory:", runMigrations: Bool = true) throws {
-        let resolved = name.isEmpty ? ":memory:" : name
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolved: String
+        if trimmed.isEmpty || trimmed == ":memory:" {
+            resolved = ":memory:"
+        } else if trimmed.hasPrefix("file:") {
+            resolved = trimmed
+        } else {
+            let safeName = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
+            resolved = "file:\(safeName)?mode=memory&cache=shared"
+        }
         try self.init(path: resolved, isInMemory: true, runMigrations: runMigrations)
     }
 
@@ -773,7 +782,10 @@ public final class SQLiteWALDatabase: @unchecked Sendable {
         self.lock.name = "com.agentvm.store.sqlite.lock"
 
         var openedHandle: OpaquePointer?
-        let openFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_EXRESCODE
+        var openFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_EXRESCODE
+        if isInMemory || path.hasPrefix("file:") {
+            openFlags |= SQLITE_OPEN_URI
+        }
         let rc = sqlite3_open_v2(path, &openedHandle, openFlags, nil)
         guard rc == SQLITE_OK, let handle = openedHandle else {
             let msg = openedHandle.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) }

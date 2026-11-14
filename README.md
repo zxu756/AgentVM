@@ -2,7 +2,7 @@
 
 # AgentVM `v1.1.0`
 
-**Native Apple Silicon MicroVM Sandbox, Sub-20ms APFS Copy-on-Write Branching & Layer-2 Deep Packet Inspection Workbench (`Virtualization.framework` + Swift 6)**
+> **Current Status (M0 — Baseline Honesty & Crash Fixes)**: APFS Copy-on-Write (`clonefile(2)`) sparse disk & snapshot lineage management, SQLite WAL workspace persistence, pure-Swift NoCloud `cidata` ISO-9660 generation, offline Ethernet/IPv4/DNS/TLS packet dissection (`.pcapng`), and sandboxed `JavaScriptCore` policy evaluation work locally today. Real Linux image download, `VZVirtualMachine` guest boot, and live `AF_VSOCK` command execution are in development (M1–M3). User-space egress firewall enforcement and live VM packet capture are not connected to guest traffic yet (scheduled for M5).
 
 [![Version](https://img.shields.io/badge/version-v1.1.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
@@ -10,118 +10,120 @@
 [![Bilingual](https://img.shields.io/badge/UI-中文%20%7C%20EN-2A9D6F)](README.zh-CN.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2A9D6F)](LICENSE)
 
-`AgentVM` (`v1.1.0`) is an industrial-grade local sandbox hypervisor and network security workbench built natively on Apple's `Virtualization.framework`, APFS `clonefile(2)` Copy-on-Write storage primitives, a pure-Swift user-space Layer-2 Ethernet switch with TLS 1.3 SNI deep packet inspection, a multiplexed `AVM1` VirtioSocket RPC stack, and a sandboxed `JavaScriptCore` extension runtime.
+`AgentVM` is a macOS (Apple Silicon) workspace manager, APFS Copy-on-Write disk & snapshot lineage tool, and protocol inspection workbench written in Swift 6, with live `中文 | EN` bilingual switching across the desktop UI and CLI (`--lang en` / `--lang zh`).
 
-Designed for running autonomous coding agents (Claude Code, Codex, Antigravity, Mistral Vibe) inside hardware-isolated Linux/macOS microVMs where **forking 10 isolated experiment branches takes under 20 ms and 0 bytes of upfront disk duplication**, every outbound packet is dissected down to TLS ClientHello SNI and DNS labels, destructive guest commands automatically trigger pre-execution CoW checkpoints, and every workbench surface supports zero-restart **`中文 | EN` live bilingual switching**.
+By default, launching the desktop app or initializing a `.agentvm` workspace starts completely empty (0 VMs, 0 packets, 0 alerts) and never fabricates guest execution or telemetry:
 
-![AgentVM Snapshot & CoW Branch Lineage DAG](docs/screenshot-overview-dag.png)
-
----
-
-## What's New in `v1.1.0` — Native Bilingual (`中文 | EN`) Workbench & Dossier
-
-- **Zero-Restart Live Language Switching**: Switch instantaneously between Simplified Chinese (`中文`) and English (`EN`) from the top toolbar `中文 | EN` Hardware-Amber segmented pill, menu shortcut `⇧⌘L` (`切换语言 / Toggle Language`), `⌘K` fuzzy command palette, or `⌘,` Preferences.
-- **Deterministic Locale Resolution**: Resolves `--lang zh|en` CLI flag -> `AGENTVM_LANG=zh|en` environment variable -> `UserDefaults` (`io.github.zxu756.AgentVM.language`) -> macOS `Locale.preferredLanguages.first` (`zh*` defaults automatically to `zh-Hans`).
-- **Interactive Bilingual HTML Compliance Dossier**: `agentvm export-html` generates standalone Hallmark-audited dark-telemetry HTML reports ([`docs/demo-agentvm-dossier.html`](docs/demo-agentvm-dossier.html)) with an embedded `中文 | EN` toggle pill, `localStorage` persistence, and browser-locale auto-detection.
-- **Bilingual 2x Retina Offscreen Renderer**: `--export-screenshots <dir> --lang zh|en` renders deterministic `2720 × 1680 px` Retina studio captures in both English and Simplified Chinese.
+- Creating a VM in M0 provisions a sparse GPT disk image and a NoCloud `cidata` ISO-9660 seed image, without a guest OS installed.
+- Running `agentvm up <vm>` or `agentvm exec <vm> -- ...` on an unbooted/empty disk exits non-zero with an explicit error instead of silently falling back to a simulator.
+- Host-side protocol & wire-session simulation is available only when explicitly requested via `--backend simulation` (every output line is prefixed with `SIMULATED:`) or in UI demonstration mode (`--demo` / **Load Demo**, labeled `[DEMO]`).
+- Unmeasured CPU and memory fields are displayed as `—`.
+- Until M5 is completed, guest networking relies on macOS system NAT with no outbound egress enforcement; the Wiretap and Firewall views display `Not connected to live traffic yet (scheduled for M5)`.
 
 ---
 
-## Core Architecture (11 Isolated SwiftPM Modules)
+## Status & Milestone Roadmap
 
-| Layer | Target | Engineering Scope |
+| Milestone | Capability | Status |
 |---|---|---|
-| **L1 Foundation** | `AgentVMModels` | Strongly-typed identifiers, VM/NIC/VirtioFS/Cloud-Init topology validation, live `AgentVMLocalizer` (`中文` / `EN`), IEEE 802.3 CRC-32, RFC 1071 internet checksums, bounds-checked binary cursors |
-| **L2 Persistence** | `AgentVMStore` | Thread-safe `<SQLite3>` WAL engine with `v1 -> v4` schema migrations, `.agentvm` bundle integrity verifier, Command-pattern infinite Undo/Redo controller, SHA-256 base image catalog, Kahn topological sort & LCA/GC DAG query engine |
-| **L3 Storage CoW** | `AgentVMStorageCoW` | Darwin `clonefile(2)` sub-20ms CoW branching, `SEEK_HOLE`/`SEEK_DATA` + `F_PUNCHHOLE` sparse extent analyzer, `AVMPATCH` zlib binary delta engine, pure-Swift ECMA-119 + Rock Ridge `cidata` **ISO-9660 Cloud-Init builder & reader**, Protective MBR + Primary/Backup GPT & QCOW2 v3 converter, filesystem superblock & Shannon entropy forensics |
-| **L4 L2 Switch & DPI** | `AgentVMNetSwitch` | `socketpair` datagram-pumped user-space L2 switch, byte-accurate Ethernet II / 802.1Q VLAN / ARP / IPv4 / ICMPv4 / UDP / DHCPv4 / DNS (RFC 1035 loop-guarded) / TCP / TLS 1.2 & 1.3 `ClientHello` SNI & ALPN / HTTP dissector, stateful egress firewall with DNS-to-IP correlation & token-bucket rate limiters, Wireshark `.pcapng` codec, recursive-descent boolean filter parser |
-| **L5 Vsock & PTY** | `AgentVMVsockRPC` | 24-byte Big-Endian `AVM1` (`0x41564D31`) multiplexed stream framing with CRC-32 & `zlib`, credit-based sliding-window session manager, POSIX loopback TCP port-forwarder, full VT100/ANSI/xterm screen buffer, and cross-verified Python 3 `agentvm-guestd` systemd bootstrap generator |
-| **L6 Extensions** | `AgentVMPluginHost` | Per-plugin isolated `JSVirtualMachine` sandbox with capability gates, microsecond watchdog, 4 built-in plugins (`secret-leak-guard`, `runaway-budget-breaker`, `auto-git-checkpoint`, `iac-compose-bridge`), and bidirectional `.avm.hcl` / `compose.yaml` IaC compiler |
-| **L7 Hypervisor** | `AgentVMHypervisor` | Native `VZVirtualMachine` lifecycle driver (Linux Kernel, UEFI NVRAM, Virtio-Block, Virtio-FS, Rosetta x86_64 binfmt share, Memory Balloon, Entropy, Serial, `saveMachineStateTo`/`restoreMachineStateFrom`) + deterministic hybrid simulation backend |
-| **L8 CLI & MCP** | `AgentVMCLIAndMCP` | 15-subcommand `agentvm` CLI (`--lang zh|en`), 9-tool JSON-RPC 2.0 `stdio` Model Context Protocol server, and Hallmark-audited bilingual standalone HTML compliance dossier exporter |
-| **L9 Shell** | `AgentVMWorkbenchShell` | Dark Rack Graphite & Hardware Amber (`#141517` + `#D97724`) industrial design system, `中文 | EN` segmented toggle pill, Split-Pane / Document Tabbing docking controller, zero-latency `⌘K` bilingual fuzzy command palette, `⌘,` multi-tab preferences, rails, and 4-channel bottom drawer |
-| **L10 Studio** | `AgentVMStudioViews` | Interactive Snapshot & CoW Lineage DAG Canvas, Wireshark-grade 3-pane Packet Table + Dissection Tree + Synchronized 16-Byte Hex Dump, VT100 Console, Dry-Run Firewall Simulator, APFS Extent & ISO-9660 Studio, and Live JS Plugin Scratchpad |
-| **L11 Unified Entry** | `AgentVM` | Single Apple Silicon executable combining the native SwiftUI macOS Studio Workbench, headless multi-subcommand CLI, `stdio` JSON-RPC 2.0 MCP server, and offscreen `2720 × 1680 px` 2x Retina screenshot renderer |
+| **M0** | Honest baseline: plain `agentvm ps` fix, real `clonefile(2)` probe in `doctor`, empty default UI, explicit `--backend simulation` (`SIMULATED:`) & `[DEMO]` gating, `—` for unmeasured telemetry, preemptive `JavaScriptCore` hook watchdog | **Implemented on `m0/honest`** |
+| **M1** | `agentvm image pull debian-12-bookworm-arm64` + single-command `agentvm run` booting a real Linux kernel/rootfs on `VZVirtualMachine` with live `AF_VSOCK` stdout/stderr/exit-code streaming and `/proc` telemetry | Planned |
+| **M2** | Per-VM background daemon so `up`, `exec`, `pause`, `resume`, and `halt` work across separate CLI invocations | Planned |
+| **M3** | Measured APFS CoW branching (`branch`) and snapshot restore (`snapshot` / `restore`) against real Linux root filesystems (measured latency and dirty-byte delta to be reported after M3) | Planned |
+| **M4** | Desktop UI wired end-to-end to real running VMs, live serial console, and workspace state | Planned |
+| **M5** | Live guest NIC attachment to the user-space Layer-2 switch, outbound DNS/TLS SNI policy enforcement, and real guest `.pcapng` capture | Planned (under evaluation) |
 
 ---
 
-## Workbench Views
+## Verified CLI Quick Start
 
-### Wireshark-Grade Layer-2 Packet Wiretap & Synchronized Hex Dissector
-![AgentVM Layer-2 Packet Wiretap & Hex Dissector](docs/screenshot-packet-inspector.png)
-
-### APFS Copy-on-Write Extent Map & Pure-Swift NoCloud ISO-9660 Studio
-![AgentVM Storage CoW Extents & Cloud-Init Studio](docs/screenshot-storage-cloudinit.png)
-
-### Split-Pane Firewall Policy Simulator & JavaScriptCore Extension Host
-![AgentVM Firewall Policy Simulator & JS Plugin Studio](docs/screenshot-plugins-policy.png)
-
----
-
-## Installation
-
-### Homebrew Cask (macOS 14+ Apple Silicon)
+Build the `AgentVM` executable from source and run all commands against an isolated `.agentvm` workspace:
 
 ```bash
-brew install --cask zxu756/tap/agentvm
+swift build --product AgentVM
+alias agentvm="$(pwd)/.build/debug/AgentVM"
+
+# 1. Host readiness check (runs a live APFS clonefile(2) probe on the workspace volume)
+agentvm --lang en --workspace ./demo-check.agentvm doctor
+
+# 2. Initialize an empty workspace and create an empty sparse GPT VM record
+agentvm --lang en --workspace ./demo-check.agentvm init
+agentvm --lang en --workspace ./demo-check.agentvm create sandbox-a
+
+# 3. List VMs in table or JSON form (unmeasured CPU/RAM shown as —)
+agentvm --lang en --workspace ./demo-check.agentvm ps
+agentvm --lang en --workspace ./demo-check.agentvm ps --json
+
+# 4. Fork an APFS Copy-on-Write disk branch, list snapshots, inspect plugins, and export HCL
+agentvm --lang en --workspace ./demo-check.agentvm branch sandbox-a sandbox-b --no-boot
+agentvm --lang en --workspace ./demo-check.agentvm snapshot list
+agentvm --lang en --workspace ./demo-check.agentvm plugin
+agentvm --lang en --workspace ./demo-check.agentvm export-hcl
+
+# 5. Booting or executing on an empty disk fails honestly (non-zero exit code)
+agentvm --lang en --workspace ./demo-check.agentvm up sandbox-a
+# -> exits non-zero: [ERR_NO_BOOTABLE_SYSTEM] VM 'sandbox-a' has no bootable guest OS or kernel on its disk...
+agentvm --lang en --workspace ./demo-check.agentvm exec sandbox-a -- uname -a
+# -> exits non-zero: [ERR_NO_BOOTABLE_SYSTEM] VM 'sandbox-a' has no bootable guest OS or kernel on its disk...
+
+# 6. Explicit host-side simulation requires --backend simulation and prefixes every line with SIMULATED:
+agentvm --lang en --workspace ./demo-check.agentvm --backend simulation exec sandbox-a -- uname -a
+# -> SIMULATED: Linux sandbox-a 6.8.0-agentvm-arm64 #1 SMP PREEMPT_DYNAMIC aarch64 GNU/Linux
 ```
 
-### Build from Source
+Every command also supports Simplified Chinese output via `--lang zh` (or `AGENTVM_LANG=zh`):
 
 ```bash
-git clone https://github.com/zxu756/AgentVM.git
-cd AgentVM
-swift test --no-parallel
+agentvm --lang zh --workspace ./demo-check.agentvm doctor
+agentvm --lang zh --workspace ./demo-check.agentvm ps
+```
+
+---
+
+## Desktop Workbench Preview (`[DEMO]` Synthetic Dataset)
+
+> **Demonstration Data Notice**: All screenshots below were rendered in explicit `--demo` mode (`DEMO · SYNTHETIC DATA`). The VMs, CoW branches, Ethernet/TLS frames, and policy counters shown in these captures are synthetic demonstration fixtures, not captures from live running guest VMs. Launching `AgentVM` normally opens an empty workspace.
+
+### Overview & Snapshot Lineage DAG (`[DEMO]` Synthetic Data)
+![AgentVM Overview & CoW Lineage DAG — Synthetic Demo Data](docs/screenshot-overview-dag.png)
+
+### Offline Packet Dissector & Hex View (`[DEMO]` Synthetic Data — Live Traffic Scheduled for M5)
+![AgentVM Packet Dissector — Synthetic Demo Data](docs/screenshot-packet-inspector.png)
+
+### APFS Sparse Extent Map & NoCloud ISO-9660 Inspector (`[DEMO]` Synthetic Data)
+![AgentVM APFS Extents & Cloud-Init Inspector — Synthetic Demo Data](docs/screenshot-storage-cloudinit.png)
+
+### Policy Rule Simulator & JavaScriptCore Plugin Host (`[DEMO]` Synthetic Data — Live Traffic Scheduled for M5)
+![AgentVM Firewall Simulator & JS Plugin Host — Synthetic Demo Data](docs/screenshot-plugins-policy.png)
+
+---
+
+## Testing & Verification Scripts
+
+```bash
+# Scoped unit tests for specific SwiftPM modules
+./Scripts/test.sh scope AgentVMStore AgentVMHypervisor AgentVMCLIAndMCP
+
+# Replay all documented README commands in a temporary workspace
+./Scripts/acceptance/readme-commands.sh
+
+# Run full M0 acceptance suite (20x cold CLI stability, honest failure checks, doctor probe, clean repo check, GUI empty-launch check)
+./Scripts/test.sh milestone 0
+```
+
+---
+
+## Building the macOS App Bundle
+
+```bash
 ./Scripts/build-app.sh
+# Launch empty default workbench (0 VMs, 0 packets, 0 alerts):
 open build/AgentVM.app
+# Or launch with synthetic demonstration data explicitly enabled:
+./build/AgentVM.app/Contents/MacOS/AgentVM --demo
 ```
 
-> **Entitlement Note**: `Scripts/build-app.sh` automatically ad-hoc signs `AgentVM.app` (`v1.1.0`) with `com.apple.security.virtualization`, enabling hardware-accelerated `Virtualization.framework` execution on Apple Silicon without requiring a paid Apple Developer certificate.
-
----
-
-## CLI, Language Selection & MCP Automation
-
-Every operation available in the desktop studio is exposed headlessly via the `agentvm` binary:
-
-```bash
-# 0. Launch the desktop workbench directly in Simplified Chinese or English (or press Shift+Cmd+L live)
-/Applications/AgentVM.app/Contents/MacOS/AgentVM --lang zh
-AGENTVM_LANG=en /Applications/AgentVM.app/Contents/MacOS/AgentVM
-
-# 1. Verify Apple Virtualization, APFS clonefile(2), and Rosetta Linux support
-agentvm doctor
-
-# 2. Initialize a .agentvm bundle and provision a golden sandbox blade
-agentvm init --workspace ./my-fleet.agentvm --seed-demo
-agentvm ps
-
-# 3. Fork an instant (< 20 ms) APFS Copy-on-Write branch for a coding agent
-agentvm --workspace ./my-fleet.agentvm branch ubuntu-golden-base claude-exp-01 --owner claude-code
-
-# 4. Run a guarded guest command over multiplexed AVM1 VirtioSocket
-agentvm --workspace ./my-fleet.agentvm exec claude-exp-01 -- uname -a
-
-# 5. Query L2 DPI Wiretap with boolean filter expressions & export Wireshark .pcapng
-agentvm --workspace ./my-fleet.agentvm pcap --filter "proto == TLS || verdict == DROP" --export capture.pcapng
-
-# 6. Export declarative HCL topology or interactive bilingual HTML compliance dossier
-agentvm --workspace ./my-fleet.agentvm export-hcl > fleet.avm.hcl
-agentvm --workspace ./my-fleet.agentvm export-html docs/demo-agentvm-dossier.html
-```
-
-### Registering the Built-In MCP Server (`Claude Code` / `Codex` / `Antigravity`)
-
-```json
-{
-  "mcpServers": {
-    "agentvm": {
-      "command": "/Applications/AgentVM.app/Contents/MacOS/AgentVM",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+`Scripts/build-app.sh` ad-hoc signs `AgentVM.app` with `com.apple.security.virtualization` on Apple Silicon (`macOS 14+`).
 
 ---
 

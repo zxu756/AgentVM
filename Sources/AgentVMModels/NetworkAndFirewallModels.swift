@@ -241,7 +241,7 @@ public enum TCPFlowLifecycleState: String, Codable, Hashable, Sendable, CaseIter
     case reset = "RESET"
 }
 
-// MARK: - Wireshark-Grade Protocol Dissection Tree Models
+// MARK: - Protocol Dissection Tree Models
 
 public struct DissectedField: Codable, Hashable, Sendable, Identifiable {
     public var id: String

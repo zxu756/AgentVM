@@ -32,7 +32,7 @@ public enum BuiltInAgentPlugins {
                 .commandExecInterception,
                 .pluginKVStore
             ],
-            timeoutMilliseconds: 800,
+            timeoutMilliseconds: 200,
             configFields: [
                 PluginConfigField(
                     key: "dnsMaxSubdomainEntropy",
@@ -129,7 +129,7 @@ public enum BuiltInAgentPlugins {
                 .snapshotCheckpoint,
                 .pluginKVStore
             ],
-            timeoutMilliseconds: 600,
+            timeoutMilliseconds: 200,
             configFields: [
                 PluginConfigField(
                     key: "maxDirtyDiskMB",
@@ -184,13 +184,13 @@ public enum BuiltInAgentPlugins {
             name: "Pre-Destructive CoW Auto-Checkpoint",
             version: SemanticVersion(major: 1, minor: 1, patch: 0),
             author: "AgentVM Storage Team",
-            summary: "Automatically forks a sub-20ms APFS Copy-on-Write checkpoint before destructive shell, package, or database commands.",
+            summary: "Automatically forks an APFS Copy-on-Write checkpoint before destructive shell, package, or database commands.",
             isBuiltIn: true,
             requestedCapabilities: [
                 .commandExecInterception,
                 .snapshotCheckpoint
             ],
-            timeoutMilliseconds: 600,
+            timeoutMilliseconds: 200,
             configFields: [
                 PluginConfigField(
                     key: "checkpointPackageInstalls",
@@ -245,7 +245,7 @@ public enum BuiltInAgentPlugins {
                 .topologyImportExport,
                 .workbenchCommand
             ],
-            timeoutMilliseconds: 800,
+            timeoutMilliseconds: 200,
             configFields: [],
             entryPointSource: """
             function getCommands() {

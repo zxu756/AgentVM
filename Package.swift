@@ -142,7 +142,8 @@ let package = Package(
                 "AgentVMHypervisor",
                 "AgentVMPluginHost",
                 "AgentVMCLIAndMCP",
-                "AgentVMWorkbenchShell"
+                "AgentVMWorkbenchShell",
+                "AgentVMStudioViews"
             ]
         )
     ]

@@ -37,16 +37,19 @@ public actor AgentVMMCPServer {
             ],
             [
                 "name": "agentvm_fork_cow_branch",
-                "description": "Fork an instant (<20ms) APFS Copy-on-Write sandbox branch from an existing VM.",
-                "inputSchema": [
-                    "type": "object",
-                    "properties": [
-                        "parentVMID": ["type": "string"],
-                        "branchName": ["type": "string"],
-                        "owner": ["type": "string"]
-                    ],
-                    "required": ["parentVMID", "branchName"]
-                ]
+                "description": "Fork an APFS clonefile(2) Copy-on-Write sandbox branch from an existing VM.",
+                "inputSchema": {
+                    [
+                        "type": "object",
+                        "properties": [
+                            "parentVMID": ["type": "string"],
+                            "branchName": ["type": "string"],
+                            "owner": ["type": "string"],
+                            "bootImmediately": ["type": "boolean"]
+                        ],
+                        "required": ["parentVMID", "branchName"]
+                    ]
+                }()
             ],
             [
                 "name": "agentvm_exec_command",
@@ -207,13 +210,20 @@ public actor AgentVMMCPServer {
                 throw AgentVMError.cliUsageError(detail: "parentVMID and branchName are required.")
             }
             let owner = (arguments["owner"] as? String) ?? "mcp-branch"
+            let parentID = VMID(parentStr)
+            let parentRecord = try await coordinator.store.fetchVM(parentID)
+            let bootNow = (arguments["bootImmediately"] as? Bool) ?? (parentRecord?.telemetry.state == .running)
             let forked = try await coordinator.forkCoWBranch(
-                fromVMID: VMID(parentStr),
+                fromVMID: parentID,
                 branchName: branchName,
-                agentOwnerTag: owner
+                agentOwnerTag: owner,
+                bootImmediately: bootNow
             )
+            let isSim = await coordinator.currentExecutionBackend() == .deterministicSimulation
+            let prefix = isSim ? "SIMULATED: " : ""
             return String(
-                format: "Forked CoW branch %@ ('%@') in %.2f ms from snapshot %@.",
+                format: "%@Forked CoW branch %@ ('%@') in %.2f ms from snapshot %@.",
+                prefix,
                 forked.childVM.id.rawValue,
                 forked.childVM.spec.name,
                 forked.cloneDurationMilliseconds,
@@ -231,7 +241,9 @@ public actor AgentVMMCPServer {
                 vmID: VMID(vmIDStr),
                 request: GuestExecRequest(executable: exe, arguments: cmdArgs, workingDirectory: cwd)
             )
-            return "exitCode=\(res.exitCode)\nstdout:\n\(res.stdoutUTF8)\nstderr:\n\(res.stderrUTF8)"
+            let isSim = await coordinator.currentExecutionBackend() == .deterministicSimulation
+            let prefix = isSim ? "SIMULATED: " : ""
+            return "\(prefix)exitCode=\(res.exitCode)\nstdout:\n\(res.stdoutUTF8)\nstderr:\n\(res.stderrUTF8)"
 
         case "agentvm_capture_snapshot":
             guard let vmIDStr = arguments["vmID"] as? String,

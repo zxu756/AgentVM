@@ -10,8 +10,12 @@ import Foundation
 public struct HtmlFleetReportExporter: Sendable {
     public init() {}
 
-    public func renderStandaloneHTML(coordinator: AgentVMFleetCoordinator) async throws -> String {
+    public func renderStandaloneHTML(
+        coordinator: AgentVMFleetCoordinator,
+        isDemoOverride: Bool? = nil
+    ) async throws -> String {
         let manifest = try await coordinator.store.loadManifest()
+        let isDemo = isDemoOverride ?? manifest.isDemonstrationWorkspace
         let vms = try await coordinator.store.listVMs()
         let snapshots = try await coordinator.store.listSnapshots()
         let packets = await coordinator.l2Switch.recentPackets(limit: 80)
@@ -79,6 +83,13 @@ public struct HtmlFleetReportExporter: Sendable {
         }
 
         let cleanTitle = escapeHTML(sanitizeNoDashes(ByteMetricsFormatter.scrubHomePath(manifest.title)))
+        let displayTitleEn = isDemo ? "[DEMO] \(cleanTitle)" : cleanTitle
+        let displayTitleZh = isDemo ? "[演示数据] \(cleanTitle)" : cleanTitle
+        let demoBannerHTML: String = isDemo
+            ? """
+              <div class="demo-banner" role="note" data-en="[DEMO] Synthetic demonstration dataset: simulated microVMs, crafted Layer-2 frames, and sample audit metrics (not captured from live guest VMs)." data-zh="[演示数据] 合成演示数据集：模拟微虚拟机、构造的二层数据帧与示例审计指标（非真实客户机运行采集）。">[DEMO] Synthetic demonstration dataset: simulated microVMs, crafted Layer-2 frames, and sample audit metrics (not captured from live guest VMs).</div>
+            """
+            : ""
         let arch = escapeHTML(caps.architecture)
         let osVer = escapeHTML(caps.macOSVersion)
         let hostMem = escapeHTML(caps.hostMemoryGBFormatted)
@@ -94,12 +105,12 @@ public struct HtmlFleetReportExporter: Sendable {
 
         return """
         <!DOCTYPE html>
-        <html lang="en" data-title-en="\(cleanTitle): AgentVM Security Audit" data-title-zh="\(cleanTitle): AgentVM 安全合规审计档案">
+        <html lang="en" data-title-en="\(displayTitleEn): AgentVM Security Audit" data-title-zh="\(displayTitleZh): AgentVM 安全合规审计档案">
         <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="description" content="AgentVM microVM fleet security, Copy-on-Write storage lineage, and Layer-2 DPI firewall audit report.">
-        <title>\(cleanTitle): AgentVM Security Audit</title>
+        <title>\(displayTitleEn): AgentVM Security Audit</title>
         <style>
         /* Hallmark · v2.0.0 · scope: app · genre: modern-minimal · posture: restrained · shape: app screen · surface: absolute */
         /* hallmark · rack-graphite dark telemetry surface with tabular monospace counters */
@@ -220,6 +231,17 @@ public struct HtmlFleetReportExporter: Sendable {
           font-size: 0.95rem;
           color: var(--ink-secondary);
         }
+        .demo-banner {
+          background: var(--signal-amber-soft);
+          border: 1px solid var(--signal-amber);
+          color: var(--signal-amber);
+          border-radius: 8px;
+          padding: 0.75rem 1rem;
+          margin-bottom: 1.5rem;
+          font-family: var(--font-mono);
+          font-size: 0.85rem;
+          font-weight: 600;
+        }
         .metrics {
           display: grid;
           grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -339,7 +361,7 @@ public struct HtmlFleetReportExporter: Sendable {
         <main class="shell">
           <header class="mast">
             <div>
-              <h1>\(cleanTitle)</h1>
+              <h1 data-en="\(displayTitleEn)" data-zh="\(displayTitleZh)">\(displayTitleEn)</h1>
               <p class="lead" data-en="\(leadEn)" data-zh="\(leadZh)">\(leadEn)</p>
             </div>
             <div class="mast-actions">
@@ -352,6 +374,7 @@ public struct HtmlFleetReportExporter: Sendable {
               <button class="filter-btn" type="button" onclick="window.print()" data-en="Print Compliance Snapshot" data-zh="打印合规审计快照">Print Compliance Snapshot</button>
             </div>
           </header>
+          \(demoBannerHTML)
 
           <section class="metrics" aria-label="Fleet telemetry summary">
             <div class="metric-box">

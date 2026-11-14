@@ -71,7 +71,7 @@ public struct StudioHydratedSnapshot: Sendable {
     public var undoSummaries: [UndoCommandSummary]
     public var redoSummaries: [UndoCommandSummary]
     public var persistedJournal: [UndoJournalRecord]
-    public var lastForkLatencyMs: Double
+    public var lastForkLatencyMs: Double?
 }
 
 // MARK: - Quick Wiretap Presets & Synthetic Packet Probes
@@ -156,6 +156,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
     @Published public var manifest: AgentVMProjectManifest = AgentVMProjectManifest()
     @Published public var preferences: WorkspacePreferences = WorkspacePreferences()
     @Published public var hostCapabilities: HostCapabilityReport = HostHypervisorProbe.probeCapabilities()
+    @Published public var isDemoMode: Bool = false
     @Published public var isBootstrapped: Bool = false
     @Published public var isBusy: Bool = false
     @Published public var lastStatusBanner: String = "Workspace ready"
@@ -169,7 +170,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
     @Published public var currentLCADiff: SnapshotDiffReport?
     @Published public var dagValidationReport: SnapshotDAGValidationReport?
     @Published public var gcPlan: GarbageCollectionPlan?
-    @Published public var lastForkLatencyMs: Double = 6.8
+    @Published public var lastForkLatencyMs: Double? = nil
 
     // Wireshark L2 Packet Wiretap State
     @Published public var allPackets: [CapturedPacket] = []
@@ -229,9 +230,9 @@ public final class AgentVMStudioViewModel: ObservableObject {
     @Published public var selectedPluginID: PluginID?
     @Published public var pluginLogs: [PluginHookConsoleEntry] = []
     @Published public var scratchpadSource: String = AgentVMStudioViewModel.defaultScratchpadScript
-    @Published public var scratchpadOutputJSON: String = "{\n  \"action\" : \"drop\",\n  \"matchedRule\" : \"Anthropic API Token\",\n  \"severity\" : \"critical\"\n}"
+    @Published public var scratchpadOutputJSON: String = ""
     @Published public var scratchpadConsoleLines: [String] = []
-    @Published public var scratchpadDurationMicros: UInt64 = 184
+    @Published public var scratchpadDurationMicros: UInt64 = 0
     @Published public var hclPreview: String = ""
     @Published public var composePreview: String = ""
     @Published public var selectedIaCFormat: String = "hcl"
@@ -270,25 +271,32 @@ public final class AgentVMStudioViewModel: ObservableObject {
     public init(
         bundleURL: URL? = nil,
         coordinator: AgentVMFleetCoordinator? = nil,
-        docking: SplitDockingController? = nil
+        docking: SplitDockingController? = nil,
+        isDemoMode: Bool? = nil
     ) {
-        let resolvedURL = bundleURL ?? Self.defaultInteractiveBundleURL()
+        let rawArgs = Array(CommandLine.arguments.dropFirst())
+        let resolvedDemo = isDemoMode ?? Self.extractDemoFlag(from: rawArgs)
+        self.isDemoMode = resolvedDemo
+
+        let resolvedURL = bundleURL
+            ?? Self.extractWorkspaceBundleOverride(from: rawArgs)
+            ?? Self.defaultInteractiveBundleURL(isDemoMode: resolvedDemo)
         self.workspaceBundleURL = resolvedURL
         if let coordinator {
             self.coordinator = coordinator
         } else {
+            let backend: HypervisorExecutionBackend = resolvedDemo ? .deterministicSimulation : .strictHardwareVZ
             do {
                 self.coordinator = try AgentVMFleetCoordinator(
                     bundleURL: resolvedURL,
-                    executionBackend: .automaticHybrid
+                    executionBackend: backend
                 )
             } catch {
                 let fallbackURL = URL(fileURLWithPath: NSTemporaryDirectory())
                     .appendingPathComponent("AgentVMFallback-\(UUID().uuidString).agentvm", isDirectory: true)
-                // Guaranteed writable fallback directory
                 self.coordinator = try! AgentVMFleetCoordinator(
                     bundleURL: fallbackURL,
-                    executionBackend: .deterministicSimulation
+                    executionBackend: backend
                 )
             }
         }
@@ -304,6 +312,33 @@ public final class AgentVMStudioViewModel: ObservableObject {
 
         forwardChildObjectChanges()
         registerExtendedCommandPaletteActions()
+    }
+
+    public static func extractDemoFlag(from args: [String] = Array(CommandLine.arguments.dropFirst())) -> Bool {
+        for arg in args {
+            if arg == "--" { break }
+            if arg == "--demo" { return true }
+        }
+        return false
+    }
+
+    public static func extractWorkspaceBundleOverride(
+        from args: [String] = Array(CommandLine.arguments.dropFirst())
+    ) -> URL? {
+        var idx = 0
+        while idx < args.count {
+            let token = args[idx]
+            if token == "--" { break }
+            if (token == "--workspace" || token == "-w"), idx + 1 < args.count {
+                return URL(fileURLWithPath: args[idx + 1], isDirectory: true)
+            }
+            if token.hasPrefix("--workspace=") {
+                let path = String(token.dropFirst("--workspace=".count))
+                return URL(fileURLWithPath: path, isDirectory: true)
+            }
+            idx += 1
+        }
+        return nil
     }
 
     private static func applyCompactTabTitles(to docking: SplitDockingController) {
@@ -329,15 +364,31 @@ public final class AgentVMStudioViewModel: ObservableObject {
         }
     }
 
-    public static func defaultInteractiveBundleURL() -> URL {
+    public var demoBadgeText: String {
+        L("[DEMO]", "[演示数据]")
+    }
+
+    public var liveTrafficStatusNotice: String {
+        L(
+            "Not connected to live traffic yet (scheduled for M5)",
+            "尚未接入真实流量（排在 M5）"
+        )
+    }
+
+    public var hasLiveConnectedTraffic: Bool {
+        false
+    }
+
+    public static func defaultInteractiveBundleURL(isDemoMode: Bool = false) -> URL {
         if let envPath = ProcessInfo.processInfo.environment["AGENTVM_WORKSPACE"], !envPath.isEmpty {
             return URL(fileURLWithPath: envPath, isDirectory: true)
         }
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let bundleName = isDemoMode ? "DemoFleet.agentvm" : "DefaultFleet.agentvm"
         return appSupport
             .appendingPathComponent("AgentVM", isDirectory: true)
-            .appendingPathComponent("DefaultFleet.agentvm", isDirectory: true)
+            .appendingPathComponent(bundleName, isDirectory: true)
     }
 
     private func forwardChildObjectChanges() {
@@ -408,6 +459,15 @@ public final class AgentVMStudioViewModel: ObservableObject {
                 keyEquivalentDisplay: "⇧⌘E",
                 sfSymbol: "doc.badge.gearshape",
                 searchTokens: ["hcl", "terraform", "export", "topology", "导出", "拓扑"]
+            ),
+            CommandPaletteActionItem(
+                id: "workspace.load.demo",
+                title: L("Load Demonstration Workspace [DEMO]", "载入演示工作区数据 [演示数据]"),
+                subtitle: L("Populates synthetic demo VMs, CoW branches, and crafted L2 frames", "填充合成演示虚拟机、CoW 分支与构造的二层抓包数据"),
+                category: .workspaceView,
+                keyEquivalentDisplay: "",
+                sfSymbol: "sparkles.rectangle.stack",
+                searchTokens: ["demo", "seed", "sample", "演示", "示例"]
             )
         ])
         commandPalette.registerActions(actions)
@@ -465,8 +525,9 @@ public final class AgentVMStudioViewModel: ObservableObject {
         }
     }
 
-    public var fleetCoWSpaceSavedPercent: Double {
-        let virtualTotal = max(1, totalVirtualPoolBytes)
+    public var fleetCoWSpaceSavedPercent: Double? {
+        let virtualTotal = totalVirtualPoolBytes
+        guard virtualTotal > 0 else { return nil }
         let dirty = min(virtualTotal, totalDirtyCoWBytes)
         return max(0.0, min(99.9, (1.0 - Double(dirty) / Double(virtualTotal)) * 100.0))
     }
@@ -510,14 +571,18 @@ public final class AgentVMStudioViewModel: ObservableObject {
         }
     }
 
-    /// Seeds demonstration VMs, CoW branches, snapshots, L2 packets, ext4 superblocks, and JS plugin hooks if needed,
-    /// then gathers every subsystem state into an immutable `StudioHydratedSnapshot` ready for synchronous `@MainActor` binding.
+    /// Hydrates every subsystem state into an immutable `StudioHydratedSnapshot` ready for synchronous `@MainActor` binding.
+    /// Never seeds synthetic demonstration VMs, packets, or plugin hooks unless `isDemoMode` or `manifest.isDemonstrationWorkspace` is explicitly true.
     public func buildHydratedSnapshot(preferredVMID: VMID? = nil) async throws -> StudioHydratedSnapshot {
         try await coordinator.store.seedDefaultFirewallPresetsIfNeeded()
-        try await coordinator.seedIndustrialDemonstrationFleetIfEmpty()
-        try await enrichDemonstrationArtifactsIfNeeded()
+        var loadedManifest = try await coordinator.store.loadManifest()
+        let effectiveDemo = isDemoMode || loadedManifest.isDemonstrationWorkspace
+        if effectiveDemo {
+            try await coordinator.seedIndustrialDemonstrationFleetIfEmpty()
+            try await enrichDemonstrationArtifactsIfNeeded()
+            loadedManifest = try await coordinator.store.loadManifest()
+        }
 
-        let loadedManifest = try await coordinator.store.loadManifest()
         let caps = await coordinator.hostCapabilities()
         let loadedVMs = try await coordinator.store.listVMs()
         let loadedSnapshots = try await coordinator.store.listSnapshots()
@@ -594,13 +659,22 @@ public final class AgentVMStudioViewModel: ObservableObject {
         let plugins = await coordinator.pluginEngine.listPluginStatuses()
         let pLogs = await coordinator.pluginEngine.recentConsoleLogs(limit: 120)
 
-        let samplePkt = packets.first(where: { $0.tlsSNI == "api.github.com" })
-            ?? packets.last
-            ?? simPacket
-        let scratchOutcome = (try? await coordinator.pluginEngine.evaluateScratchpadScript(
-            source: scratchpadSource,
-            samplePacket: samplePkt
-        )) ?? (outputJSON: "{\n  \"action\" : \"allow\"\n}", consoleLines: [], durationMicros: 140)
+        let scratchOutcome: (outputJSON: String, consoleLines: [String], durationMicros: UInt64)
+        if effectiveDemo {
+            let samplePkt = packets.first(where: { $0.tlsSNI == "api.github.com" })
+                ?? packets.last
+                ?? simPacket
+            scratchOutcome = (try? await coordinator.pluginEngine.evaluateScratchpadScript(
+                source: scratchpadSource,
+                samplePacket: samplePkt
+            )) ?? (outputJSON: "{\n  \"action\" : \"allow\"\n}", consoleLines: [], durationMicros: 140)
+        } else {
+            scratchOutcome = (
+                outputJSON: self.scratchpadOutputJSON,
+                consoleLines: self.scratchpadConsoleLines,
+                durationMicros: self.scratchpadDurationMicros
+            )
+        }
 
         let allSpecs = loadedVMs.map(\.spec)
         let hcl = iacCodec.exportHCL(vms: allSpecs, policy: fwPolicy)
@@ -652,12 +726,15 @@ public final class AgentVMStudioViewModel: ObservableObject {
             undoSummaries: undoList,
             redoSummaries: redoList,
             persistedJournal: ledger,
-            lastForkLatencyMs: 6.4
+            lastForkLatencyMs: self.lastForkLatencyMs
         )
     }
 
     public func hydrateSynchronously(from snapshot: StudioHydratedSnapshot) {
         self.manifest = snapshot.manifest
+        if snapshot.manifest.isDemonstrationWorkspace {
+            self.isDemoMode = true
+        }
         self.preferences = snapshot.manifest.preferences
         self.hostCapabilities = snapshot.hostCapabilities
         self.vms = snapshot.vms
@@ -716,6 +793,29 @@ public final class AgentVMStudioViewModel: ObservableObject {
         self.redoSummaries = snapshot.redoSummaries
         self.persistedJournal = snapshot.persistedJournal
         self.isBootstrapped = true
+    }
+
+    public func loadDemonstrationFleet() {
+        runCoordinatorTask(label: L("Loading Demonstration Fleet [DEMO]", "正在载入演示沙盒集群 [演示数据]")) { [self] in
+            try await loadDemonstrationFleetAsync()
+            toastCenter.post(
+                title: L("[DEMO] Loaded Demonstration Fleet", "[演示数据] 已载入合成演示集群"),
+                detail: L(
+                    "Populated synthetic microVMs, APFS CoW lineage, and crafted Layer-2 frames.",
+                    "已填充合成微虚拟机、APFS CoW 血统与构造的二层抓包数据。"
+                ),
+                severity: .notice
+            )
+        }
+    }
+
+    public func loadDemonstrationFleetAsync() async throws {
+        self.isDemoMode = true
+        try await coordinator.store.seedDefaultFirewallPresetsIfNeeded()
+        try await coordinator.seedIndustrialDemonstrationFleetIfEmpty()
+        try await enrichDemonstrationArtifactsIfNeeded()
+        let snapshot = try await buildHydratedSnapshot()
+        hydrateSynchronously(from: snapshot)
     }
 
     /// Configures deterministic layout, active tabs, and highlighted selections for each of the 4 Retina screenshots.
@@ -1813,6 +1913,8 @@ public final class AgentVMStudioViewModel: ObservableObject {
             exportHTMLSecurityReportDefault()
         case "plugins.export.hcl":
             exportHCLDefault()
+        case "workspace.load.demo":
+            loadDemonstrationFleet()
         case "app.language.toggle":
             let updated = AgentVMLocalizer.shared.toggleLanguage()
             refreshLocalizedChrome()

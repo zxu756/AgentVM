@@ -4,7 +4,7 @@ import Darwin
 import Foundation
 import Testing
 
-@Suite("M04 NetSwitch L2/L3/L4/L7 Dissector, Egress Firewall, PCAPNG & Wiretap")
+@Suite("M04 NetSwitch L2/L3/L4/L7 Dissector, Egress Firewall, PCAPNG & Wiretap", .timeLimit(.minutes(1)))
 struct NetSwitchDissectorAndPCAPTests {
 
     private let guestMAC = MACAddress(octets: [0x52, 0x54, 0x00, 0x10, 0x20, 0x30])

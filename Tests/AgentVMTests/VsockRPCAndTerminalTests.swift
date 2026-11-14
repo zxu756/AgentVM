@@ -4,7 +4,7 @@ import Darwin
 import Foundation
 import Testing
 
-@Suite("M05 AVM1 Vsock Wire Framing, Multiplexed RPC, Port Forwarding & VT100 Terminal")
+@Suite("M05 AVM1 Vsock Wire Framing, Multiplexed RPC, Port Forwarding & VT100 Terminal", .timeLimit(.minutes(1)))
 struct VsockRPCAndTerminalTests {
 
     // MARK: - Helpers
@@ -164,7 +164,7 @@ struct VsockRPCAndTerminalTests {
 
     // MARK: - 2. VsockMultiplexSession Loopback Exec, Multi-Chunk SHA-256 File Transfer & Heartbeat
 
-    @Test("VsockMultiplexSession loopback pair executes commands with exit codes, env vars, and streaming chunks")
+    @Test("VsockMultiplexSession simulated loopback pair executes commands with exit codes, env vars, and streaming chunks")
     func vsockLoopbackSessionExecuteCommandAndStreaming() async throws {
         let vmID = VMID("vm-vsock-exec")
         let (host, guest) = await VsockMultiplexSession.createLoopbackPair(vmID: vmID)
@@ -208,7 +208,7 @@ struct VsockRPCAndTerminalTests {
         await guest.shutdown()
     }
 
-    @Test("VsockMultiplexSession enforces command watchdog timeout returning exitCode 124 and timedOut == true")
+    @Test("VsockMultiplexSession simulated loopback enforces command watchdog timeout returning exitCode 124 and timedOut == true")
     func vsockLoopbackSessionCommandWatchdogTimeout() async throws {
         let (host, guest) = await VsockMultiplexSession.createLoopbackPair(vmID: VMID("vm-timeout"))
 
@@ -225,7 +225,7 @@ struct VsockRPCAndTerminalTests {
         await guest.shutdown()
     }
 
-    @Test("VsockMultiplexSession streams multi-chunk 384 KiB pushFile and pullFile exercising window-credit replenishment and SHA-256")
+    @Test("VsockMultiplexSession simulated loopback streams multi-chunk 384 KiB pushFile and pullFile exercising window-credit replenishment and SHA-256")
     func vsockMultiChunkFileTransferWindowCreditsAndSHA256RoundTrip() async throws {
         let tempDir = try makeTemporaryDirectory(prefix: "avm-vsock-xfer")
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -278,7 +278,7 @@ struct VsockRPCAndTerminalTests {
         await guest.shutdown()
     }
 
-    @Test("VsockMultiplexSession exchanges live telemetry heartbeats and interactive PTY stream frames")
+    @Test("VsockMultiplexSession simulated loopback exchanges telemetry heartbeats and interactive PTY stream frames")
     func vsockHeartbeatAndInteractivePTYStreaming() async throws {
         let vmID = VMID("vm-pty-hb")
         let (host, guest) = await VsockMultiplexSession.createLoopbackPair(vmID: vmID)
@@ -360,7 +360,7 @@ struct VsockRPCAndTerminalTests {
 
     // MARK: - 3. HostPortForwardManager Ephemeral 127.0.0.1:0 Bind & Live TCP Payload Relay
 
-    @Test("HostPortForwardManager binds ephemeral 127.0.0.1:0 listener and relays live TCP HTTP & raw bytes over Vsock")
+    @Test("HostPortForwardManager simulated guest responder binds ephemeral 127.0.0.1:0 listener and relays TCP HTTP over Vsock")
     func hostPortForwardEphemeralBindAndLiveTCPRelay() async throws {
         let vmID = VMID("vm-portfwd")
         let vsock = VsockMultiplexSession(vmID: vmID)
@@ -424,7 +424,7 @@ struct VsockRPCAndTerminalTests {
         await vsock.shutdown()
     }
 
-    @Test("HostPortForwardManager rejects duplicate non-ephemeral port collisions with ERR_PORT_FORWARD_BIND")
+    @Test("HostPortForwardManager simulated guest responder rejects duplicate non-ephemeral port collisions with ERR_PORT_FORWARD_BIND")
     func hostPortForwardDetectsDuplicatePortBindCollision() async throws {
         let vmID = VMID("vm-port-collide")
         let vsock = VsockMultiplexSession(vmID: vmID)

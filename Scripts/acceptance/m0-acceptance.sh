@@ -497,7 +497,7 @@ echo "PASS [Row 11/$TOTAL_ROWS]: all $mcp_tool_count tools from tools/list (and 
 # ------------------------------------------------------------------
 echo ""
 echo "[Row 12/$TOTAL_ROWS] Verifying 'doctor' reads the executable's real virtualization entitlement (en & zh)..."
-binary_entitlements="$(codesign -d --entitlements - "$AGENTVM_BIN" 2>/dev/null || true)"
+binary_entitlements="$(codesign -d --entitlements - "${AGENTVM_CLI_BINARY:-$AGENTVM_BIN}" 2>/dev/null || true)"
 if [[ "$binary_entitlements" == *"com.apple.security.virtualization"* ]]; then
     binary_is_entitled=1
 else

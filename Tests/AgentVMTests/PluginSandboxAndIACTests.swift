@@ -587,13 +587,13 @@ struct PluginSandboxAndIACTests {
             id: runawayID,
             name: "Runaway Loop Probe",
             author: "M0 Audit",
-            summary: "Spins in JS for 650ms while watchdog limit is 40ms",
+            summary: "Spins in JS for 6500ms while watchdog limit is 40ms",
             requestedCapabilities: [.networkInspect],
             timeoutMilliseconds: 40,
             entryPointSource: """
             function onPacket(pkt) {
                 const start = Date.now();
-                while (Date.now() - start < 650) {}
+                while (Date.now() - start < 6500) {}
                 return { action: "allow" };
             }
             """
@@ -612,12 +612,20 @@ struct PluginSandboxAndIACTests {
         let wallStartNs = DispatchTime.now().uptimeNanoseconds
         do {
             _ = try await engine.dispatchPacketHook(pkt)
-            Issue.record("Expected ERR_PLUGIN_TIMEOUT for 650ms busy-loop under 40ms watchdog")
+            Issue.record("Expected ERR_PLUGIN_TIMEOUT for 6500ms busy-loop under 40ms watchdog")
         } catch let err as AgentVMError {
             #expect(err.errorCode == "ERR_PLUGIN_TIMEOUT")
         }
         let wallElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - wallStartNs) / 1_000_000.0
-        // Preemptive watchdog must return promptly around 40ms rather than blocking for the full 650ms spin
-        #expect(wallElapsedMs < 250.0)
+        // Preemptive watchdog must return long before the 6500ms spin could finish. A blocking (non-preemptive)
+        // implementation cannot return in under 6500ms, so any bound well below that proves preemption.
+        //
+        // The spin and the bound are ten times the original 650ms / 250ms. With those figures the test was
+        // load-sensitive: under the default parallel `swift test` every `await` in `dispatchPacketHook` has to
+        // wait for a free thread of the cooperative pool, and the measured wall time (dominated by that
+        // scheduling latency, not by the spin) reached 270-920ms on a busy machine while the same call takes
+        // about 42ms under `--no-parallel`. Scaling both keeps the bound at the same 38% of the spin and gives
+        // scheduling noise 2.5s of room.
+        #expect(wallElapsedMs < 2500.0)
     }
 }

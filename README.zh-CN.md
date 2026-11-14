@@ -39,7 +39,7 @@
 
 ## 已验证命令行示例
 
-从源码编译 `AgentVM` 后，可在独立 `.agentvm` 工作区中直接复现以下命令：
+从源码编译 `AgentVM` 后，可在独立 `.agentvm` 工作区中直接复现以下命令。以 `# ->` 开头的行是文档记录的结果，`...` 代表每次不同的内容（ID、路径、耗时）。`Scripts/acceptance/readme-commands.sh` 直接读取这个代码块，命令或这些结果对不上时会失败。
 
 ```bash
 swift build --product AgentVM
@@ -47,20 +47,29 @@ alias agentvm="$(pwd)/.build/debug/AgentVM"
 
 # 1. 宿主机就绪自检（在工作区所在卷上执行一次真实的 APFS clonefile(2) 临时克隆探测；读取当前可执行文件的虚拟化权限）
 agentvm --lang zh --workspace ./demo-check.agentvm doctor
+# -> APFS clonefile(2) : 通过 (实测 clonefile(2) 写时复制克隆成功)
 
 # 2. 初始化空工作区并创建一台空稀疏 GPT 磁盘虚拟机记录
 agentvm --lang zh --workspace ./demo-check.agentvm init
+# -> 已初始化空工作区「demo-check」（...）：...
 agentvm --lang zh --workspace ./demo-check.agentvm create sandbox-a
+# -> 已创建虚拟机「sandbox-a」（...），根快照 ...（空稀疏 GPT 磁盘，未安装客户机系统）
 
 # 3. 查看虚拟机表格或 JSON 输出（未实测的 CPU/内存统一显示为 —）
 agentvm --lang zh --workspace ./demo-check.agentvm ps
+# -> sandbox-a ... 已停止
 agentvm --lang zh --workspace ./demo-check.agentvm ps --json
+# -> "state" : "stopped"
 
 # 4. 派生 APFS 写时复制磁盘分支、列出快照、查看插件并导出 HCL 清单
 agentvm --lang zh --workspace ./demo-check.agentvm branch sandbox-a sandbox-b --no-boot
+# -> 已通过 clonefile(2) 派生 CoW 分支「sandbox-b」（...），耗时 ... ms，父快照 ...
 agentvm --lang zh --workspace ./demo-check.agentvm snapshot list
+# -> Golden Base (sandbox-a) ... Branch Fork -> sandbox-b ... CoW Head (sandbox-b)
 agentvm --lang zh --workspace ./demo-check.agentvm plugin
+# -> builtin.secret-leak-guard ... 已启用
 agentvm --lang zh --workspace ./demo-check.agentvm export-hcl
+# -> sandbox_vm "sandbox-a" ... sandbox_vm "sandbox-b"
 
 # 5. 对无操作系统的空磁盘执行 up 或 exec 会诚实返回非零退出码与错误说明
 agentvm --lang zh --workspace ./demo-check.agentvm up sandbox-a
@@ -96,7 +105,7 @@ agentvm --lang en --workspace ./demo-check.agentvm ps
 
 ## 桌面工作台界面预览（`[演示数据]` 合成样本）
 
-> **演示数据说明**：下方截图均通过显式 `--demo` 模式渲染（顶部带有 `演示数据 · 合成样本` 标识）。图中的虚拟机、CoW 分支、以太网/TLS 数据帧与策略计数均为离线合成演示样本，并非采集自真实运行中的客户机。正常启动 `AgentVM` 默认显示空工作区。这些图是在状态栏修正之前渲染的：图里状态栏写着 `虚拟化: Apple VZ`，而演示集群实际运行在主机侧模拟器上。当前版本在演示模式下状态栏显示 `虚拟化: SIMULATED 模拟`，每台演示虚拟机的状态显示为 `SIMULATED 模拟 · 运行中`；截图会随下一个版本重新渲染。
+> **演示数据说明**：下方截图均通过显式 `--demo` 模式渲染（顶部带有 `演示数据 · 合成样本` 标识）。图中的虚拟机、CoW 分支、以太网/TLS 数据帧与策略计数均为离线合成演示样本，并非采集自真实运行中的客户机。正常启动 `AgentVM` 默认显示空工作区。这些图是在状态栏修正之前渲染的：图里状态栏写着 `虚拟化: Apple VZ`，而演示集群实际运行在主机侧模拟器上。当前版本在演示模式下状态栏显示 `虚拟化: SIMULATED 模拟`，每台演示虚拟机的状态显示为 `SIMULATED 模拟 · 运行中`；截图还没有重新渲染。
 
 ### 总览与快照血统拓扑图（`[演示数据]` 合成样本）
 ![AgentVM 快照与写时复制分支血统图 — 合成演示数据](docs/screenshot-overview-dag-zh.png)

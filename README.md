@@ -39,7 +39,7 @@ By default, launching the desktop app or initializing a `.agentvm` workspace sta
 
 ## Verified CLI Quick Start
 
-Build the `AgentVM` executable from source and run all commands against an isolated `.agentvm` workspace:
+Build the `AgentVM` executable from source and run all commands against an isolated `.agentvm` workspace. Lines starting with `# ->` show the documented result; `...` stands for text that varies (IDs, paths, timings). `Scripts/acceptance/readme-commands.sh` reads this block and fails if a command or one of these results no longer matches.
 
 ```bash
 swift build --product AgentVM
@@ -47,20 +47,29 @@ alias agentvm="$(pwd)/.build/debug/AgentVM"
 
 # 1. Host readiness check (live APFS clonefile(2) probe on the workspace volume; reads this executable's virtualization entitlement)
 agentvm --lang en --workspace ./demo-check.agentvm doctor
+# -> APFS clonefile(2) : PASS (verified via live clonefile(2) probe)
 
 # 2. Initialize an empty workspace and create an empty sparse GPT VM record
 agentvm --lang en --workspace ./demo-check.agentvm init
+# -> Initialized workspace 'demo-check' (...) at ...
 agentvm --lang en --workspace ./demo-check.agentvm create sandbox-a
+# -> Created VM 'sandbox-a' (...) with root snapshot ... (empty sparse GPT disk, no guest OS installed)
 
 # 3. List VMs in table or JSON form (unmeasured CPU/RAM shown as —)
 agentvm --lang en --workspace ./demo-check.agentvm ps
+# -> sandbox-a ... stopped
 agentvm --lang en --workspace ./demo-check.agentvm ps --json
+# -> "state" : "stopped"
 
 # 4. Fork an APFS Copy-on-Write disk branch, list snapshots, inspect plugins, and export HCL
 agentvm --lang en --workspace ./demo-check.agentvm branch sandbox-a sandbox-b --no-boot
+# -> Forked CoW branch 'sandbox-b' (...) in ... ms from snapshot ...
 agentvm --lang en --workspace ./demo-check.agentvm snapshot list
+# -> Golden Base (sandbox-a) ... Branch Fork -> sandbox-b ... CoW Head (sandbox-b)
 agentvm --lang en --workspace ./demo-check.agentvm plugin
+# -> builtin.secret-leak-guard ... ENABLED
 agentvm --lang en --workspace ./demo-check.agentvm export-hcl
+# -> sandbox_vm "sandbox-a" ... sandbox_vm "sandbox-b"
 
 # 5. Booting or executing on an empty disk fails honestly (non-zero exit code)
 agentvm --lang en --workspace ./demo-check.agentvm up sandbox-a
@@ -96,7 +105,7 @@ agentvm --lang zh --workspace ./demo-check.agentvm ps
 
 ## Desktop Workbench Preview (`[DEMO]` Synthetic Dataset)
 
-> **Demonstration Data Notice**: All screenshots below were rendered in explicit `--demo` mode (`DEMO · SYNTHETIC DATA`). The VMs, CoW branches, Ethernet/TLS frames, and policy counters shown in these captures are synthetic demonstration fixtures, not captures from live running guest VMs. Launching `AgentVM` normally opens an empty workspace. These images were rendered before the status bar was corrected: in them it reads `Hypervisor: Apple VZ`, while the demonstration fleet runs on the host-side simulator. Current builds show `Hypervisor: SIMULATED` in demonstration mode and `SIMULATED · Running` on each demonstration VM; the images will be re-rendered with the next release.
+> **Demonstration Data Notice**: All screenshots below were rendered in explicit `--demo` mode (`DEMO · SYNTHETIC DATA`). The VMs, CoW branches, Ethernet/TLS frames, and policy counters shown in these captures are synthetic demonstration fixtures, not captures from live running guest VMs. Launching `AgentVM` normally opens an empty workspace. These images were rendered before the status bar was corrected: in them it reads `Hypervisor: Apple VZ`, while the demonstration fleet runs on the host-side simulator. Current builds show `Hypervisor: SIMULATED` in demonstration mode and `SIMULATED · Running` on each demonstration VM; the images have not been re-rendered yet.
 
 ### Overview & Snapshot Lineage DAG (`[DEMO]` Synthetic Data)
 ![AgentVM Overview & CoW Lineage DAG — Synthetic Demo Data](docs/screenshot-overview-dag.png)

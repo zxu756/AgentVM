@@ -300,6 +300,10 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case baseImageError(imageID: String, reason: BaseImageErrorReason)
     case diskSizeTooSmallForImage(imageID: String, requestedBytes: UInt64, imageBytes: UInt64)
     case vmNameAlreadyExists(name: String, existingID: VMID)
+    case vmBusy(vmName: String, holderPID: Int32?)
+    case runUnsupportedInSimulation(vmName: String)
+    case persistentBootRequiresDaemon(vmName: String)
+    case airgapPolicyUnsupportedBeforeM5(vmName: String)
     case guestAgentNotConnected(vmName: String, state: String)
     case guestVsockConnectTimedOut(
         vmName: String,
@@ -352,6 +356,10 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             }
         case .diskSizeTooSmallForImage: return "ERR_DISK_SIZE_TOO_SMALL"
         case .vmNameAlreadyExists: return "ERR_VM_NAME_EXISTS"
+        case .vmBusy: return "ERR_VM_LOCKED"
+        case .runUnsupportedInSimulation: return "ERR_RUN_SIMULATION_UNSUPPORTED"
+        case .persistentBootRequiresDaemon: return "ERR_DAEMON_REQUIRED"
+        case .airgapPolicyUnsupportedBeforeM5: return "ERR_AIRGAP_UNSUPPORTED"
         case .guestAgentNotConnected: return "ERR_GUEST_AGENT_UNAVAILABLE"
         case .guestVsockConnectTimedOut: return "ERR_VSOCK_CONNECT_TIMEOUT"
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
@@ -450,6 +458,27 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "工作区里已经有一台名为「\(name)」的虚拟机（\(existingID.rawValue)），没有创建新的。请换一个名字。"
                 : "A virtual machine named '\(name)' already exists in this workspace (\(existingID.rawValue)); nothing was created. Choose a different name."
+        case let .vmBusy(vmName, holderPID):
+            if let pid = holderPID {
+                return isZh
+                    ? "虚拟机「\(vmName)」正被进程 \(pid) 占用；同一时刻只能有一个进程使用同一台虚拟机。"
+                    : "VM '\(vmName)' is currently in use by process \(pid); only one process may use a VM at a time."
+            }
+            return isZh
+                ? "虚拟机「\(vmName)」正被另一进程占用；同一时刻只能有一个进程使用同一台虚拟机。"
+                : "VM '\(vmName)' is currently in use by another process; only one process may use a VM at a time."
+        case let .runUnsupportedInSimulation(vmName):
+            return isZh
+                ? "'agentvm run' 仅支持在真实虚拟机上执行命令，不支持 --backend simulation（未启动虚拟机「\(vmName)」，未执行任何操作）。"
+                : "'agentvm run' only executes commands on a real hardware VM and is not supported under --backend simulation (VM '\(vmName)' was not started and nothing was executed)."
+        case let .persistentBootRequiresDaemon(vmName):
+            return isZh
+                ? "常驻后台守护进程在 M2 之前尚未实现，无法通过 'agentvm up' 将虚拟机「\(vmName)」启动为常驻状态；请改用 'agentvm run \(vmName) -- <命令>' 执行命令。"
+                : "Persistent background VM lifecycle ('agentvm up') requires the M2 daemon and is not available yet for VM '\(vmName)'; use 'agentvm run \(vmName) -- <cmd>' instead."
+        case let .airgapPolicyUnsupportedBeforeM5(vmName):
+            return isZh
+                ? "当前工作区出口策略为 airgap，但在 M5 之前网络使用系统 NAT，做不到断网启动，已拒绝启动虚拟机「\(vmName)」。如需联网启动请先切换策略（如 'agentvm policy strict'）。"
+                : "Active workspace egress policy is 'airgap', but air-gapped boot cannot be enforced before M5 while networking uses system NAT; refused to start VM '\(vmName)'. Switch policy (e.g. 'agentvm policy strict') to boot with NAT."
         case let .guestAgentNotConnected(vmName, state):
             return isZh
                 ? "虚拟机「\(vmName)」当前状态为 \(state)，尚未连接真实客户机代理（agentvm-guestd），无法执行客户机命令。"
@@ -578,6 +607,14 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return "Specify a --disk-size of at least \(ByteMetricsFormatter.formatBytes(imageBytes)) (\(imageBytes) bytes) or omit --disk-size."
         case .vmNameAlreadyExists:
             return "Run 'agentvm ps' to list existing virtual machines."
+        case .vmBusy:
+            return "Wait for the process currently using this VM to finish, or create a separate VM."
+        case .runUnsupportedInSimulation:
+            return "Omit '--backend simulation' to run on a real hardware VM."
+        case let .persistentBootRequiresDaemon(vmName):
+            return "Use 'agentvm run \(vmName) -- <cmd>' to boot, execute a command, and shut down cleanly."
+        case .airgapPolicyUnsupportedBeforeM5:
+            return "Run 'agentvm policy strict' to switch away from 'airgap' until M5 enforces L2 egress rules."
         case .cowCloneFailed:
             return "Ensure source and destination disk images reside on the same APFS volume."
         case .firewallBlocked:

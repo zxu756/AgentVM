@@ -742,4 +742,98 @@ struct VsockRPCAndTerminalTests {
         await session.shutdown()
         proc.waitUntilExit()
     }
+
+    @Test("Generated Python guest daemon streams stdout chunks live before long-running child exits")
+    func guestDaemonScriptStreamsStdoutLiveBeforeSleepCompletes() async throws {
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-py-stream")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let daemonModuleURL = tempDir.appendingPathComponent("agentvm_guestd.py")
+        try GuestAgentBootstrapGenerator().pythonDaemonScript().write(
+            to: daemonModuleURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        var fds: [Int32] = [-1, -1]
+        #expect(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        let guestHandle = FileHandle(fileDescriptor: fds[1], closeOnDealloc: false)
+        proc.standardInput = guestHandle
+        proc.arguments = [
+            "-u",
+            "-c",
+            """
+            import os, socket, sys
+            sys.path.insert(0, sys.argv[1])
+            import agentvm_guestd
+            sock = socket.fromfd(0, socket.AF_UNIX, socket.SOCK_STREAM)
+            session = agentvm_guestd.GuestVsockConnectionSession(
+                conn=sock,
+                heartbeat_interval=60,
+                default_workspace=sys.argv[1],
+            )
+            session.run()
+            """,
+            tempDir.path
+        ]
+        try proc.run()
+        _ = Darwin.close(fds[1])
+        defer {
+            if proc.isRunning {
+                proc.terminate()
+                proc.waitUntilExit()
+            }
+        }
+
+        let session = VsockMultiplexSession(vmID: VMID("py-daemon-stream-test"))
+        try await session.attachPOSIXFileDescriptor(fds[0], closeWhenDone: true)
+        defer {
+            Task { await session.shutdown() }
+        }
+
+        final class ChunkTimingRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            var firstStdoutElapsedMs: Double?
+            var streamedStdout = Data()
+
+            func record(data: Data, elapsedMs: Double) {
+                lock.withLock {
+                    streamedStdout.append(data)
+                    if firstStdoutElapsedMs == nil,
+                       String(decoding: streamedStdout, as: UTF8.self).contains("started") {
+                        firstStdoutElapsedMs = elapsedMs
+                    }
+                }
+            }
+        }
+
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        let recorder = ChunkTimingRecorder()
+
+        let result = try await session.executeCommandStreaming(
+            GuestExecRequest(
+                executable: "/bin/sh",
+                arguments: ["-c", "echo started; sleep 3"],
+                workingDirectory: tempDir.path,
+                runAsUser: "root"
+            ),
+            onChunk: { chunk in
+                guard chunk.stream == .stdout else { return }
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                recorder.record(data: chunk.data, elapsedMs: Double(nowNs - startNs) / 1_000_000.0)
+            }
+        )
+
+        #expect(result.exitCode == 0)
+        #expect(result.stdoutData == Data("started\n".utf8))
+        let firstMs = try #require(recorder.firstStdoutElapsedMs)
+        // Must arrive well before the 3000 ms sleep finishes!
+        #expect(firstMs < 1_500.0, "Expected 'started' chunk before sleep 3 ended, but arrived at \(firstMs) ms")
+
+        await session.shutdown()
+        proc.waitUntilExit()
+    }
 }

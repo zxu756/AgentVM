@@ -28,6 +28,10 @@ public actor AgentVMProjectStore {
         bundleURL.appendingPathComponent("logs", isDirectory: true)
     }
 
+    public nonisolated var locksDirectoryURL: URL {
+        bundleURL.appendingPathComponent("locks", isDirectory: true)
+    }
+
     public nonisolated var manifestFileURL: URL {
         bundleURL.appendingPathComponent("manifest.json", isDirectory: false)
     }
@@ -78,7 +82,8 @@ public actor AgentVMProjectStore {
             standardized.appendingPathComponent("snapshots", isDirectory: true),
             standardized.appendingPathComponent("pcap", isDirectory: true),
             standardized.appendingPathComponent("isos", isDirectory: true),
-            standardized.appendingPathComponent("logs", isDirectory: true)
+            standardized.appendingPathComponent("logs", isDirectory: true),
+            standardized.appendingPathComponent("locks", isDirectory: true)
         ]
 
         if createIfMissing {

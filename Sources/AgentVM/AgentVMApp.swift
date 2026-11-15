@@ -55,11 +55,24 @@ enum AgentVMEntryPoint {
         if isCLIInvocation(rawArgs) {
             let runner = AgentVMCLIRunner()
             let forwarder = CLIStandardStreamForwarder()
+            var signalController: OneShotRunSignalController?
+            var signalSources: [any DispatchSourceSignal] = []
+
+            if extractCLISubcommand(rawArgs) == "run" {
+                let controller = OneShotRunSignalController()
+                signalController = controller
+                signalSources = controller.installPOSIXSignalSources()
+            }
+
             let outcome = await runner.execute(
                 arguments: rawArgs,
-                liveStderrHandler: { forwarder.writeProgress($0) }
+                signalController: signalController,
+                liveStderrHandler: { forwarder.writeProgress($0) },
+                liveStdoutDataHandler: { forwarder.writeStdoutChunk($0) },
+                liveStderrDataHandler: { forwarder.writeStderrChunk($0) }
             )
             outcome.writeProcessOutput(forwarder: forwarder)
+            withExtendedLifetime(signalSources) {}
             Darwin.exit(outcome.exitCode)
         }
 
@@ -138,6 +151,37 @@ enum AgentVMEntryPoint {
             }
         }
         return sawMCP ? (resolvedURL, backend) : nil
+    }
+
+    private static func extractCLISubcommand(_ args: [String]) -> String? {
+        let stripped = AppLanguage.strippingLanguageArguments(from: args)
+        let filtered = stripped.filter { arg in
+            !arg.hasPrefix("-psn_")
+                && arg != "-NSDocumentRevisionsDebugMode"
+                && arg != "YES"
+                && arg != "NO"
+        }
+        var idx = 0
+        while idx < filtered.count {
+            let token = filtered[idx]
+            if token == "--" {
+                return nil
+            }
+            if (token == "--workspace" || token == "-w"), idx + 1 < filtered.count {
+                idx += 2
+            } else if token.hasPrefix("--workspace=") {
+                idx += 1
+            } else if token == "--demo" {
+                idx += 1
+            } else if token == "--backend", idx + 1 < filtered.count {
+                idx += 2
+            } else if token.hasPrefix("--backend=") {
+                idx += 1
+            } else {
+                return token
+            }
+        }
+        return nil
     }
 
     private static func isCLIInvocation(_ args: [String]) -> Bool {

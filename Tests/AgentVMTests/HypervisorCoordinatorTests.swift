@@ -1472,4 +1472,82 @@ struct HypervisorCoordinatorTests {
         let storedAfterTimeout = try #require(try await coordinator.store.fetchVM(created.vmRecord.id))
         #expect(storedAfterTimeout.telemetry.state == .stopped)
     }
+
+    @Test("VMExecutionLock enforces non-blocking flock mutual exclusion across two handles in one process and auto-releases")
+    func vmExecutionLockMutualExclusionAndAutoReleaseAcrossTwoHandles() throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-vm-lock")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let lockURL = tempDir.appendingPathComponent("locks/vm-test.lock")
+        #expect(VMExecutionLock.isLocked(at: lockURL) == false)
+
+        // 1. First handle acquires lock; second handle in same process fails immediately with ERR_VM_LOCKED + holder PID
+        do {
+            let handle1 = try VMExecutionLock.acquire(at: lockURL, vmName: "t1")
+            #expect(VMExecutionLock.isLocked(at: lockURL) == true)
+
+            var caught: AgentVMError?
+            do {
+                _ = try VMExecutionLock.acquire(at: lockURL, vmName: "t1")
+            } catch let err as AgentVMError {
+                caught = err
+            }
+            let busyErr = try #require(caught)
+            #expect(busyErr.errorCode == "ERR_VM_LOCKED")
+            #expect(busyErr.localizedMessage(in: .en).contains("\(Darwin.getpid())"))
+            #expect(busyErr.localizedMessage(in: .zhHans).contains("\(Darwin.getpid())"))
+
+            // Explicit release frees the lock
+            handle1.release()
+            #expect(VMExecutionLock.isLocked(at: lockURL) == false)
+        }
+
+        // 2. Automatic release when handle deinitializes (closes underlying fd without explicit release())
+        do {
+            let transientHandle = try VMExecutionLock.acquire(at: lockURL, vmName: "t1")
+            _ = transientHandle
+            #expect(VMExecutionLock.isLocked(at: lockURL) == true)
+        }
+        #expect(VMExecutionLock.isLocked(at: lockURL) == false)
+
+        let handleAfterAutoRelease = try VMExecutionLock.acquire(at: lockURL, vmName: "t1")
+        #expect(VMExecutionLock.isLocked(at: lockURL) == true)
+        handleAfterAutoRelease.release()
+        #expect(VMExecutionLock.isLocked(at: lockURL) == false)
+    }
+
+    @Test("listVMsForReporting reconciles database 'running' state to 'stopped' when no process holds the VM lock")
+    func listVMsForReportingReconcilesStaleRunningRecordWhenLockIsUnheld() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-stale-running-ps")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let bundleURL = tempDir.appendingPathComponent("StalePS.agentvm", isDirectory: true)
+        let coordinator = try AgentVMFleetCoordinator(
+            bundleURL: bundleURL,
+            executionBackend: .strictHardwareVZ
+        )
+
+        let created = try await coordinator.createSandboxVM(name: "t1")
+        var stale = created.vmRecord
+        stale.telemetry.state = .running
+        stale.telemetry.simulated = false
+        stale.telemetry.guestAgentConnected = true
+        stale.telemetry.vsockStreamsOpen = 2
+        stale.telemetry.cpuUsagePercent = 42.0
+        stale.telemetry.memoryResidentMB = 512
+        try await coordinator.store.upsertVM(stale)
+
+        // Lock is NOT held -> reporting must NOT claim `running`
+        let lockURL = coordinator.lockFileURL(for: created.vmRecord.id)
+        #expect(VMExecutionLock.isLocked(at: lockURL) == false)
+
+        let reported = try await coordinator.listVMsForReporting()
+        let t1 = try #require(reported.first { $0.id == created.vmRecord.id })
+        #expect(t1.telemetry.state == .stopped)
+        #expect(t1.telemetry.guestAgentConnected == false)
+        #expect(t1.telemetry.vsockStreamsOpen == 0)
+
+        let persisted = try #require(try await coordinator.store.fetchVM(created.vmRecord.id))
+        #expect(persisted.telemetry.state == .stopped)
+    }
 }

@@ -1998,6 +1998,791 @@ struct CLIAndMCPTests {
         #expect(verboseStdout == Data("6.1.0-54-cloud-arm64\n".utf8))
         #expect(!verboseStderr.isEmpty)
     }
+
+    @Test("M1 CLI 'run' & 'ps': streams stdout live, enforces per-VM flock (second run exits 125 with PID), never persists running, and ps clears unlocked running records")
+    func cliRunFlockExclusivityLiveStreamingAndStaleRunningHygiene() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-cli-run-lock")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let cacheDir = tempDir.appendingPathComponent("shared-images", isDirectory: true)
+        let bundleURL = tempDir.appendingPathComponent("LockFleet.agentvm", isDirectory: true)
+        let env = [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+
+        let imageBytes = 4 * 1024 * 1024
+        let stagingURL = tempDir.appendingPathComponent("staging-lock.raw")
+        try APFSCoWDiskEngine().createSparseRawDisk(at: stagingURL, virtualSizeBytes: UInt64(imageBytes), overwrite: true)
+        let parts = try PartitionAndContainerInspector().writeProtectiveMBRAndGPT(
+            to: stagingURL,
+            partitions: [(name: "RootExt4", typeGUID: GPTWellKnownTypeGUID.linuxRootARM64.rawValue, sizeBytes: 2 * 1024 * 1024)]
+        )
+        var ext4Super = [UInt8](repeating: 0, count: 256)
+        ext4Super[0x38] = 0x53
+        ext4Super[0x39] = 0xEF
+        ext4Super[0x5C] = 0x04
+        ext4Super[0x60] = 0xC0
+        let fh = try FileHandle(forUpdating: stagingURL)
+        try fh.seek(toOffset: parts[0].firstLBA * 512 + 1024)
+        try fh.write(contentsOf: Data(ext4Super))
+        try fh.close()
+
+        let sha512 = try BinaryChecksums.sha512HexFile(at: stagingURL)
+        let imageID = "debian-12-bookworm-arm64"
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Test Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian.raw",
+            expectedSHA512: sha512,
+            expectedSizeBytes: UInt64(imageBytes),
+            defaultVirtualSizeBytes: UInt64(imageBytes)
+        )
+        let seeder = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, curatedEntries: [entry], createIfMissing: true)
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedURL.path, 0o444) == 0)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let cli = AgentVMCLIRunner()
+        let createOut = await cli.execute(
+            arguments: ["--lang", "en", "create", "t1", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(createOut.exitCode == 0)
+
+        let startedStream = AsyncStream<Void>.makeStream()
+        let releaseStream = AsyncStream<Void>.makeStream()
+
+        let blockingBackend = FakeVsockResponderHardwareBackend(
+            stdoutPayload: Data("started\n".utf8),
+            stderrPayload: Data(),
+            exitCode: 0,
+            holdAfterStdoutGate: {
+                for await _ in releaseStream.stream { break }
+            }
+        )
+
+        let liveStdoutBox = CLILockedStringBox()
+        let firstRunTask = Task {
+            await cli.execute(
+                arguments: ["--lang", "en", "run", "t1", "--", "sh", "-c", "echo started; sleep 20"],
+                bundleURLOverride: bundleURL,
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hardwareBackendOverride: blockingBackend,
+                liveStdoutDataHandler: { chunk in
+                    let str = String(decoding: chunk, as: UTF8.self)
+                    liveStdoutBox.append(str)
+                    if liveStdoutBox.value().contains("started") {
+                        startedStream.continuation.yield(())
+                        startedStream.continuation.finish()
+                    }
+                }
+            )
+        }
+
+        // Wait (with bounded timeout) for `started` to be streamed live while firstRunTask is still running
+        let sawStarted = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in startedStream.stream { return true }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        #expect(sawStarted == true, "Expected live stdout chunk 'started' before command finishes")
+
+        // Mid-flight DB record must NOT be persisted as `running`
+        let inspectorCoord = try AgentVMFleetCoordinator(bundleURL: bundleURL, imageCacheDirectoryURL: cacheDir, curatedImageEntries: [entry])
+        let t1Record = try #require(try await inspectorCoord.store.listVMs().first)
+        #expect(t1Record.telemetry.state == .stopped)
+        #expect(VMExecutionLock.isLocked(at: inspectorCoord.lockFileURL(for: t1Record.id)) == true)
+
+        // Second concurrent `run` on the same VM must return 125 with empty stdout and holder PID on stderr (EN + ZH)
+        let contenderBackend = FakeVsockResponderHardwareBackend(stdoutPayload: Data(), stderrPayload: Data(), exitCode: 0)
+        let secondEn = await cli.execute(
+            arguments: ["--lang", "en", "run", "t1", "--", "true"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: contenderBackend
+        )
+        #expect(secondEn.exitCode == 125)
+        #expect(secondEn.stdoutData.isEmpty)
+        #expect(secondEn.stderr.contains("ERR_VM_LOCKED"))
+        #expect(secondEn.stderr.contains("\(Darwin.getpid())"))
+        #expect(contenderBackend.lifecycleEvents.isEmpty)
+
+        let secondZh = await cli.execute(
+            arguments: ["--lang", "zh", "run", "t1", "--", "true"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: contenderBackend
+        )
+        #expect(secondZh.exitCode == 125)
+        #expect(secondZh.stdoutData.isEmpty)
+        #expect(secondZh.stderr.contains("ERR_VM_LOCKED"))
+        #expect(secondZh.stderr.contains("占用"))
+
+        // Release first `run` -> finishes cleanly with exit code 0 and releases lock
+        releaseStream.continuation.yield(())
+        releaseStream.continuation.finish()
+        let firstOutcome = await firstRunTask.value
+        #expect(firstOutcome.exitCode == 0)
+        #expect(firstOutcome.stdoutData == Data("started\n".utf8))
+        #expect(VMExecutionLock.isLocked(at: inspectorCoord.lockFileURL(for: t1Record.id)) == false)
+
+        // `ps` and `ps --json` when DB has stale `running` with no lock holder must NOT show `running`
+        var staleRecord = try #require(try await inspectorCoord.store.fetchVM(t1Record.id))
+        staleRecord.telemetry.state = .running
+        staleRecord.telemetry.simulated = false
+        try await inspectorCoord.store.upsertVM(staleRecord)
+
+        let psText = await cli.execute(
+            arguments: ["--lang", "en", "ps"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(psText.exitCode == 0)
+        #expect(!psText.stdout.contains("running"))
+        #expect(psText.stdout.contains("stopped"))
+
+        let psJSON = await cli.execute(
+            arguments: ["--lang", "en", "ps", "--json"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(psJSON.exitCode == 0)
+        #expect(!psJSON.stdout.contains("\"state\" : \"running\""))
+        #expect(psJSON.stdout.contains("\"state\" : \"stopped\""))
+    }
+
+    @Test("M1 CLI 'run': maps all AgentVM failures to 125 with empty stdout, passes guest 125 verbatim, rejects --backend simulation & policy airgap, and documents 125 in help")
+    func cliRunExit125MappingsGuestExit125SimulationRejectionAirgapHonestyAndHelpDocs() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-cli-run-125")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let cacheDir = tempDir.appendingPathComponent("shared-images", isDirectory: true)
+        let bundleURL = tempDir.appendingPathComponent("Run125Fleet.agentvm", isDirectory: true)
+        let env = [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+
+        let imageBytes = 4 * 1024 * 1024
+        let stagingURL = tempDir.appendingPathComponent("staging-125.raw")
+        try APFSCoWDiskEngine().createSparseRawDisk(at: stagingURL, virtualSizeBytes: UInt64(imageBytes), overwrite: true)
+        let parts = try PartitionAndContainerInspector().writeProtectiveMBRAndGPT(
+            to: stagingURL,
+            partitions: [(name: "RootExt4", typeGUID: GPTWellKnownTypeGUID.linuxRootARM64.rawValue, sizeBytes: 2 * 1024 * 1024)]
+        )
+        var ext4Super = [UInt8](repeating: 0, count: 256)
+        ext4Super[0x38] = 0x53
+        ext4Super[0x39] = 0xEF
+        ext4Super[0x5C] = 0x04
+        ext4Super[0x60] = 0xC0
+        let fh = try FileHandle(forUpdating: stagingURL)
+        try fh.seek(toOffset: parts[0].firstLBA * 512 + 1024)
+        try fh.write(contentsOf: Data(ext4Super))
+        try fh.close()
+
+        let sha512 = try BinaryChecksums.sha512HexFile(at: stagingURL)
+        let imageID = "debian-12-bookworm-arm64"
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Test Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian.raw",
+            expectedSHA512: sha512,
+            expectedSizeBytes: UInt64(imageBytes),
+            defaultVirtualSizeBytes: UInt64(imageBytes)
+        )
+        let seeder = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, curatedEntries: [entry], createIfMissing: true)
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedURL.path, 0o444) == 0)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let cli = AgentVMCLIRunner()
+
+        // Create bootable `t1` and empty-disk `e1`
+        let createT1 = await cli.execute(
+            arguments: ["--lang", "en", "create", "t1", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(createT1.exitCode == 0)
+
+        let createE1 = await cli.execute(
+            arguments: ["--lang", "en", "create", "e1"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(createE1.exitCode == 0)
+
+        // 1. Help banner in both EN and ZH explicitly documents exit code 125 vs guest exit code 125 (distinguished via stderr)
+        let helpEn = await cli.execute(arguments: ["--lang", "en", "help"], bundleURLOverride: bundleURL, environment: env)
+        #expect(helpEn.exitCode == 0)
+        #expect(helpEn.stdout.contains("125"))
+        #expect(helpEn.stdout.lowercased().contains("stderr"))
+
+        let helpZh = await cli.execute(arguments: ["--lang", "zh", "help"], bundleURLOverride: bundleURL, environment: env)
+        #expect(helpZh.exitCode == 0)
+        #expect(helpZh.stdout.contains("125"))
+        #expect(helpZh.stdout.contains("标准错误"))
+
+        // 2. Empty disk `e1` -> exit 125, empty stdout, ERR_NO_BOOTABLE_SYSTEM on stderr
+        let emptyRun = await cli.execute(
+            arguments: ["--lang", "en", "run", "e1", "--", "uname", "-r"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(emptyRun.exitCode == 125)
+        #expect(emptyRun.stdoutData.isEmpty)
+        #expect(emptyRun.stderr.contains("ERR_NO_BOOTABLE_SYSTEM"))
+
+        // 3. Unknown VM -> exit 125, empty stdout, ERR_VM_NOT_FOUND on stderr
+        let missingRun = await cli.execute(
+            arguments: ["--lang", "en", "run", "no-such-vm", "--", "uname", "-r"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(missingRun.exitCode == 125)
+        #expect(missingRun.stdoutData.isEmpty)
+        #expect(missingRun.stderr.contains("ERR_VM_NOT_FOUND"))
+
+        // 4. Boot start failure (missing entitlement / unsupported VZ) -> exit 125, empty stdout
+        let failStartBackend = FailingStartHardwareBackend(error: .virtualizationEntitlementMissing)
+        let failStartRun = await cli.execute(
+            arguments: ["--lang", "en", "run", "t1", "--", "uname", "-r"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: failStartBackend
+        )
+        #expect(failStartRun.exitCode == 125)
+        #expect(failStartRun.stdoutData.isEmpty)
+        #expect(failStartRun.stderr.contains("ERR_VZ_ENTITLEMENT_MISSING"))
+
+        // 5. Vsock connect timeout -> exit 125, empty stdout, VM stopped, lock released
+        let timeoutBackend = AlwaysTimeoutConnectHardwareBackend()
+        let timeoutRun = await cli.execute(
+            arguments: ["--lang", "en", "run", "t1", "--", "uname", "-r"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: timeoutBackend,
+            vsockConnectTimeoutNanosecondsOverride: 20_000_000,
+            gracefulStopTimeoutNanosecondsOverride: 20_000_000
+        )
+        #expect(timeoutRun.exitCode == 125)
+        #expect(timeoutRun.stdoutData.isEmpty)
+        #expect(timeoutRun.stderr.contains("ERR_VSOCK_CONNECT_TIMEOUT"))
+        #expect(timeoutBackend.events == ["startMachine", "closeVsockConnection", "shutdown"])
+
+        // 6. Guest command itself exiting 125 passes through verbatim with empty stderr (no AgentVM error banner)
+        let guest125Backend = FakeVsockResponderHardwareBackend(
+            stdoutPayload: Data("guest-out\n".utf8),
+            stderrPayload: Data(),
+            exitCode: 125
+        )
+        let guest125Run = await cli.execute(
+            arguments: ["--lang", "en", "run", "t1", "--", "sh", "-c", "echo guest-out; exit 125"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: guest125Backend
+        )
+        #expect(guest125Run.exitCode == 125)
+        #expect(guest125Run.stdoutData == Data("guest-out\n".utf8))
+        #expect(guest125Run.stderrData.isEmpty)
+
+        // 7. `--backend simulation` rejects `run`, does not execute, and outputs zero kernel strings
+        let simBackendGuard = FailingStartHardwareBackend(error: .virtualizationEntitlementMissing)
+        let simRun = await cli.execute(
+            arguments: ["--lang", "en", "--backend", "simulation", "run", "t1", "--", "uname", "-r"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: simBackendGuard
+        )
+        #expect(simRun.exitCode != 0)
+        #expect(simRun.stdoutData.isEmpty)
+        #expect(simRun.stderr.contains("SIMULATED:"))
+        #expect(simRun.stderr.contains("ERR_RUN_SIMULATION_UNSUPPORTED"))
+        #expect(!simRun.stdout.contains("6.8"))
+        #expect(!simRun.stdout.contains("6.1"))
+        #expect(!simRun.stderr.contains("6.8"))
+        #expect(!simRun.stderr.contains("6.1"))
+
+        // 8. Egress policy honesty: `policy airgap` -> `run` returns 125 explaining M5 limitation; `policy strict` -> `run` returns 0
+        let setAirgap = await cli.execute(
+            arguments: ["--lang", "en", "policy", "airgap"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(setAirgap.exitCode == 0)
+
+        let okBackend = FakeVsockResponderHardwareBackend(stdoutPayload: Data(), stderrPayload: Data(), exitCode: 0)
+        let airgapRunEn = await cli.execute(
+            arguments: ["--lang", "en", "run", "t1", "--", "true"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: okBackend
+        )
+        #expect(airgapRunEn.exitCode == 125)
+        #expect(airgapRunEn.stdoutData.isEmpty)
+        #expect(airgapRunEn.stderr.contains("ERR_AIRGAP_UNSUPPORTED"))
+        #expect(airgapRunEn.stderr.contains("M5"))
+        #expect(okBackend.lifecycleEvents.isEmpty)
+
+        let airgapRunZh = await cli.execute(
+            arguments: ["--lang", "zh", "run", "t1", "--", "true"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: okBackend
+        )
+        #expect(airgapRunZh.exitCode == 125)
+        #expect(airgapRunZh.stdoutData.isEmpty)
+        #expect(airgapRunZh.stderr.contains("M5"))
+        #expect(airgapRunZh.stderr.contains("断网"))
+
+        let setStrict = await cli.execute(
+            arguments: ["--lang", "en", "policy", "strict"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(setStrict.exitCode == 0)
+
+        let strictRun = await cli.execute(
+            arguments: ["--lang", "en", "run", "t1", "--", "true"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: okBackend
+        )
+        #expect(strictRun.exitCode == 0)
+        #expect(okBackend.lifecycleEvents == ["startMachine", "connectVsock", "closeVsockConnection", "shutdown"])
+    }
+
+    @Test("M1 A31: default backend 'up' rejects bootable disks advising 'run' without starting VM or persisting running, while empty disks keep ERR_NO_BOOTABLE_SYSTEM")
+    func cliUpRejectsBootableDiskBeforeM2DaemonWithoutStartingVMAndKeepsEmptyDiskM0Behavior() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-cli-up-a31")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let cacheDir = tempDir.appendingPathComponent("shared-images", isDirectory: true)
+        let bundleURL = tempDir.appendingPathComponent("UpA31Fleet.agentvm", isDirectory: true)
+        let env = [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+
+        let imageBytes = 4 * 1024 * 1024
+        let stagingURL = tempDir.appendingPathComponent("staging-up.raw")
+        try APFSCoWDiskEngine().createSparseRawDisk(at: stagingURL, virtualSizeBytes: UInt64(imageBytes), overwrite: true)
+        let parts = try PartitionAndContainerInspector().writeProtectiveMBRAndGPT(
+            to: stagingURL,
+            partitions: [(name: "RootExt4", typeGUID: GPTWellKnownTypeGUID.linuxRootARM64.rawValue, sizeBytes: 2 * 1024 * 1024)]
+        )
+        var ext4Super = [UInt8](repeating: 0, count: 256)
+        ext4Super[0x38] = 0x53
+        ext4Super[0x39] = 0xEF
+        ext4Super[0x5C] = 0x04
+        ext4Super[0x60] = 0xC0
+        let fh = try FileHandle(forUpdating: stagingURL)
+        try fh.seek(toOffset: parts[0].firstLBA * 512 + 1024)
+        try fh.write(contentsOf: Data(ext4Super))
+        try fh.close()
+
+        let sha512 = try BinaryChecksums.sha512HexFile(at: stagingURL)
+        let imageID = "debian-12-bookworm-arm64"
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Test Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian.raw",
+            expectedSHA512: sha512,
+            expectedSizeBytes: UInt64(imageBytes),
+            defaultVirtualSizeBytes: UInt64(imageBytes)
+        )
+        let seeder = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, curatedEntries: [entry], createIfMissing: true)
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedURL.path, 0o444) == 0)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let cli = AgentVMCLIRunner()
+        let createT1 = await cli.execute(
+            arguments: ["--lang", "en", "create", "t1", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(createT1.exitCode == 0)
+
+        let createE1 = await cli.execute(
+            arguments: ["--lang", "en", "create", "e1"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(createE1.exitCode == 0)
+
+        let mockBackend = FakeVsockResponderHardwareBackend(stdoutPayload: Data(), stderrPayload: Data(), exitCode: 0)
+
+        // 1. Default backend `up t1` (and `boot` / `start`) on bootable disk -> non-zero, advises `run`, starts nothing, state stays `stopped`
+        for cmd in ["up", "boot", "start"] {
+            let upEn = await cli.execute(
+                arguments: ["--lang", "en", cmd, "t1"],
+                bundleURLOverride: bundleURL,
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hardwareBackendOverride: mockBackend
+            )
+            #expect(upEn.exitCode != 0)
+            #expect(upEn.stderr.contains("ERR_DAEMON_REQUIRED"))
+            #expect(upEn.stderr.contains("agentvm run"))
+            #expect(mockBackend.lifecycleEvents.isEmpty)
+        }
+
+        let upZh = await cli.execute(
+            arguments: ["--lang", "zh", "up", "t1"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: mockBackend
+        )
+        #expect(upZh.exitCode != 0)
+        #expect(upZh.stderr.contains("agentvm run"))
+        #expect(mockBackend.lifecycleEvents.isEmpty)
+
+        let psJSON = await cli.execute(
+            arguments: ["--lang", "en", "ps", "--json"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(psJSON.exitCode == 0)
+        #expect(!psJSON.stdout.contains("\"state\" : \"running\""))
+        #expect(psJSON.stdout.contains("\"state\" : \"stopped\""))
+
+        // 2. Empty disk `e1` keeps M0 behavior (`ERR_NO_BOOTABLE_SYSTEM`)
+        let upEmpty = await cli.execute(
+            arguments: ["--lang", "en", "up", "e1"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: mockBackend
+        )
+        #expect(upEmpty.exitCode != 0)
+        #expect(upEmpty.stderr.contains("ERR_NO_BOOTABLE_SYSTEM"))
+        #expect(mockBackend.lifecycleEvents.isEmpty)
+
+        // 3. `exec t1` and MCP `agentvm_exec_command` on bootable stopped VM also do NOT start a real VM
+        let execT1 = await cli.execute(
+            arguments: ["--lang", "en", "exec", "t1", "--", "uname", "-r"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: mockBackend
+        )
+        #expect(execT1.exitCode != 0)
+        #expect(mockBackend.lifecycleEvents.isEmpty)
+
+        // 4. `--backend simulation up t1` continues to work as in M0
+        let simUp = await cli.execute(
+            arguments: ["--lang", "en", "--backend", "simulation", "up", "t1"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: mockBackend
+        )
+        #expect(simUp.exitCode == 0)
+        #expect(simUp.stdout.contains("SIMULATED:running"))
+        #expect(mockBackend.lifecycleEvents.isEmpty)
+    }
+
+    @Test("M1 CLI 'run' signals: SIGINT exits 130 and SIGTERM exits 143 after shutting down VM to completion and releasing flock")
+    func cliRunHandlesSIGINTReturning130AndSIGTERMReturning143WhileStoppingVMAndReleasingLock() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-cli-run-signals")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let cacheDir = tempDir.appendingPathComponent("shared-images", isDirectory: true)
+        let bundleURL = tempDir.appendingPathComponent("SignalsFleet.agentvm", isDirectory: true)
+        let env = [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+
+        let imageBytes = 4 * 1024 * 1024
+        let stagingURL = tempDir.appendingPathComponent("staging-sig.raw")
+        try APFSCoWDiskEngine().createSparseRawDisk(at: stagingURL, virtualSizeBytes: UInt64(imageBytes), overwrite: true)
+        let parts = try PartitionAndContainerInspector().writeProtectiveMBRAndGPT(
+            to: stagingURL,
+            partitions: [(name: "RootExt4", typeGUID: GPTWellKnownTypeGUID.linuxRootARM64.rawValue, sizeBytes: 2 * 1024 * 1024)]
+        )
+        var ext4Super = [UInt8](repeating: 0, count: 256)
+        ext4Super[0x38] = 0x53
+        ext4Super[0x39] = 0xEF
+        ext4Super[0x5C] = 0x04
+        ext4Super[0x60] = 0xC0
+        let fh = try FileHandle(forUpdating: stagingURL)
+        try fh.seek(toOffset: parts[0].firstLBA * 512 + 1024)
+        try fh.write(contentsOf: Data(ext4Super))
+        try fh.close()
+
+        let sha512 = try BinaryChecksums.sha512HexFile(at: stagingURL)
+        let imageID = "debian-12-bookworm-arm64"
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Test Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian.raw",
+            expectedSHA512: sha512,
+            expectedSizeBytes: UInt64(imageBytes),
+            defaultVirtualSizeBytes: UInt64(imageBytes)
+        )
+        let seeder = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, curatedEntries: [entry], createIfMissing: true)
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedURL.path, 0o444) == 0)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let cli = AgentVMCLIRunner()
+        let createOut = await cli.execute(
+            arguments: ["--lang", "en", "create", "t1", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(createOut.exitCode == 0)
+
+        let inspectCoord = try AgentVMFleetCoordinator(bundleURL: bundleURL, imageCacheDirectoryURL: cacheDir, curatedImageEntries: [entry])
+        let vmID = try #require(try await inspectCoord.store.listVMs().first?.id)
+        let lockURL = inspectCoord.lockFileURL(for: vmID)
+
+        // 1. SIGINT during long-running guest command -> stops VM, releases lock, returns 130 with zero spurious error banner
+        do {
+            let startedStream = AsyncStream.makeStream(of: Void.self)
+            let sigintBackend = FakeVsockResponderHardwareBackend(
+                stdoutPayload: Data("started\n".utf8),
+                stderrPayload: Data(),
+                exitCode: 0,
+                holdAfterStdoutGate: {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+            )
+            let sigintController = OneShotRunSignalController()
+            let streamedOut = CLILockedStringBox()
+            let runTask = Task {
+                await cli.execute(
+                    arguments: ["--lang", "en", "run", "t1", "--", "sh", "-c", "echo started; sleep 600"],
+                    bundleURLOverride: bundleURL,
+                    curatedEntriesOverride: [entry],
+                    environment: env,
+                    hardwareBackendOverride: sigintBackend,
+                    signalController: sigintController,
+                    liveStdoutDataHandler: { chunk in
+                        streamedOut.append(String(decoding: chunk, as: UTF8.self))
+                        if streamedOut.value().contains("started\n") {
+                            startedStream.continuation.yield(())
+                            startedStream.continuation.finish()
+                        }
+                    }
+                )
+            }
+            for await _ in startedStream.stream { break }
+            #expect(VMExecutionLock.isLocked(at: lockURL))
+
+            let signalSentNs = DispatchTime.now().uptimeNanoseconds
+            sigintController.deliver(signal: SIGINT)
+            let outcome = await runTask.value
+            let interruptElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - signalSentNs) / 1_000_000.0
+
+            #expect(outcome.exitCode == 130)
+            #expect(interruptElapsedMs < 2_500.0, "SIGINT took \(String(format: "%.1f", interruptElapsedMs)) ms instead of interrupting promptly")
+            #expect(outcome.stdout == "started\n")
+            #expect(outcome.stderr.isEmpty)
+            #expect(sigintBackend.lifecycleEvents.contains("shutdown"))
+            #expect(!VMExecutionLock.isLocked(at: lockURL))
+        }
+
+        // 2. SIGTERM during long-running guest command -> stops VM, releases lock, returns 143
+        do {
+            let startedStream = AsyncStream.makeStream(of: Void.self)
+            let sigtermBackend = FakeVsockResponderHardwareBackend(
+                stdoutPayload: Data("started\n".utf8),
+                stderrPayload: Data(),
+                exitCode: 0,
+                holdAfterStdoutGate: {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+            )
+            let sigtermController = OneShotRunSignalController()
+            let streamedOut = CLILockedStringBox()
+            let runTask = Task {
+                await cli.execute(
+                    arguments: ["--lang", "en", "run", "t1", "--", "sh", "-c", "echo started; sleep 600"],
+                    bundleURLOverride: bundleURL,
+                    curatedEntriesOverride: [entry],
+                    environment: env,
+                    hardwareBackendOverride: sigtermBackend,
+                    signalController: sigtermController,
+                    liveStdoutDataHandler: { chunk in
+                        streamedOut.append(String(decoding: chunk, as: UTF8.self))
+                        if streamedOut.value().contains("started\n") {
+                            startedStream.continuation.yield(())
+                            startedStream.continuation.finish()
+                        }
+                    }
+                )
+            }
+            for await _ in startedStream.stream { break }
+            sigtermController.deliver(signal: SIGTERM)
+            let outcome = await runTask.value
+
+            #expect(outcome.exitCode == 143)
+            #expect(outcome.stdout == "started\n")
+            #expect(outcome.stderr.isEmpty)
+            #expect(sigtermBackend.lifecycleEvents.contains("shutdown"))
+            #expect(!VMExecutionLock.isLocked(at: lockURL))
+        }
+
+        // 3. SIGINT while waiting in the vsock connect retry loop -> cancels sleep immediately, shuts down VM, releases lock, returns 130
+        do {
+            let bootConnectBackend = AlwaysTimeoutConnectHardwareBackend()
+            let connectSignalController = OneShotRunSignalController()
+            let bootRunTask = Task {
+                await cli.execute(
+                    arguments: ["--lang", "en", "run", "t1", "--", "true"],
+                    bundleURLOverride: bundleURL,
+                    curatedEntriesOverride: [entry],
+                    environment: env,
+                    hardwareBackendOverride: bootConnectBackend,
+                    vsockConnectTimeoutNanosecondsOverride: 4_000_000_000,
+                    signalController: connectSignalController
+                )
+            }
+            for _ in 0..<200 {
+                if bootConnectBackend.events.contains("startMachine") {
+                    break
+                }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            #expect(bootConnectBackend.events.contains("startMachine"))
+            let bootSigSentNs = DispatchTime.now().uptimeNanoseconds
+            connectSignalController.deliver(signal: SIGINT)
+            let bootOutcome = await bootRunTask.value
+            let bootSigElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - bootSigSentNs) / 1_000_000.0
+            #expect(bootOutcome.exitCode == 130)
+            #expect(bootSigElapsedMs < 1_500.0, "SIGINT during vsock connect retry took \(String(format: "%.1f", bootSigElapsedMs)) ms")
+            #expect(bootConnectBackend.events.contains("shutdown"))
+            #expect(!VMExecutionLock.isLocked(at: lockURL))
+        }
+
+        // 4. Subsequent `ps --json` reports `stopped` and `run t1 -- true` succeeds with exit code 0
+        let psAfterSignals = await cli.execute(
+            arguments: ["--lang", "en", "ps", "--json"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(psAfterSignals.exitCode == 0)
+        #expect(!psAfterSignals.stdout.contains("\"state\" : \"running\""))
+
+        let okBackend = FakeVsockResponderHardwareBackend(stdoutPayload: Data(), stderrPayload: Data(), exitCode: 0)
+        let nextRun = await cli.execute(
+            arguments: ["--lang", "en", "run", "t1", "--", "true"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: okBackend
+        )
+        #expect(nextRun.exitCode == 0)
+    }
+}
+
+private final class FailingStartHardwareBackend: HardwareVMLowLevelBackend, @unchecked Sendable {
+    let error: AgentVMError
+    init(error: AgentVMError) {
+        self.error = error
+    }
+    func startMachine(
+        spec: VMSpec,
+        networkSocketFD: Int32?,
+        consoleLogURL: URL,
+        translator: VZConfigurationTranslator
+    ) async throws -> any HardwareVMInstanceHandle {
+        throw error
+    }
+}
+
+private final class AlwaysTimeoutConnectHardwareBackend: HardwareVMLowLevelBackend, HardwareVMInstanceHandle, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var events: [String] = []
+
+    func startMachine(
+        spec: VMSpec,
+        networkSocketFD: Int32?,
+        consoleLogURL: URL,
+        translator: VZConfigurationTranslator
+    ) async throws -> any HardwareVMInstanceHandle {
+        lock.withLock { events.append("startMachine") }
+        return self
+    }
+    func prematureStopReason() -> String? { nil }
+    func connectVsock(port: UInt32) async throws -> HardwareVsockFDDescriptor {
+        throw AgentVMError.vsockProtocolViolation(detail: "ECONNREFUSED")
+    }
+    func closeVsockConnection() async {
+        lock.withLock { events.append("closeVsockConnection") }
+    }
+    func pause() async throws {}
+    func resume() async throws {}
+    func saveMachineState(to url: URL) async throws {}
+    func shutdown(gracefulTimeoutNanoseconds: UInt64) async {
+        lock.withLock { events.append("shutdown") }
+    }
 }
 
 private final class FakeVsockResponderHardwareBackend: HardwareVMLowLevelBackend, HardwareVMInstanceHandle, @unchecked Sendable {
@@ -2005,6 +2790,7 @@ private final class FakeVsockResponderHardwareBackend: HardwareVMLowLevelBackend
     private let stdoutPayload: Data
     private let stderrPayload: Data
     private let exitCode: Int32
+    private let holdAfterStdoutGate: (@Sendable () async -> Void)?
     private var hostFD: Int32 = -1
     private var peerFD: Int32 = -1
     private var responderTask: Task<Void, Never>?
@@ -2012,10 +2798,16 @@ private final class FakeVsockResponderHardwareBackend: HardwareVMLowLevelBackend
     private(set) var lifecycleEvents: [String] = []
     private(set) var lastCapturedRequest: GuestExecRequest?
 
-    init(stdoutPayload: Data, stderrPayload: Data, exitCode: Int32) {
+    init(
+        stdoutPayload: Data,
+        stderrPayload: Data,
+        exitCode: Int32,
+        holdAfterStdoutGate: (@Sendable () async -> Void)? = nil
+    ) {
         self.stdoutPayload = stdoutPayload
         self.stderrPayload = stderrPayload
         self.exitCode = exitCode
+        self.holdAfterStdoutGate = holdAfterStdoutGate
     }
 
     func startMachine(
@@ -2042,6 +2834,7 @@ private final class FakeVsockResponderHardwareBackend: HardwareVMLowLevelBackend
         let outData = stdoutPayload
         let errData = stderrPayload
         let rc = exitCode
+        let holdGate = holdAfterStdoutGate
 
         let task = Task.detached { [weak self] in
             let codec = VsockWireCodec()
@@ -2110,6 +2903,11 @@ private final class FakeVsockResponderHardwareBackend: HardwareVMLowLevelBackend
                         }
                         seq += 1
                         offset = end
+                    }
+
+                    if let holdGate {
+                        await holdGate()
+                        if Task.isCancelled { break outer }
                     }
 
                     if !errData.isEmpty {

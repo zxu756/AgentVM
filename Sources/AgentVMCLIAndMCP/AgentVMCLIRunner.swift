@@ -12,21 +12,44 @@ import Foundation
 
 public final class CLIStandardStreamForwarder: @unchecked Sendable {
     private let lock = NSLock()
-    private var forwardedBytes = Data()
+    private var forwardedStdoutBytes = Data()
+    private var forwardedStderrBytes = Data()
 
     public init() {}
 
-    public func writeProgress(_ chunk: String, to stderrHandle: FileHandle = .standardError) {
-        guard !chunk.isEmpty else { return }
-        let chunkData = Data(chunk.utf8)
+    public func writeStdoutChunk(_ chunkData: Data, to stdoutHandle: FileHandle = .standardOutput) {
+        guard !chunkData.isEmpty else { return }
         lock.withLock {
-            forwardedBytes.append(chunkData)
+            forwardedStdoutBytes.append(chunkData)
+        }
+        stdoutHandle.write(chunkData)
+    }
+
+    public func writeStderrChunk(_ chunkData: Data, to stderrHandle: FileHandle = .standardError) {
+        guard !chunkData.isEmpty else { return }
+        lock.withLock {
+            forwardedStderrBytes.append(chunkData)
         }
         stderrHandle.write(chunkData)
     }
 
+    public func writeProgress(_ chunk: String, to stderrHandle: FileHandle = .standardError) {
+        guard !chunk.isEmpty else { return }
+        writeStderrChunk(Data(chunk.utf8), to: stderrHandle)
+    }
+
+    public func unforwardedStdoutSuffix(of fullStdoutData: Data) -> Data {
+        let prefix = lock.withLock { forwardedStdoutBytes }
+        guard !prefix.isEmpty,
+              fullStdoutData.count >= prefix.count,
+              fullStdoutData.prefix(prefix.count) == prefix else {
+            return fullStdoutData
+        }
+        return Data(fullStdoutData.dropFirst(prefix.count))
+    }
+
     public func unforwardedSuffix(of fullStderrData: Data) -> Data {
-        let prefix = lock.withLock { forwardedBytes }
+        let prefix = lock.withLock { forwardedStderrBytes }
         guard !prefix.isEmpty,
               fullStderrData.count >= prefix.count,
               fullStderrData.prefix(prefix.count) == prefix else {
@@ -68,12 +91,13 @@ public struct CLIExecutionOutcome: Codable, Hashable, Sendable {
         stderrHandle: FileHandle = .standardError,
         forwarder: CLIStandardStreamForwarder? = nil
     ) {
-        if !stdoutData.isEmpty {
-            stdoutHandle.write(stdoutData)
+        let remainingStdout = forwarder?.unforwardedStdoutSuffix(of: stdoutData) ?? stdoutData
+        if !remainingStdout.isEmpty {
+            stdoutHandle.write(remainingStdout)
         }
-        let remaining = forwarder?.unforwardedSuffix(of: stderrData) ?? stderrData
-        if !remaining.isEmpty {
-            stderrHandle.write(remaining)
+        let remainingStderr = forwarder?.unforwardedSuffix(of: stderrData) ?? stderrData
+        if !remainingStderr.isEmpty {
+            stderrHandle.write(remainingStderr)
         }
     }
 }
@@ -92,6 +116,122 @@ public struct ParsedRunArguments: Equatable, Sendable {
     }
 }
 
+public final class OneShotRunSignalController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedSignal: Int32?
+    private var activeTask: Task<GuestExecResult, Error>?
+    private var activeCoordinator: AgentVMFleetCoordinator?
+    private var activeVMID: VMID?
+
+    public init() {}
+
+    public static func exitCode(forSignal signalNumber: Int32) -> Int32? {
+        switch signalNumber {
+        case SIGINT:
+            return 130
+        case SIGTERM:
+            return 143
+        default:
+            return signalNumber > 0 ? (128 + signalNumber) : nil
+        }
+    }
+
+    public var terminationExitCode: Int32? {
+        lock.withLock {
+            guard let sig = recordedSignal else { return nil }
+            return Self.exitCode(forSignal: sig)
+        }
+    }
+
+    func registerActiveRun(
+        coordinator: AgentVMFleetCoordinator,
+        vmID: VMID,
+        task: Task<GuestExecResult, Error>
+    ) {
+        let shouldInterruptImmediately: Bool = lock.withLock {
+            activeCoordinator = coordinator
+            activeVMID = vmID
+            activeTask = task
+            return recordedSignal != nil
+        }
+        if shouldInterruptImmediately {
+            task.cancel()
+            Task {
+                await coordinator.interruptOneShotExecution(vmID)
+            }
+        }
+    }
+
+    func clearActiveRun() {
+        lock.withLock {
+            activeTask = nil
+            activeCoordinator = nil
+            activeVMID = nil
+        }
+    }
+
+    public func deliver(signal: Int32) {
+        let snapshot: (Task<GuestExecResult, Error>?, AgentVMFleetCoordinator?, VMID?) = lock.withLock {
+            if recordedSignal == nil {
+                recordedSignal = signal
+            }
+            return (activeTask, activeCoordinator, activeVMID)
+        }
+        snapshot.0?.cancel()
+        if let coordinator = snapshot.1, let vmID = snapshot.2 {
+            Task {
+                await coordinator.interruptOneShotExecution(vmID)
+            }
+        }
+    }
+
+    public nonisolated func installPOSIXSignalSources() -> [any DispatchSourceSignal] {
+        let sigQueue = DispatchQueue(label: "io.zxu756.agentvm.cli.signals")
+        Darwin.signal(SIGINT, SIG_IGN)
+        Darwin.signal(SIGTERM, SIG_IGN)
+
+        let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: sigQueue)
+        sigintSource.setEventHandler { [weak self] in
+            self?.deliver(signal: SIGINT)
+        }
+        sigintSource.resume()
+
+        let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: sigQueue)
+        sigtermSource.setEventHandler { [weak self] in
+            self?.deliver(signal: SIGTERM)
+        }
+        sigtermSource.resume()
+
+        return [sigintSource, sigtermSource]
+    }
+}
+
+private final class StreamedBinaryOutputCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stdoutBuffer = Data()
+    private var stderrBuffer = Data()
+
+    func appendStdout(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.withLock {
+            stdoutBuffer.append(chunk)
+        }
+    }
+
+    func appendStderr(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.withLock {
+            stderrBuffer.append(chunk)
+        }
+    }
+
+    func snapshot() -> (stdout: Data, stderr: Data) {
+        lock.withLock {
+            (stdoutBuffer, stderrBuffer)
+        }
+    }
+}
+
 public struct AgentVMCLIRunner: Sendable {
     public static let cliSubcommands: Set<String> = [
         "doctor", "init", "ps", "list", "image", "create", "run",
@@ -101,6 +241,8 @@ public struct AgentVMCLIRunner: Sendable {
         "export-hcl", "export-html",
         "help", "--help", "-h", "version", "--version", "-v"
     ]
+
+    public static let runInfrastructureErrorExitCode: Int32 = 125
 
     public init() {}
 
@@ -189,7 +331,12 @@ public struct AgentVMCLIRunner: Sendable {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         diskEngineOverride: APFSCoWDiskEngine? = nil,
         hardwareBackendOverride: (any HardwareVMLowLevelBackend)? = nil,
-        liveStderrHandler: (@Sendable (String) -> Void)? = nil
+        vsockConnectTimeoutNanosecondsOverride: UInt64? = nil,
+        gracefulStopTimeoutNanosecondsOverride: UInt64? = nil,
+        signalController: OneShotRunSignalController? = nil,
+        liveStderrHandler: (@Sendable (String) -> Void)? = nil,
+        liveStdoutDataHandler: (@Sendable (Data) -> Void)? = nil,
+        liveStderrDataHandler: (@Sendable (Data) -> Void)? = nil
     ) async -> CLIExecutionOutcome {
         let language: AppLanguage
         if let cliLang = AppLanguage.extractCLILanguage(from: arguments) {
@@ -425,7 +572,9 @@ public struct AgentVMCLIRunner: Sendable {
                 imageCacheDirectoryURL: resolvedCacheURL,
                 curatedImageEntries: curatedEntriesOverride,
                 diskEngine: diskEngineOverride ?? APFSCoWDiskEngine(),
-                hardwareBackendOverride: hardwareBackendOverride
+                hardwareBackendOverride: hardwareBackendOverride,
+                vsockConnectTimeoutNanoseconds: vsockConnectTimeoutNanosecondsOverride ?? 180_000_000_000,
+                gracefulStopTimeoutNanoseconds: gracefulStopTimeoutNanosecondsOverride ?? 30_000_000_000
             )
 
             switch subcommand {
@@ -452,8 +601,11 @@ public struct AgentVMCLIRunner: Sendable {
                 rawOutcome = try await runOneShot(
                     coordinator: coordinator,
                     parsedRun: parsedRun,
+                    signalController: signalController,
                     progressStderrCollector: streamedProgressStderr,
-                    liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
+                    liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler,
+                    liveStdoutDataHandler: isSimulationFlagged ? nil : liveStdoutDataHandler,
+                    liveStderrDataHandler: isSimulationFlagged ? nil : liveStderrDataHandler
                 )
             case "up", "boot", "start":
                 rawOutcome = try await runLifecycle(coordinator: coordinator, action: "boot", parsed: parsed, language: language)
@@ -513,6 +665,14 @@ public struct AgentVMCLIRunner: Sendable {
                     hintLine = "提示：运行 'agentvm image list' 查看可用镜像条目，或运行 'agentvm image pull <id>' 下载镜像。"
                 } else if case .diskSizeTooSmallForImage = err {
                     hintLine = "提示：请省略 --disk-size（默认等于镜像大小），或指定不小于镜像大小的容量（如 --disk-size 8G）。"
+                } else if case let .persistentBootRequiresDaemon(vmName) = err {
+                    hintLine = "提示：请改用 'agentvm run \(vmName) -- <命令>' 启动虚拟机、执行命令并关机。"
+                } else if case .airgapPolicyUnsupportedBeforeM5 = err {
+                    hintLine = "提示：请先运行 'agentvm policy strict' 切换出口策略，M5 之后才支持断网启动。"
+                } else if case .runUnsupportedInSimulation = err {
+                    hintLine = "提示：请去掉 '--backend simulation' 在真实虚拟机上运行。"
+                } else if case .vmBusy = err {
+                    hintLine = "提示：请等待当前正在使用该虚拟机的进程结束，或创建另一台虚拟机。"
                 } else {
                     hintLine = "提示：查看审计日志抽屉或运行 'agentvm doctor' 进行环境自检。"
                 }
@@ -520,16 +680,20 @@ public struct AgentVMCLIRunner: Sendable {
                 hintLine = "Hint: \(err.remediationHint)"
             }
             let rawStderr = streamedProgressStderr.snapshot() + "[\(err.errorCode)] \(localizedErr)\n\(hintLine)\n"
+            let errorExitCode: Int32 = (subcommand == "run") ? Self.runInfrastructureErrorExitCode : 1
             return CLIExecutionOutcome(
-                exitCode: 1,
-                stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                exitCode: errorExitCode,
+                stdoutData: Data(),
+                stderrData: Data((isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr).utf8)
             )
         } catch {
             let prefix = isZh ? "错误：" : "Error: "
             let rawStderr = streamedProgressStderr.snapshot() + "\(prefix)\(error.localizedDescription)\n"
+            let errorExitCode: Int32 = (subcommand == "run") ? Self.runInfrastructureErrorExitCode : 1
             return CLIExecutionOutcome(
-                exitCode: 1,
-                stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                exitCode: errorExitCode,
+                stdoutData: Data(),
+                stderrData: Data((isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr).utf8)
             )
         }
     }
@@ -763,7 +927,7 @@ public struct AgentVMCLIRunner: Sendable {
         let vmID = try await resolveVMID(targetToken, coordinator: coordinator)
         let updated: VMInstanceRecord
         switch action {
-        case "boot": updated = try await coordinator.bootVM(vmID)
+        case "boot": updated = try await coordinator.bootPersistentVM(vmID)
         case "pause": updated = try await coordinator.pauseVM(vmID)
         case "resume": updated = try await coordinator.resumeVM(vmID)
         default: updated = try await coordinator.haltVM(vmID)
@@ -898,10 +1062,22 @@ public struct AgentVMCLIRunner: Sendable {
     private func runOneShot(
         coordinator: AgentVMFleetCoordinator,
         parsedRun: ParsedRunArguments,
+        signalController: OneShotRunSignalController?,
         progressStderrCollector: StreamedStderrCollector,
-        liveStderrHandler: (@Sendable (String) -> Void)?
+        liveStderrHandler: (@Sendable (String) -> Void)?,
+        liveStdoutDataHandler: (@Sendable (Data) -> Void)?,
+        liveStderrDataHandler: (@Sendable (Data) -> Void)?
     ) async throws -> CLIExecutionOutcome {
+        if await coordinator.currentExecutionBackend() == .deterministicSimulation {
+            throw AgentVMError.runUnsupportedInSimulation(vmName: parsedRun.vmToken)
+        }
+        if let earlySignalExit = signalController?.terminationExitCode {
+            return CLIExecutionOutcome(exitCode: earlySignalExit, stdoutData: Data(), stderrData: Data())
+        }
         let vmID = try await resolveVMID(parsedRun.vmToken, coordinator: coordinator)
+        if let earlySignalExit = signalController?.terminationExitCode {
+            return CLIExecutionOutcome(exitCode: earlySignalExit, stdoutData: Data(), stderrData: Data())
+        }
         let request = GuestExecRequest(
             executable: parsedRun.executable,
             arguments: parsedRun.arguments,
@@ -918,11 +1094,48 @@ public struct AgentVMCLIRunner: Sendable {
             progressCallback = nil
         }
 
-        let execResult = try await coordinator.runOneShotCommand(
-            vmID: vmID,
-            request: request,
-            onProgress: progressCallback
-        )
+        let outputCollector = StreamedBinaryOutputCollector()
+        let chunkCallback: (@Sendable (GuestExecOutputChunk) async -> Void) = { chunk in
+            switch chunk.stream {
+            case .stdout:
+                outputCollector.appendStdout(chunk.data)
+                liveStdoutDataHandler?(chunk.data)
+            case .stderr, .systemNotice:
+                outputCollector.appendStderr(chunk.data)
+                liveStderrDataHandler?(chunk.data)
+            }
+        }
+
+        let execTask = Task<GuestExecResult, Error> {
+            try await coordinator.runOneShotCommand(
+                vmID: vmID,
+                request: request,
+                onProgress: progressCallback,
+                onOutputChunk: chunkCallback
+            )
+        }
+        signalController?.registerActiveRun(coordinator: coordinator, vmID: vmID, task: execTask)
+        defer { signalController?.clearActiveRun() }
+
+        let taskResult = await execTask.result
+        if let signalExitCode = signalController?.terminationExitCode {
+            let partial = outputCollector.snapshot()
+            let partialStderr: Data
+            if parsedRun.verbose {
+                var combined = Data(progressStderrCollector.snapshot().utf8)
+                combined.append(partial.stderr)
+                partialStderr = combined
+            } else {
+                partialStderr = partial.stderr
+            }
+            return CLIExecutionOutcome(
+                exitCode: signalExitCode,
+                stdoutData: partial.stdout,
+                stderrData: partialStderr
+            )
+        }
+
+        let execResult = try taskResult.get()
 
         let stderrData: Data
         if parsedRun.verbose {
@@ -1734,7 +1947,11 @@ public struct AgentVMCLIRunner: Sendable {
               snapshot [list | <vm> <标题>]   列出或捕获 CoW 磁盘快照检查点
               restore <快照ID>                将虚拟机磁盘回滚至指定快照节点
               run <vm> [--verbose] -- <命令> [参数...]
-                                              单进程无界面启动真机、等待 vsock 守护进程、执行命令并关机（原始字节流直通）
+                                              单进程无界面启动真机、等待 vsock 守护进程、执行命令并关机（原始字节流直通）。
+                                              退出码：客户机命令退出码（含 125，被信号 N 杀掉则为 128+N）原样返回；AgentVM 自身失败
+                                              （启动失败、180 秒未连上、机器被占用、无可引导系统、airgap 策略等）统一返回 125，
+                                              标准输出为空，原因写到标准错误（靠标准错误有无 AgentVM 报错与客户机退出码 125 区分）；
+                                              收到 SIGINT / SIGTERM 停机放锁后返回 130 / 143
               exec <vm> -- <命令> [参数...]   在已连接客户机代理的虚拟机中执行命令（或配合 --backend simulation 演练协议栈）
               pcap [--filter <表达式>] [--export <文件.pcapng>]
               policy [strict | airgap]        查看或选择工作区的防火墙规则预设（选择会保存到工作区；M5 之前不作用于任何客户机流量）
@@ -1774,7 +1991,11 @@ public struct AgentVMCLIRunner: Sendable {
           snapshot [list | <vm> <title>]  List or capture CoW disk snapshot checkpoints
           restore <snapshot-id>           Roll back VM disk & topology to a snapshot node
           run <vm> [--verbose] -- <cmd> [args...]
-                                          Boot VM headlessly, wait for vsock guest daemon, execute command & shut down (byte-exact I/O)
+                                          Boot VM headlessly, wait for vsock guest daemon, execute command & shut down (byte-exact I/O).
+                                          Exit codes: guest exit codes (including 125, or 128+N on signal N) pass through verbatim;
+                                          AgentVM failures (boot error, 180s vsock timeout, VM locked/busy, unbootable disk, airgap policy)
+                                          return 125 with empty stdout and an AgentVM error on stderr (distinguishing them from guest exit 125);
+                                          SIGINT / SIGTERM shut down the VM, release the lock, and return 130 / 143
           exec <vm> -- <cmd> [args...]    Execute command over AVM1 VirtioSocket (requires live guest agent or --backend simulation)
           pcap [--filter <expr>] [--export <file.pcapng>]
           policy [strict | airgap]        Inspect or select the workspace firewall preset (saved to the workspace; not enforced on guest traffic before M5)

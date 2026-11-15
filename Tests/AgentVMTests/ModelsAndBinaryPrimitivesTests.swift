@@ -444,6 +444,45 @@ struct ModelsAndBinaryPrimitivesTests {
         }
     }
 
+    @Test("AgentVMError Stage 04 M1 honesty and exclusivity errors emit exact error codes and EN/ZH messages")
+    func stage04ErrorCodesAndBilingualMessages() {
+        let cases: [(AgentVMError, String, String, String)] = [
+            (
+                .vmBusy(vmName: "t1", holderPID: 42_424),
+                "ERR_VM_LOCKED",
+                "42424",
+                "42424"
+            ),
+            (
+                .runUnsupportedInSimulation(vmName: "t1"),
+                "ERR_RUN_SIMULATION_UNSUPPORTED",
+                "simulation",
+                "simulation"
+            ),
+            (
+                .persistentBootRequiresDaemon(vmName: "t1"),
+                "ERR_DAEMON_REQUIRED",
+                "agentvm run",
+                "agentvm run"
+            ),
+            (
+                .airgapPolicyUnsupportedBeforeM5(vmName: "t1"),
+                "ERR_AIRGAP_UNSUPPORTED",
+                "M5",
+                "M5"
+            )
+        ]
+
+        for (error, expectedCode, enToken, zhToken) in cases {
+            #expect(error.errorCode == expectedCode)
+            let enMsg = error.localizedMessage(in: .en)
+            let zhMsg = error.localizedMessage(in: .zhHans)
+            #expect(enMsg.contains(enToken), "EN message missing '\(enToken)': \(enMsg)")
+            #expect(zhMsg.contains(zhToken), "ZH message missing '\(zhToken)': \(zhMsg)")
+            #expect(!error.remediationHint.isEmpty)
+        }
+    }
+
     // MARK: - 7. BinaryCursor & BinaryBufferWriter Round-Trips & Bounds Guards
 
     @Test("BinaryBufferWriter and BinaryCursor round-trip BE, LE, BothEndian, ASCII, padding, and patching")

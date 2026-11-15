@@ -8,6 +8,136 @@ import Darwin
 import Foundation
 import Virtualization
 
+@_silgen_name("flock")
+private func c_posix_flock(_ fd: Int32, _ operation: Int32) -> Int32
+
+// MARK: - Per-VM Non-Blocking POSIX File Lock (flock)
+
+/// Exclusive non-blocking per-VM file lock (`flock(fd, LOCK_EX | LOCK_NB)`) stored at `<workspace>/locks/<vmID>.lock`.
+/// Because BSD `flock(2)` is bound to the kernel open file description (`struct fileglob`), opening two descriptors in the
+/// same or separate processes genuinely contends with `EWOULDBLOCK`, and kernel descriptor teardown on process exit
+/// (including `SIGKILL` / `kill -9`) releases the lock automatically.
+public final class VMExecutionLock: @unchecked Sendable {
+    public let lockFileURL: URL
+    private let stateLock = NSLock()
+    private var fd: Int32
+
+    private init(lockFileURL: URL, fd: Int32) {
+        self.lockFileURL = lockFileURL
+        self.fd = fd
+    }
+
+    deinit {
+        release()
+    }
+
+    public static func acquire(at lockFileURL: URL, vmName: String) throws -> VMExecutionLock {
+        let standardized = lockFileURL.standardizedFileURL
+        let parentDir = standardized.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        } catch {
+            throw AgentVMError.diskImageOperationFailed(
+                path: parentDir.path,
+                errnoCode: Darwin.errno,
+                detail: "Unable to create locks directory: \(error.localizedDescription)"
+            )
+        }
+
+        let fd = Darwin.open(standardized.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
+        guard fd >= 0 else {
+            throw AgentVMError.diskImageOperationFailed(
+                path: standardized.path,
+                errnoCode: Darwin.errno,
+                detail: "Unable to open VM lock file."
+            )
+        }
+
+        if posixFlock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let errCode = Darwin.errno
+            if errCode == EWOULDBLOCK || errCode == EAGAIN {
+                var holderPID = readHolderPID(fromFD: fd)
+                if holderPID == nil {
+                    Darwin.usleep(5_000)
+                    holderPID = readHolderPID(fromFD: fd)
+                }
+                _ = Darwin.close(fd)
+                throw AgentVMError.vmBusy(vmName: vmName, holderPID: holderPID)
+            }
+            _ = Darwin.close(fd)
+            throw AgentVMError.diskImageOperationFailed(
+                path: standardized.path,
+                errnoCode: errCode,
+                detail: "flock(LOCK_EX | LOCK_NB) failed."
+            )
+        }
+
+        let ownerStamp = Data("pid=\(Darwin.getpid())\nvm=\(vmName)\n".utf8)
+        _ = Darwin.ftruncate(fd, 0)
+        ownerStamp.withUnsafeBytes { rawBuf in
+            if let base = rawBuf.baseAddress {
+                _ = Darwin.pwrite(fd, base, rawBuf.count, 0)
+            }
+        }
+
+        return VMExecutionLock(lockFileURL: standardized, fd: fd)
+    }
+
+    public static func isLocked(at lockFileURL: URL) -> Bool {
+        let standardized = lockFileURL.standardizedFileURL
+        guard FileManager.default.fileExists(atPath: standardized.path) else {
+            return false
+        }
+        var probeFD = Darwin.open(standardized.path, O_RDWR | O_CLOEXEC)
+        if probeFD < 0 {
+            probeFD = Darwin.open(standardized.path, O_RDONLY | O_CLOEXEC)
+        }
+        guard probeFD >= 0 else {
+            return false
+        }
+        defer { _ = Darwin.close(probeFD) }
+
+        if posixFlock(probeFD, LOCK_EX | LOCK_NB) != 0 {
+            let errCode = Darwin.errno
+            return errCode == EWOULDBLOCK || errCode == EAGAIN
+        }
+        _ = posixFlock(probeFD, LOCK_UN)
+        return false
+    }
+
+    public func release() {
+        let descriptorToClose = stateLock.withLock { () -> Int32 in
+            let current = fd
+            fd = -1
+            return current
+        }
+        guard descriptorToClose >= 0 else { return }
+        _ = Darwin.ftruncate(descriptorToClose, 0)
+        _ = Self.posixFlock(descriptorToClose, LOCK_UN)
+        _ = Darwin.close(descriptorToClose)
+    }
+
+    private static func posixFlock(_ fd: Int32, _ operation: Int32) -> Int32 {
+        c_posix_flock(fd, operation)
+    }
+
+    private static func readHolderPID(fromFD fd: Int32) -> Int32? {
+        var scratch = [UInt8](repeating: 0, count: 256)
+        let n = Darwin.pread(fd, &scratch, scratch.count, 0)
+        guard n > 0 else { return nil }
+        let text = String(decoding: scratch.prefix(n), as: UTF8.self)
+        for line in text.split(whereSeparator: \.isNewline) {
+            if line.hasPrefix("pid=") {
+                let rawPID = line.dropFirst("pid=".count).trimmingCharacters(in: .whitespaces)
+                if let parsed = Int32(rawPID), parsed > 0 {
+                    return parsed
+                }
+            }
+        }
+        return nil
+    }
+}
+
 // MARK: - Unified Fleet Hypervisor, CoW Branching & Network DPI Coordinator
 
 public enum HypervisorExecutionBackend: String, Codable, Hashable, Sendable {
@@ -411,6 +541,10 @@ public actor AgentVMFleetCoordinator {
         return store.logsDirectoryURL.appendingPathComponent("\(baseName).console.log")
     }
 
+    public nonisolated func lockFileURL(for vmID: VMID) -> URL {
+        store.locksDirectoryURL.appendingPathComponent("\(vmID.rawValue).lock", isDirectory: false)
+    }
+
     public init(
         bundleURL: URL,
         executionBackend: HypervisorExecutionBackend = .strictHardwareVZ,
@@ -475,12 +609,36 @@ public actor AgentVMFleetCoordinator {
     /// record's runtime state is, by definition, reported by the simulator, so the flag is set on all of them.
     public func listVMsForReporting() async throws -> [VMInstanceRecord] {
         let vms = try await store.listVMs()
-        guard isSimulationBackend else { return vms }
-        return vms.map { record in
-            var marked = record
-            marked.telemetry.simulated = true
-            return marked
+        if isSimulationBackend {
+            return vms.map { record in
+                var marked = record
+                marked.telemetry.simulated = true
+                return marked
+            }
         }
+
+        var reconciledList: [VMInstanceRecord] = []
+        reconciledList.reserveCapacity(vms.count)
+        for record in vms {
+            if record.telemetry.state == .running,
+               !record.telemetry.simulated,
+               hardwareBoxes[record.id] == nil,
+               !VMExecutionLock.isLocked(at: lockFileURL(for: record.id)) {
+                var stopped = record
+                stopped.telemetry.state = .stopped
+                stopped.telemetry.guestAgentConnected = false
+                stopped.telemetry.hasLiveGuestTelemetry = false
+                stopped.telemetry.vsockStreamsOpen = 0
+                stopped.telemetry.cpuUsagePercent = 0
+                stopped.telemetry.memoryResidentMB = 0
+                stampRuntimeOrigin(&stopped)
+                try? await store.upsertVM(stopped)
+                reconciledList.append(stopped)
+            } else {
+                reconciledList.append(record)
+            }
+        }
+        return reconciledList
     }
 
     /// Loads a VM record for a lifecycle or exec operation.
@@ -981,6 +1139,30 @@ public actor AgentVMFleetCoordinator {
         _ vmID: VMID,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> VMInstanceRecord {
+        try await bootVMInternal(vmID, persistRunningState: true, onProgress: onProgress)
+    }
+
+    /// Boots a VM into a persistent background state (`agentvm up`, `exec` auto-boot, Studio boot).
+    /// Under `--backend simulation`, delegates to `bootVM`. Under the default hardware backend, checks
+    /// `verifyBootableGuestSystem` first (so empty disks still report `ERR_NO_BOOTABLE_SYSTEM`) and then
+    /// refuses persistent hardware boot before the M2 daemon exists, advising `agentvm run` (A31).
+    public func bootPersistentVM(
+        _ vmID: VMID,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> VMInstanceRecord {
+        if isSimulationBackend {
+            return try await bootVM(vmID, onProgress: onProgress)
+        }
+        let record = try await loadVMForOperation(vmID)
+        try verifyBootableGuestSystem(for: record.spec)
+        throw AgentVMError.persistentBootRequiresDaemon(vmName: record.spec.name)
+    }
+
+    private func bootVMInternal(
+        _ vmID: VMID,
+        persistRunningState: Bool,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> VMInstanceRecord {
         var record = try await loadVMForOperation(vmID)
         if record.telemetry.state == .running {
             if isSimulationBackend && !record.telemetry.simulated {
@@ -1069,6 +1251,7 @@ public actor AgentVMFleetCoordinator {
                 consoleLogURL: resolvedConsoleLogURL,
                 translator: vzTranslator
             )
+            hardwareBoxes[vmID] = box
         } catch {
             if vmFD != nil {
                 await l2Switch.detachPort(for: vmID)
@@ -1087,6 +1270,7 @@ public actor AgentVMFleetCoordinator {
 
         do {
             while true {
+                try Task.checkCancellation()
                 if let stopReason = box.prematureStopReason() {
                     lastConnectErrorDetail = "VM stopped before vsock connected (\(stopReason))"
                     break
@@ -1099,6 +1283,7 @@ public actor AgentVMFleetCoordinator {
                 } catch {
                     lastConnectErrorDetail = error.localizedDescription
                 }
+                try Task.checkCancellation()
 
                 let nowNs = DispatchTime.now().uptimeNanoseconds
                 if nowNs >= deadlineNs {
@@ -1121,9 +1306,15 @@ public actor AgentVMFleetCoordinator {
                     break
                 }
             }
+            try Task.checkCancellation()
         } catch {
-            await box.closeVsockConnection()
-            await box.shutdown(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
+            if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
+                let stopTimeout = gracefulStopTimeoutNanoseconds
+                await Task {
+                    await ownedBox.closeVsockConnection()
+                    await ownedBox.shutdown(gracefulTimeoutNanoseconds: stopTimeout)
+                }.value
+            }
             if vmFD != nil {
                 await l2Switch.detachPort(for: vmID)
             }
@@ -1131,8 +1322,13 @@ public actor AgentVMFleetCoordinator {
         }
 
         guard let connectedDescriptor, connectedDescriptor.fileDescriptor >= 0 else {
-            await box.closeVsockConnection()
-            await box.shutdown(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
+            if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
+                let stopTimeout = gracefulStopTimeoutNanoseconds
+                await Task {
+                    await ownedBox.closeVsockConnection()
+                    await ownedBox.shutdown(gracefulTimeoutNanoseconds: stopTimeout)
+                }.value
+            }
             if vmFD != nil {
                 await l2Switch.detachPort(for: vmID)
             }
@@ -1160,8 +1356,13 @@ public actor AgentVMFleetCoordinator {
             )
         } catch {
             await session.shutdown()
-            await box.closeVsockConnection()
-            await box.shutdown(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
+            if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
+                let stopTimeout = gracefulStopTimeoutNanoseconds
+                await Task {
+                    await ownedBox.closeVsockConnection()
+                    await ownedBox.shutdown(gracefulTimeoutNanoseconds: stopTimeout)
+                }.value
+            }
             if vmFD != nil {
                 await l2Switch.detachPort(for: vmID)
             }
@@ -1188,7 +1389,9 @@ public actor AgentVMFleetCoordinator {
         record.telemetry.guestAgentConnected = true
         record.telemetry.vsockStreamsOpen = await session.openStreamCount()
         stampRuntimeOrigin(&record)
-        try await store.upsertVM(record)
+        if persistRunningState {
+            try await store.upsertVM(record)
+        }
 
         try await store.appendDiagnostic(DiagnosticEvent(
             severity: .info,
@@ -1536,7 +1739,7 @@ public actor AgentVMFleetCoordinator {
 
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
         if bootImmediately {
-            childRecord = try await bootVM(childID)
+            childRecord = try await bootPersistentVM(childID)
         }
 
         try await store.appendDiagnostic(DiagnosticEvent(
@@ -1580,7 +1783,7 @@ public actor AgentVMFleetCoordinator {
         try await store.upsertVM(record)
 
         if wasRunning {
-            record = try await bootVM(record.id)
+            record = try await bootPersistentVM(record.id)
         }
 
         try await store.appendDiagnostic(DiagnosticEvent(
@@ -1598,7 +1801,7 @@ public actor AgentVMFleetCoordinator {
     public func executeInGuest(vmID: VMID, request: GuestExecRequest) async throws -> GuestExecResult {
         var record = try await loadVMForOperation(vmID)
         if record.telemetry.state != .running {
-            _ = try await bootVM(vmID)
+            _ = try await bootPersistentVM(vmID)
         } else if executionBackend == .deterministicSimulation && vsockSessions[vmID] == nil {
             // Only the explicit simulation backend may answer with the simulated responder. A `running`
             // record under the hardware backend with no live session falls through to ERR_GUEST_AGENT_UNAVAILABLE.
@@ -1666,10 +1869,34 @@ public actor AgentVMFleetCoordinator {
     public func runOneShotCommand(
         vmID: VMID,
         request: GuestExecRequest,
-        onProgress: (@Sendable (String) -> Void)? = nil
+        onProgress: (@Sendable (String) -> Void)? = nil,
+        onOutputChunk: (@Sendable (GuestExecOutputChunk) async -> Void)? = nil
     ) async throws -> GuestExecResult {
-        let bootedRecord = try await bootVM(vmID, onProgress: onProgress)
+        if isSimulationBackend {
+            let fallbackName = (try? await store.fetchVM(vmID))?.spec.name ?? vmID.rawValue
+            throw AgentVMError.runUnsupportedInSimulation(vmName: fallbackName)
+        }
+        let initialRecord = try await loadVMForOperation(vmID)
+        let activePolicy = await l2Switch.firewall.currentPolicy()
+        if activePolicy.id == PolicySetID("pol-airgap")
+            || initialRecord.spec.networkInterfaces.contains(where: { $0.mode == .isolatedAirgap }) {
+            throw AgentVMError.airgapPolicyUnsupportedBeforeM5(vmName: initialRecord.spec.name)
+        }
+
+        let vmLock = try VMExecutionLock.acquire(
+            at: lockFileURL(for: vmID),
+            vmName: initialRecord.spec.name
+        )
+        defer { vmLock.release() }
+
+        try Task.checkCancellation()
+        let bootedRecord = try await bootVMInternal(
+            vmID,
+            persistRunningState: false,
+            onProgress: onProgress
+        )
         do {
+            try Task.checkCancellation()
             guard let session = vsockSessions[vmID] else {
                 throw AgentVMError.guestAgentNotConnected(
                     vmName: bootedRecord.spec.name,
@@ -1677,7 +1904,7 @@ public actor AgentVMFleetCoordinator {
                 )
             }
             onProgress?("Executing command in '\(bootedRecord.spec.name)': \(request.commandLineSummary)")
-            let execResult = try await session.executeCommand(request)
+            let execResult = try await session.executeCommandStreaming(request, onChunk: onOutputChunk)
 
             var ledgerEntry = execResult
             if isSimulationBackend {
@@ -1685,12 +1912,27 @@ public actor AgentVMFleetCoordinator {
             }
             try? await store.appendExecResult(ledgerEntry)
 
-            _ = try await haltVM(vmID, onProgress: onProgress)
+            _ = try await Task {
+                try await self.haltVM(vmID, onProgress: onProgress)
+            }.value
             onProgress?("VM '\(bootedRecord.spec.name)' stopped.")
             return execResult
         } catch {
-            _ = try? await haltVM(vmID, onProgress: onProgress)
+            _ = await Task {
+                try? await self.haltVM(vmID, onProgress: onProgress)
+            }.value
             throw error
+        }
+    }
+
+    /// Wakes an in-flight `runOneShotCommand` when the CLI receives `SIGINT` or `SIGTERM` so `runOneShotCommand`
+    /// can perform an orderly VM shutdown and release the per-VM `flock` before the process exits.
+    public func interruptOneShotExecution(_ vmID: VMID) async {
+        if let session = vsockSessions[vmID] {
+            await session.shutdown()
+        }
+        if let box = hardwareBoxes[vmID] {
+            await box.closeVsockConnection()
         }
     }
 

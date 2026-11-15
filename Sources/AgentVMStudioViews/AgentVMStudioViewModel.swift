@@ -1155,7 +1155,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
 
     public func bootVM(_ vmID: VMID) {
         runCoordinatorTask(label: L("Booting VM", "正在启动虚拟机")) { [self] in
-            let updated = try await coordinator.bootVM(vmID)
+            let updated = try await coordinator.bootPersistentVM(vmID)
             await refreshAllState()
             toastCenter.post(
                 title: L("Blade Running", "刀片已运行"),
@@ -1219,7 +1219,7 @@ public final class AgentVMStudioViewModel: ObservableObject {
                 memoryMB: preferences.defaultMemoryMB,
                 diskVirtualBytes: 32 * 1024 * 1024
             )
-            _ = try await coordinator.bootVM(summary.vmRecord.id)
+            _ = try await coordinator.bootPersistentVM(summary.vmRecord.id)
             selectedVMID = summary.vmRecord.id
             await refreshAllState()
             toastCenter.post(

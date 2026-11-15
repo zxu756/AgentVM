@@ -803,21 +803,95 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                             env=env,
                             preexec_fn=demote_user,
                         )
-                        try:
-                            out_bytes, err_bytes = proc.communicate(input=stdin_bytes, timeout=timeout_sec)
-                        except subprocess.TimeoutExpired:
-                            timed_out = True
-                            proc.kill()
-                            out_bytes, err_bytes = proc.communicate()
+                        out_fd = proc.stdout.fileno()
+                        err_fd = proc.stderr.fileno()
+                        read_fds = {out_fd: ("stdout", proc.stdout), err_fd: ("stderr", proc.stderr)}
+                        stdin_view = memoryview(stdin_bytes) if stdin_bytes else None
+                        stdin_offset = 0
+                        stdin_fd = None
+                        if proc.stdin is not None:
+                            if stdin_view is not None and len(stdin_view) > 0:
+                                stdin_fd = proc.stdin.fileno()
+                                fl = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+                                fcntl.fcntl(stdin_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                            else:
+                                proc.stdin.close()
 
-                        for stream_label, buf in (("stdout", out_bytes), ("stderr", err_bytes)):
-                            if buf:
-                                for off in range(0, len(buf), MAX_CHUNK_BYTES):
+                        deadline = started + timeout_sec
+                        while read_fds or stdin_fd is not None:
+                            if self.closed:
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                                break
+                            rem = deadline - time.monotonic()
+                            if rem <= 0:
+                                timed_out = True
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                                break
+                            w_candidates = [stdin_fd] if stdin_fd is not None else []
+                            rlist, wlist, _ = select.select(
+                                list(read_fds.keys()), w_candidates, [], min(0.1, rem)
+                            )
+                            if wlist and stdin_fd is not None and stdin_view is not None:
+                                try:
+                                    written = os.write(stdin_fd, stdin_view[stdin_offset : stdin_offset + MAX_CHUNK_BYTES])
+                                    stdin_offset += written
+                                    if stdin_offset >= len(stdin_view):
+                                        proc.stdin.close()
+                                        stdin_fd = None
+                                except BlockingIOError:
+                                    pass
+                                except OSError:
+                                    try:
+                                        proc.stdin.close()
+                                    except Exception:
+                                        pass
+                                    stdin_fd = None
+                            for rfd in rlist:
+                                entry = read_fds.get(rfd)
+                                if entry is None:
+                                    continue
+                                stream_label, pipe_obj = entry
+                                try:
+                                    chunk = os.read(rfd, MAX_CHUNK_BYTES)
+                                except OSError:
+                                    chunk = b""
+                                if not chunk:
+                                    read_fds.pop(rfd, None)
+                                    try:
+                                        pipe_obj.close()
+                                    except Exception:
+                                        pass
+                                else:
+                                    seq += 1
+                                    self._emit_exec_chunk(stream_id, req_id, stream_label, seq, chunk)
+
+                        if stdin_fd is not None and proc.stdin is not None:
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
+                        for _, (stream_label, pipe_obj) in list(read_fds.items()):
+                            try:
+                                rem_bytes = pipe_obj.read()
+                            except Exception:
+                                rem_bytes = b""
+                            if rem_bytes and not self.closed:
+                                for off in range(0, len(rem_bytes), MAX_CHUNK_BYTES):
                                     seq += 1
                                     self._emit_exec_chunk(
-                                        stream_id, req_id, stream_label, seq, buf[off : off + MAX_CHUNK_BYTES]
+                                        stream_id, req_id, stream_label, seq, rem_bytes[off : off + MAX_CHUNK_BYTES]
                                     )
-                        rc = proc.returncode if proc.returncode is not None else 0
+                            try:
+                                pipe_obj.close()
+                            except Exception:
+                                pass
+                        rc = proc.wait()
                         exit_code = 124 if timed_out else (128 - rc if rc < 0 else rc)
                 except FileNotFoundError as fnf:
                     seq += 1

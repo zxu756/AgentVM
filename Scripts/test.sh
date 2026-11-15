@@ -17,11 +17,13 @@ Usage:
   Scripts/test.sh milestone <0|1|2|3|4|5|6> [--record]
   Scripts/test.sh release
 
-  milestone 0 writes the acceptance logs to a temporary directory and leaves the working tree untouched.
+  milestone <N> writes the acceptance logs to a temporary directory and leaves the working tree untouched.
   Pass --record to copy them into reports/ (the committed evidence the README refers to).
+  milestone 1 requires AGENTVM_REAL_VM=1; without it, the real-VM portion is reported unrun and exits non-zero.
   No mode of this script launches the desktop UI.
 
 Environment:
+  AGENTVM_REAL_VM=1      enable real Virtualization.framework guest VM acceptance (m1-real-boot.sh)
   AGENTVM_BUILD_JOBS=N   pass `-j N` to swift build / swift test
 
 Modules:
@@ -181,8 +183,52 @@ run_milestone() {
                 echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
             fi
             ;;
-        1|2|3|4|5|6)
-            echo "SKIPPED: Milestone M${m} acceptance script is scheduled for M${m} (current branch is M0)."
+        1)
+            echo "==> [AgentVM] Milestone M1: touched module unit scopes"
+            run_scope \
+                AgentVMModels \
+                AgentVMStore \
+                AgentVMStorageCoW \
+                AgentVMVsockRPC \
+                AgentVMHypervisor \
+                AgentVMCLIAndMCP \
+                AgentVMStudioViews \
+                AgentVM
+
+            local log_dir
+            log_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentvm-m1-logs.XXXXXX")"
+            echo "==> [AgentVM] Milestone M1: m0-acceptance.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/m0-acceptance.sh" "$log_dir/m0-acceptance.txt"
+            echo "==> [AgentVM] Milestone M1: readme-commands.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/readme-commands.sh" "$log_dir/readme-commands.txt"
+
+            if [[ "${AGENTVM_REAL_VM:-}" != "1" ]]; then
+                echo "==> [AgentVM] Milestone M1: m1-real-boot.sh"
+                set +e
+                "$ROOT_DIR/Scripts/acceptance/m1-real-boot.sh" 2>&1 | tee "$log_dir/m1-real-boot.txt"
+                local real_rc=${PIPESTATUS[0]}
+                set -e
+                [[ $real_rc -ne 0 ]] || real_rc=2
+                echo "UNRUN: Milestone M1 real-VM acceptance (m1-real-boot.sh) did not run because AGENTVM_REAL_VM=1 is not set; milestone 1 does not pass without real-VM verification (logs at $log_dir)." >&2
+                exit "$real_rc"
+            fi
+
+            echo "==> [AgentVM] Milestone M1: m1-real-boot.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/m1-real-boot.sh" "$log_dir/m1-real-boot.txt"
+
+            if [[ $record -eq 1 ]]; then
+                mkdir -p "$ROOT_DIR/reports"
+                cp "$log_dir/m0-acceptance.txt" "$ROOT_DIR/reports/m0-acceptance.txt"
+                cp "$log_dir/readme-commands.txt" "$ROOT_DIR/reports/readme-commands.txt"
+                cp "$log_dir/m1-real-boot.txt" "$ROOT_DIR/reports/m1-real-boot.txt"
+                rm -rf "$log_dir"
+                echo "==> [AgentVM] Recorded reports/m0-acceptance.txt, reports/readme-commands.txt, and reports/m1-real-boot.txt"
+            else
+                echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
+            fi
+            ;;
+        2|3|4|5|6)
+            echo "SKIPPED: Milestone M${m} acceptance script is scheduled for M${m} (current branch is M1)."
             exit 1
             ;;
         *)
@@ -212,17 +258,19 @@ run_release() {
     fi
 
     if [[ "${AGENTVM_REAL_VM:-0}" == "1" ]]; then
-        echo "==> [AgentVM] AGENTVM_REAL_VM=1: checking real-VM milestone scripts"
+        echo "==> [AgentVM] AGENTVM_REAL_VM=1: running real-VM milestone scripts"
         local found_real=0
         local script
-        for script in "$ROOT_DIR"/Scripts/acceptance/m[1-6]-acceptance.sh; do
+        for script in "$ROOT_DIR"/Scripts/acceptance/m[1-6]-*.sh; do
             if [[ -x "$script" ]]; then
                 found_real=1
+                echo "==> [AgentVM] Release gate: $(basename "$script")"
                 "$script"
             fi
         done
         if [[ $found_real -eq 0 ]]; then
-            echo "SKIPPED: No M1-M6 real-VM acceptance scripts present in M0."
+            echo "ERROR: No M1-M6 real-VM acceptance scripts found." >&2
+            exit 1
         fi
     else
         echo "SKIPPED (AGENTVM_REAL_VM!=1): Real Virtualization.framework guest VM tests (M1-M6) were not run."

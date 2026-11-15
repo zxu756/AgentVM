@@ -291,9 +291,10 @@ public struct BaseImageCatalogEntry: Codable, Hashable, Sendable, Identifiable {
     public var distribution: String
     public var version: String
     public var guestOS: GuestOSType
-    public var downloadURL: String
-    public var expectedSHA256: String
-    public var compressedSizeBytes: UInt64
+    public var isSupported: Bool
+    public var downloadURL: String?
+    public var expectedSHA512: String?
+    public var expectedSizeBytes: UInt64?
     public var defaultVirtualSizeBytes: UInt64
     public var includesPreinstalledToolchains: [String]
     public var cachedLocalPath: String?
@@ -304,11 +305,12 @@ public struct BaseImageCatalogEntry: Codable, Hashable, Sendable, Identifiable {
         distribution: String,
         version: String,
         guestOS: GuestOSType,
-        downloadURL: String,
-        expectedSHA256: String,
-        compressedSizeBytes: UInt64,
-        defaultVirtualSizeBytes: UInt64,
-        includesPreinstalledToolchains: [String],
+        isSupported: Bool = true,
+        downloadURL: String? = nil,
+        expectedSHA512: String? = nil,
+        expectedSizeBytes: UInt64? = nil,
+        defaultVirtualSizeBytes: UInt64 = 0,
+        includesPreinstalledToolchains: [String] = [],
         cachedLocalPath: String? = nil
     ) {
         self.id = id
@@ -316,11 +318,24 @@ public struct BaseImageCatalogEntry: Codable, Hashable, Sendable, Identifiable {
         self.distribution = distribution
         self.version = version
         self.guestOS = guestOS
+        self.isSupported = isSupported
         self.downloadURL = downloadURL
-        self.expectedSHA256 = expectedSHA256
-        self.compressedSizeBytes = compressedSizeBytes
+        self.expectedSHA512 = expectedSHA512
+        self.expectedSizeBytes = expectedSizeBytes
         self.defaultVirtualSizeBytes = defaultVirtualSizeBytes
         self.includesPreinstalledToolchains = includesPreinstalledToolchains
         self.cachedLocalPath = cachedLocalPath
+    }
+
+    /// Canonical filename inside the shared base image cache directory (e.g. `debian-12-bookworm-arm64.raw`).
+    public var cacheFileName: String {
+        if let downloadURL,
+           let url = URL(string: downloadURL) {
+            let ext = url.pathExtension.lowercased()
+            if !ext.isEmpty {
+                return "\(id).\(ext)"
+            }
+        }
+        return "\(id).raw"
     }
 }

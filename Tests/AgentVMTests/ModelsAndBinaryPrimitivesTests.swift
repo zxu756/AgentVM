@@ -338,6 +338,112 @@ struct ModelsAndBinaryPrimitivesTests {
         #expect(streamedHex == expectedHex)
     }
 
+    @Test("BinaryChecksums computes NIST FIPS 180-4 SHA-512 digests in memory and across multi-megabyte files")
+    func sha512MemoryAndStreamingFileVectors() throws {
+        // Independent NIST FIPS 180-4 SHA-512 test vectors
+        #expect(
+            BinaryChecksums.sha512Hex(Data())
+                == "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        )
+        #expect(
+            BinaryChecksums.sha512Hex(Data("abc".utf8))
+                == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        )
+        let twoBlockMessage = Data(
+            "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu".utf8
+        )
+        #expect(
+            BinaryChecksums.sha512Hex(twoBlockMessage)
+                == "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"
+        )
+
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-sha512")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Exceed 4 MiB streaming buffer (5 MiB + 137 bytes deterministic payload)
+        let byteCount = 5 * 1024 * 1024 + 137
+        var largeBytes = [UInt8](repeating: 0, count: byteCount)
+        for i in 0..<byteCount {
+            largeBytes[i] = UInt8((i &* 131 &+ 29) & 0xFF)
+        }
+        let largePayload = Data(largeBytes)
+        let fileURL = tempDir.appendingPathComponent("multi-mb-sha512.bin")
+        try largePayload.write(to: fileURL)
+
+        let expectedHex = BinaryChecksums.sha512Hex(largePayload)
+        let streamedHex = try BinaryChecksums.sha512HexFile(at: fileURL)
+        #expect(streamedHex.count == 128)
+        #expect(streamedHex == expectedHex)
+
+        let missingURL = tempDir.appendingPathComponent("does-not-exist.bin")
+        #expect(throws: (any Error).self) {
+            _ = try BinaryChecksums.sha512HexFile(at: missingURL)
+        }
+    }
+
+    @Test("AgentVMError.baseImageError produces distinct ERR_IMAGE_* codes and complete EN/ZH messages")
+    func baseImageErrorCodesAndBilingualMessages() {
+        let cases: [(AgentVMError, String, String, String)] = [
+            (
+                .baseImageError(imageID: "missing-os", reason: .unknownImage(availableIDs: ["debian-12-bookworm-arm64"])),
+                "ERR_IMAGE_NOT_FOUND",
+                "missing-os",
+                "未找到"
+            ),
+            (
+                .baseImageError(imageID: "ubuntu-24.04-noble-arm64", reason: .unsupportedImage),
+                "ERR_IMAGE_UNSUPPORTED",
+                "unsupported",
+                "暂不支持"
+            ),
+            (
+                .baseImageError(imageID: "debian-12-bookworm-arm64", reason: .missingFromCache),
+                "ERR_IMAGE_NOT_CACHED",
+                "image pull",
+                "尚未缓存"
+            ),
+            (
+                .baseImageError(imageID: "debian-12-bookworm-arm64", reason: .insecureDownloadURL(url: "http://example.com/a.raw")),
+                "ERR_IMAGE_INSECURE_URL",
+                "https",
+                "https"
+            ),
+            (
+                .baseImageError(imageID: "debian-12-bookworm-arm64", reason: .insecureRedirect(targetURL: "http://mirror.example.com/a.raw")),
+                "ERR_IMAGE_INSECURE_URL",
+                "redirect",
+                "跳转"
+            ),
+            (
+                .baseImageError(imageID: "debian-12-bookworm-arm64", reason: .downloadFailed(detail: "HTTP 503")),
+                "ERR_IMAGE_DOWNLOAD_FAILED",
+                "HTTP 503",
+                "下载"
+            ),
+            (
+                .baseImageError(imageID: "debian-12-bookworm-arm64", reason: .sizeMismatch(expectedBytes: 3_221_225_472, actualBytes: 1024)),
+                "ERR_IMAGE_SIZE_MISMATCH",
+                "3221225472",
+                "大小不符"
+            ),
+            (
+                .baseImageError(imageID: "debian-12-bookworm-arm64", reason: .checksumMismatch(expectedSHA512: "aaaa", actualSHA512: "bbbb")),
+                "ERR_IMAGE_CHECKSUM_MISMATCH",
+                "SHA-512",
+                "校验和不符"
+            )
+        ]
+
+        for (error, expectedCode, enToken, zhToken) in cases {
+            #expect(error.errorCode == expectedCode)
+            let enMsg = error.localizedMessage(in: .en)
+            let zhMsg = error.localizedMessage(in: .zhHans)
+            #expect(enMsg.lowercased().contains(enToken.lowercased()), "EN message missing '\(enToken)': \(enMsg)")
+            #expect(zhMsg.contains(zhToken), "ZH message missing '\(zhToken)': \(zhMsg)")
+            #expect(!error.remediationHint.isEmpty)
+        }
+    }
+
     // MARK: - 7. BinaryCursor & BinaryBufferWriter Round-Trips & Bounds Guards
 
     @Test("BinaryBufferWriter and BinaryCursor round-trip BE, LE, BothEndian, ASCII, padding, and patching")

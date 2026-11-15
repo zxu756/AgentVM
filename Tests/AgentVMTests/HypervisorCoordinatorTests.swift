@@ -824,4 +824,29 @@ struct HypervisorCoordinatorTests {
         )
         #expect(supportedOnly.canStartVirtualMachines == false)
     }
+
+    @Test("A30: AgentVMFleetCoordinator shares base image cache across workspaces and never creates per-workspace ImageCache")
+    func coordinatorSharesImageCacheAcrossWorkspaces() throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-coord-shared-cache")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let sharedCacheURL = tempDir.appendingPathComponent("SharedImages", isDirectory: true).standardizedFileURL
+        let wsA = tempDir.appendingPathComponent("WorkspaceA.agentvm", isDirectory: true)
+        let wsB = tempDir.appendingPathComponent("WorkspaceB.agentvm", isDirectory: true)
+
+        let coordA = try AgentVMFleetCoordinator(bundleURL: wsA, imageCacheDirectoryURL: sharedCacheURL)
+        let coordB = try AgentVMFleetCoordinator(bundleURL: wsB, imageCacheDirectoryURL: sharedCacheURL)
+
+        #expect(coordA.imageCatalog.cacheDirectoryURL == sharedCacheURL)
+        #expect(coordB.imageCatalog.cacheDirectoryURL == sharedCacheURL)
+        #expect(!FileManager.default.fileExists(atPath: wsA.appendingPathComponent("ImageCache").path))
+        #expect(!FileManager.default.fileExists(atPath: wsB.appendingPathComponent("ImageCache").path))
+
+        // Default coordinator without explicit override points at defaultCacheDirectoryURL(), never inside the workspace bundle
+        let wsDefault = tempDir.appendingPathComponent("WorkspaceDefault.agentvm", isDirectory: true)
+        let coordDefault = try AgentVMFleetCoordinator(bundleURL: wsDefault)
+        #expect(coordDefault.imageCatalog.cacheDirectoryURL == BaseImageRegistryCatalog.defaultCacheDirectoryURL())
+        #expect(!coordDefault.imageCatalog.cacheDirectoryURL.path.hasPrefix(wsDefault.standardizedFileURL.path))
+        #expect(!FileManager.default.fileExists(atPath: wsDefault.appendingPathComponent("ImageCache").path))
+    }
 }

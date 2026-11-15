@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 // MARK: - Canonical Checksum & Hashing Primitives (CRC32, RFC 1071, SHA-256)
@@ -91,6 +92,49 @@ public enum BinaryChecksums: Sendable {
             let chunk = try handle.read(upToCount: 1_048_576) ?? Data()
             if chunk.isEmpty { break }
             hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func sha512Hex(_ data: Data) -> String {
+        let digest = SHA512.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func sha512HexFile(at url: URL) throws -> String {
+        let path = url.path
+        let fd = Darwin.open(path, O_RDONLY)
+        guard fd >= 0 else {
+            let code = errno
+            throw AgentVMError.diskImageOperationFailed(
+                path: path,
+                errnoCode: code,
+                detail: String(cString: strerror(code))
+            )
+        }
+        defer { _ = Darwin.close(fd) }
+
+        var hasher = SHA512()
+        let chunkSize = 4 * 1024 * 1024
+        var buffer = [UInt8](repeating: 0, count: chunkSize)
+        try buffer.withUnsafeMutableBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            while true {
+                let bytesRead = Darwin.read(fd, baseAddress, chunkSize)
+                if bytesRead > 0 {
+                    hasher.update(bufferPointer: UnsafeRawBufferPointer(start: baseAddress, count: bytesRead))
+                } else if bytesRead == 0 {
+                    break
+                } else {
+                    let code = errno
+                    if code == EINTR { continue }
+                    throw AgentVMError.diskImageOperationFailed(
+                        path: path,
+                        errnoCode: code,
+                        detail: String(cString: strerror(code))
+                    )
+                }
+            }
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }

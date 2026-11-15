@@ -40,7 +40,12 @@ public struct AgentVMCLIRunner: Sendable {
 
     public func execute(
         arguments: [String],
-        bundleURLOverride: URL? = nil
+        bundleURLOverride: URL? = nil,
+        imageCacheURLOverride: URL? = nil,
+        curatedEntriesOverride: [BaseImageCatalogEntry]? = nil,
+        urlSessionConfiguration: URLSessionConfiguration? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        liveStderrHandler: (@Sendable (String) -> Void)? = nil
     ) async -> CLIExecutionOutcome {
         let language: AppLanguage
         if let cliLang = AppLanguage.extractCLILanguage(from: arguments) {
@@ -56,7 +61,7 @@ public struct AgentVMCLIRunner: Sendable {
         let isZh = (language == .zhHans)
 
         var args = AppLanguage.strippingLanguageArguments(from: arguments)
-        var resolvedBundleURL = bundleURLOverride ?? Self.defaultWorkspaceBundleURL()
+        var resolvedBundleURL = bundleURLOverride ?? Self.defaultWorkspaceBundleURL(environment: environment)
         var executionBackend: HypervisorExecutionBackend = .strictHardwareVZ
         var isSimulationFlagged = false
 
@@ -172,15 +177,55 @@ public struct AgentVMCLIRunner: Sendable {
             )
         }
 
-        do {
-            let coordinator = try AgentVMFleetCoordinator(
-                bundleURL: resolvedBundleURL,
-                executionBackend: executionBackend
-            )
+        if subcommand == "image" {
+            if let usageErr = Self.validateImageSubcommandUsage(parsed: parsed, language: language) {
+                let rawStderr = usageErr + "\n"
+                return CLIExecutionOutcome(
+                    exitCode: Self.usageErrorExitCode,
+                    stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                )
+            }
+        }
 
+        let streamedProgressStderr = StreamedStderrCollector()
+
+        do {
             let rawOutcome: CLIExecutionOutcome
             // How this subcommand's stdout can carry the simulation marker without breaking its format.
             var stdoutFormat: SimulationMarkedFormat = .textLines
+
+            if subcommand == "image" {
+                let asJSON = parsed.flags.contains("--json")
+                if asJSON { stdoutFormat = .json }
+                let resolvedCacheURL = (
+                    imageCacheURLOverride ?? BaseImageRegistryCatalog.defaultCacheDirectoryURL(environment: environment)
+                ).standardizedFileURL
+                let catalog = try BaseImageRegistryCatalog(
+                    cacheDirectoryURL: resolvedCacheURL,
+                    curatedEntries: curatedEntriesOverride,
+                    urlSessionConfiguration: urlSessionConfiguration,
+                    createIfMissing: false
+                )
+                rawOutcome = try await runImage(
+                    catalog: catalog,
+                    parsed: parsed,
+                    language: language,
+                    isSimulation: isSimulationFlagged,
+                    environment: environment,
+                    progressStderrCollector: streamedProgressStderr,
+                    liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
+                )
+                if isSimulationFlagged {
+                    return Self.markSimulatedOutcome(rawOutcome, stdoutFormat: stdoutFormat, language: language)
+                }
+                return rawOutcome
+            }
+
+            let coordinator = try AgentVMFleetCoordinator(
+                bundleURL: resolvedBundleURL,
+                executionBackend: executionBackend,
+                imageCacheDirectoryURL: imageCacheURLOverride
+            )
 
             switch subcommand {
             case "doctor":
@@ -247,18 +292,22 @@ public struct AgentVMCLIRunner: Sendable {
             let localizedErr = err.localizedMessage(in: language)
             let hintLine: String
             if isZh {
-                hintLine = "提示：查看审计日志抽屉或运行 'agentvm doctor' 进行环境自检。"
+                if case .baseImageError = err {
+                    hintLine = "提示：运行 'agentvm image list' 查看可用镜像条目，或运行 'agentvm image pull <id>' 下载镜像。"
+                } else {
+                    hintLine = "提示：查看审计日志抽屉或运行 'agentvm doctor' 进行环境自检。"
+                }
             } else {
                 hintLine = "Hint: \(err.remediationHint)"
             }
-            let rawStderr = "[\(err.errorCode)] \(localizedErr)\n\(hintLine)\n"
+            let rawStderr = streamedProgressStderr.snapshot() + "[\(err.errorCode)] \(localizedErr)\n\(hintLine)\n"
             return CLIExecutionOutcome(
                 exitCode: 1,
                 stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
             )
         } catch {
             let prefix = isZh ? "错误：" : "Error: "
-            let rawStderr = "\(prefix)\(error.localizedDescription)\n"
+            let rawStderr = streamedProgressStderr.snapshot() + "\(prefix)\(error.localizedDescription)\n"
             return CLIExecutionOutcome(
                 exitCode: 1,
                 stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
@@ -719,6 +768,292 @@ public struct AgentVMCLIRunner: Sendable {
         return CLIExecutionOutcome(exitCode: 0, stdout: msg)
     }
 
+    // MARK: - Base Image Catalog Subcommands (`agentvm image list | pull <id> | verify <id>`)
+
+    private struct ImageListJSONEntry: Codable, Sendable {
+        var id: String
+        var displayName: String
+        var distribution: String
+        var version: String
+        var guestOS: String
+        var supported: Bool
+        var cached: Bool
+        var cacheFileName: String?
+        var expectedSizeBytes: UInt64?
+        var expectedSHA512: String?
+        var downloadURL: String?
+        var simulated: Bool
+    }
+
+    private final class StreamedStderrCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var buffer = ""
+        private var lastPrintedPercentBucket: Int = -1
+        private var lastPrintedBytes: UInt64 = 0
+
+        func emit(_ line: String, liveHandler: (@Sendable (String) -> Void)?) {
+            guard !line.isEmpty else { return }
+            lock.lock()
+            buffer += line
+            lock.unlock()
+            liveHandler?(line)
+        }
+
+        func shouldEmitDownloadProgress(receivedBytes: UInt64, totalBytes: UInt64?) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if let totalBytes, totalBytes > 0 {
+                let pctBucket = Int((Double(receivedBytes) * 100.0 / Double(totalBytes)) / 5.0)
+                if receivedBytes >= totalBytes
+                    || lastPrintedPercentBucket < 0
+                    || pctBucket > lastPrintedPercentBucket
+                    || (receivedBytes - lastPrintedBytes) >= 128 * 1024 * 1024 {
+                    lastPrintedPercentBucket = pctBucket
+                    lastPrintedBytes = receivedBytes
+                    return true
+                }
+                return false
+            }
+            if lastPrintedBytes == 0 || (receivedBytes - lastPrintedBytes) >= 64 * 1024 * 1024 {
+                lastPrintedBytes = receivedBytes
+                return true
+            }
+            return false
+        }
+
+        func snapshot() -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            return buffer
+        }
+    }
+
+    private static func scrubPath(_ path: String, environment: [String: String]) -> String {
+        if let envHome = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envHome.isEmpty {
+            let normalizedHome = envHome.hasSuffix("/") ? String(envHome.dropLast()) : envHome
+            if path == normalizedHome {
+                return "~"
+            }
+            if path.hasPrefix(normalizedHome + "/") {
+                return "~" + String(path.dropFirst(normalizedHome.count))
+            }
+        }
+        return ByteMetricsFormatter.scrubHomePath(path)
+    }
+
+    private static func validateImageSubcommandUsage(
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage
+    ) -> String? {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+
+        guard let action = parsed.positionals.first else {
+            return isZh
+                ? "子命令「image」缺少操作（可选：list、pull、verify）。\(helpHintZh)"
+                : "Missing action for 'image' (expected one of: list, pull, verify). \(helpHintEn)"
+        }
+
+        switch action {
+        case "list":
+            if parsed.positionals.count > 1 {
+                return isZh
+                    ? "「image list」不接受多余参数「\(parsed.positionals[1])」。\(helpHintZh)"
+                    : "Unexpected argument '\(parsed.positionals[1])' for 'image list'. \(helpHintEn)"
+            }
+            return nil
+        case "pull", "verify":
+            if parsed.flags.contains("--json") {
+                return isZh
+                    ? "选项「--json」仅支持「image list」，不支持「image \(action)」。\(helpHintZh)"
+                    : "Option '--json' is only supported for 'image list', not 'image \(action)'. \(helpHintEn)"
+            }
+            if parsed.positionals.count < 2 {
+                return isZh
+                    ? "「image \(action)」缺少镜像条目 <id> 参数。\(helpHintZh)"
+                    : "Missing <id> argument for 'image \(action)'. \(helpHintEn)"
+            }
+            return nil
+        default:
+            return isZh
+                ? "未知的「image」操作「\(action)」（可选：list、pull、verify）。\(helpHintZh)"
+                : "Unknown action '\(action)' for 'image' (expected: list, pull, verify). \(helpHintEn)"
+        }
+    }
+
+    private func runImage(
+        catalog: BaseImageRegistryCatalog,
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage,
+        isSimulation: Bool,
+        environment: [String: String],
+        progressStderrCollector: StreamedStderrCollector,
+        liveStderrHandler: (@Sendable (String) -> Void)?
+    ) async throws -> CLIExecutionOutcome {
+        let isZh = (language == .zhHans)
+        let action = parsed.positionals[0]
+
+        switch action {
+        case "list":
+            let entries = await catalog.allEntries()
+            if parsed.flags.contains("--json") {
+                var jsonItems: [ImageListJSONEntry] = []
+                for entry in entries {
+                    let cached = await catalog.isImageCached(id: entry.id)
+                    jsonItems.append(
+                        ImageListJSONEntry(
+                            id: entry.id,
+                            displayName: entry.displayName,
+                            distribution: entry.distribution,
+                            version: entry.version,
+                            guestOS: entry.guestOS.rawValue,
+                            supported: entry.isSupported,
+                            cached: cached,
+                            cacheFileName: entry.isSupported ? entry.cacheFileName : nil,
+                            expectedSizeBytes: entry.expectedSizeBytes,
+                            expectedSHA512: entry.expectedSHA512,
+                            downloadURL: entry.downloadURL,
+                            simulated: isSimulation
+                        )
+                    )
+                }
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                let raw = try encoder.encode(jsonItems)
+                return CLIExecutionOutcome(exitCode: 0, stdout: String(decoding: raw, as: UTF8.self) + "\n")
+            }
+
+            let cacheLabel = Self.scrubPath(catalog.cacheDirectoryURL.path, environment: environment)
+            var out = ""
+            if isZh {
+                out += "共享镜像缓存目录：\(cacheLabel)\n"
+                out += "\(Self.padDisplayColumn("镜像 ID", width: 34))  \(Self.padDisplayColumn("版本", width: 16))  \(Self.padDisplayColumn("支持状态", width: 12))  \(Self.padDisplayColumn("缓存状态", width: 12))  大小\n"
+                out += String(repeating: "-", count: 90) + "\n"
+                for entry in entries {
+                    let cached = await catalog.isImageCached(id: entry.id)
+                    let supportCol = entry.isSupported ? "可用" : "暂不支持"
+                    let cacheCol = entry.isSupported ? (cached ? "已缓存" : "未缓存") : "—"
+                    let sizeCol = entry.expectedSizeBytes.map { ByteMetricsFormatter.formatBytes($0) } ?? "—"
+                    out += "\(Self.padDisplayColumn(entry.id, width: 34))  \(Self.padDisplayColumn(entry.version, width: 16))  \(Self.padDisplayColumn(supportCol, width: 12))  \(Self.padDisplayColumn(cacheCol, width: 12))  \(sizeCol)\n"
+                }
+            } else {
+                out += "Shared Image Cache: \(cacheLabel)\n"
+                out += "\(Self.padDisplayColumn("IMAGE ID", width: 34))  \(Self.padDisplayColumn("VERSION", width: 16))  \(Self.padDisplayColumn("SUPPORT", width: 13))  \(Self.padDisplayColumn("CACHE", width: 12))  SIZE\n"
+                out += String(repeating: "-", count: 90) + "\n"
+                for entry in entries {
+                    let cached = await catalog.isImageCached(id: entry.id)
+                    let supportCol = entry.isSupported ? "SUPPORTED" : "UNSUPPORTED"
+                    let cacheCol = entry.isSupported ? (cached ? "CACHED" : "NOT CACHED") : "—"
+                    let sizeCol = entry.expectedSizeBytes.map { ByteMetricsFormatter.formatBytes($0) } ?? "—"
+                    out += "\(Self.padDisplayColumn(entry.id, width: 34))  \(Self.padDisplayColumn(entry.version, width: 16))  \(Self.padDisplayColumn(supportCol, width: 13))  \(Self.padDisplayColumn(cacheCol, width: 12))  \(sizeCol)\n"
+                }
+            }
+            return CLIExecutionOutcome(exitCode: 0, stdout: out)
+
+        case "pull":
+            let imageID = parsed.positionals[1]
+            let outcome = try await catalog.pullImage(id: imageID) { prog in
+                let totalLabel = prog.totalBytes.map { ByteMetricsFormatter.formatBytes($0) } ?? "?"
+                switch prog.phase {
+                case .connecting:
+                    let line: String
+                    if prog.resumedFromOffset > 0 {
+                        let resumeStr = ByteMetricsFormatter.formatBytes(prog.resumedFromOffset)
+                        line = isZh
+                            ? "正在连接并尝试从 \(resumeStr) 处断点续传「\(prog.imageID)」（共 \(totalLabel)）...\n"
+                            : "Connecting to resume '\(prog.imageID)' from \(resumeStr) / \(totalLabel)...\n"
+                    } else {
+                        line = isZh
+                            ? "正在连接并下载「\(prog.imageID)」（共 \(totalLabel)）...\n"
+                            : "Connecting to download '\(prog.imageID)' (\(totalLabel))...\n"
+                    }
+                    progressStderrCollector.emit(line, liveHandler: liveStderrHandler)
+
+                case .resuming:
+                    let resumeStr = ByteMetricsFormatter.formatBytes(prog.resumedFromOffset)
+                    let line = isZh
+                        ? "服务器返回 HTTP 206，正在从字节 \(prog.resumedFromOffset)（\(resumeStr)）续传...\n"
+                        : "HTTP 206 Partial Content: resuming from byte \(prog.resumedFromOffset) (\(resumeStr))...\n"
+                    progressStderrCollector.emit(line, liveHandler: liveStderrHandler)
+
+                case .restartedFullDownload:
+                    let line = isZh
+                        ? "服务器返回 HTTP 200（忽略 Range），已清空临时文件并从字节 0 重新下载...\n"
+                        : "Server returned HTTP 200 (Range ignored); truncated .part and restarting from byte 0...\n"
+                    progressStderrCollector.emit(line, liveHandler: liveStderrHandler)
+
+                case .downloading:
+                    guard progressStderrCollector.shouldEmitDownloadProgress(
+                        receivedBytes: prog.receivedBytes,
+                        totalBytes: prog.totalBytes
+                    ) else { return }
+                    let recvStr = ByteMetricsFormatter.formatBytes(prog.receivedBytes)
+                    let pctStr: String
+                    if let total = prog.totalBytes, total > 0 {
+                        let pct = min(100.0, Double(prog.receivedBytes) * 100.0 / Double(total))
+                        pctStr = String(format: "%.1f%%", pct)
+                    } else {
+                        pctStr = "—"
+                    }
+                    let line = isZh
+                        ? "下载进度「\(prog.imageID)」：\(recvStr) / \(totalLabel)（\(pctStr)）\n"
+                        : "Downloading '\(prog.imageID)': \(recvStr) / \(totalLabel) (\(pctStr))\n"
+                    progressStderrCollector.emit(line, liveHandler: liveStderrHandler)
+
+                case .verifying:
+                    let recvStr = ByteMetricsFormatter.formatBytes(prog.receivedBytes)
+                    let line = isZh
+                        ? "正在校验文件大小与 SHA-512 校验和（\(recvStr)）...\n"
+                        : "Verifying size and SHA-512 digest (\(recvStr))...\n"
+                    progressStderrCollector.emit(line, liveHandler: liveStderrHandler)
+
+                case .completed:
+                    let recvStr = ByteMetricsFormatter.formatBytes(prog.receivedBytes)
+                    let line = isZh
+                        ? "校验通过并已设为只读（0444）：\(prog.imageID)（\(recvStr)）。\n"
+                        : "Checksum verified and finalized read-only (0444): \(prog.imageID) (\(recvStr)).\n"
+                    progressStderrCollector.emit(line, liveHandler: liveStderrHandler)
+
+                case .alreadyCached:
+                    break
+                }
+            }
+
+            let scrubbedFile = Self.scrubPath(outcome.localFileURL.path, environment: environment)
+            let sizeStr = ByteMetricsFormatter.formatBytes(outcome.sizeBytes)
+            let stdout: String
+            if outcome.wasAlreadyCached {
+                stdout = isZh
+                    ? "镜像「\(outcome.entry.id)」已在缓存中且已通过校验：\(scrubbedFile)（\(sizeStr)，未联网）。\n"
+                    : "Image '\(outcome.entry.id)' is already cached and verified at \(scrubbedFile) (\(sizeStr), no network download performed).\n"
+            } else {
+                stdout = isZh
+                    ? "镜像「\(outcome.entry.id)」已下载并校验通过：\(scrubbedFile)（\(sizeStr)，SHA-512：\(outcome.sha512Hex)）。\n"
+                    : "Pulled and verified image '\(outcome.entry.id)' at \(scrubbedFile) (\(sizeStr), SHA-512: \(outcome.sha512Hex)).\n"
+            }
+            return CLIExecutionOutcome(
+                exitCode: 0,
+                stdout: stdout,
+                stderr: progressStderrCollector.snapshot()
+            )
+
+        case "verify":
+            let imageID = parsed.positionals[1]
+            let report = try await catalog.verifyCuratedImageStrict(id: imageID)
+            let scrubbedPath = Self.scrubPath(report.localPath, environment: environment)
+            let sizeStr = ByteMetricsFormatter.formatBytes(report.logicalSizeBytes)
+            let stdout = isZh
+                ? "校验通过「\(report.imageID)」：\(scrubbedPath)（\(sizeStr)，SHA-512：\(report.actualSHA512)）\n"
+                : "VERIFIED '\(report.imageID)' at \(scrubbedPath) (\(sizeStr), SHA-512: \(report.actualSHA512))\n"
+            return CLIExecutionOutcome(exitCode: 0, stdout: stdout)
+
+        default:
+            return CLIExecutionOutcome(exitCode: Self.usageErrorExitCode)
+        }
+    }
+
     // MARK: - Formatting & Resolution Helpers
 
     private func resolveVMID(_ token: String, coordinator: AgentVMFleetCoordinator) async throws -> VMID {
@@ -764,6 +1099,11 @@ public struct AgentVMCLIRunner: Sendable {
             "init": SubcommandGrammar(flags: ["--seed-demo"]),
             "ps": list,
             "list": list,
+            "image": SubcommandGrammar(
+                flags: ["--json"],
+                maxPositionals: 2,
+                allowedFirstPositional: ["list", "pull", "verify"]
+            ),
             "create": SubcommandGrammar(valueOptions: ["--owner", "--cpus", "--memory-mb"], maxPositionals: 1),
             "up": lifecycle, "boot": lifecycle, "start": lifecycle,
             "pause": lifecycle, "resume": lifecycle,
@@ -979,6 +1319,9 @@ public struct AgentVMCLIRunner: Sendable {
               init [--seed-demo]              初始化空 .agentvm 工作区（加 --seed-demo 显式载入带 [演示数据] 标记的合成演示集群）
               ps [--json]                     列出沙盒虚拟机、状态、CPU/内存遥测（未实测时显示 —）、IPv4 与 CoW 脏块；
                                               模拟后端写入的状态显示为 SIMULATED:<状态>，JSON 里是 telemetry.simulated = true
+              image list [--json]             列出基础镜像目录条目、支持状态与共享缓存状态（默认 ~/Library/Caches/AgentVM/images）
+              image pull <id>                 通过 HTTPS（支持断点续传）下载基础镜像至共享缓存并校验大小与 SHA-512
+              image verify <id>               在本地重新计算缓存镜像的 SHA-512 与大小并核对固定目录记录（不联网）
               create <名称> [--cpus N]        创建带空稀疏 GPT 磁盘与 NoCloud ISO 的虚拟机配置记录（名称在工作区内不能重复）
               up | pause | resume | halt <vm> 控制虚拟机生命周期（无客户机系统且未传 --backend simulation 时返回错误）
               branch <源虚拟机> <新分支名>    基于 APFS clonefile(2) 派生写时复制磁盘与快照分支
@@ -1013,6 +1356,9 @@ public struct AgentVMCLIRunner: Sendable {
           init [--seed-demo]              Initialize an empty .agentvm bundle (pass --seed-demo for [DEMO]-labeled synthetic data)
           ps [--json]                     List sandbox VMs, states, telemetry ('—' when unmeasured), IPv4, and CoW dirty bytes;
                                           state written by the simulator shows as SIMULATED:<state> (JSON: telemetry.simulated = true)
+          image list [--json]             List curated base images, support status, and shared cache status (AGENTVM_IMAGE_CACHE)
+          image pull <id>                 Download base image over HTTPS (resumable Range) and verify size & SHA-512
+          image verify <id>               Recompute cached image SHA-512 & size against pinned catalog entry (offline)
           create <name> [--cpus N]        Provision a new empty GPT sparse disk + NoCloud ISO sandbox VM record (names are unique per workspace)
           up | pause | resume | halt <vm> Control VM lifecycle (fails honestly if disk has no bootable guest OS)
           branch <src-vm> <branch-name>   Fork an APFS clonefile(2) Copy-on-Write disk & snapshot branch

@@ -99,7 +99,8 @@ public actor AgentVMFleetCoordinator {
 
     public init(
         bundleURL: URL,
-        executionBackend: HypervisorExecutionBackend = .strictHardwareVZ
+        executionBackend: HypervisorExecutionBackend = .strictHardwareVZ,
+        imageCacheDirectoryURL: URL? = nil
     ) throws {
         let createdStore = try AgentVMProjectStore(bundleURL: bundleURL, createIfMissing: true)
         self.store = createdStore
@@ -115,8 +116,8 @@ public actor AgentVMFleetCoordinator {
         )
         self.pluginEngine = AgentVMPluginEngine(loadBuiltIns: true)
         self.portForwardManager = HostPortForwardManager()
-        let cacheDir = bundleURL.appendingPathComponent("ImageCache", isDirectory: true)
-        self.imageCatalog = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir)
+        let cacheDir = (imageCacheDirectoryURL ?? BaseImageRegistryCatalog.defaultCacheDirectoryURL()).standardizedFileURL
+        self.imageCatalog = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, createIfMissing: false)
         self.executionBackend = executionBackend
     }
 

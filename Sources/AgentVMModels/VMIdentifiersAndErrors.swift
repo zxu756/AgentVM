@@ -281,10 +281,23 @@ public enum NoBootableSystemReason: Sendable, Equatable {
     }
 }
 
+/// Structured failure reasons for curated base image catalog operations (`image list`, `image pull`, `image verify`).
+public enum BaseImageErrorReason: Sendable, Equatable {
+    case unknownImage(availableIDs: [String])
+    case unsupportedImage
+    case missingFromCache
+    case insecureDownloadURL(url: String)
+    case insecureRedirect(targetURL: String)
+    case downloadFailed(detail: String)
+    case sizeMismatch(expectedBytes: UInt64, actualBytes: UInt64)
+    case checksumMismatch(expectedSHA512: String, actualSHA512: String)
+}
+
 public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case virtualizationUnsupported(reason: String)
     case virtualizationEntitlementMissing
     case noBootableSystem(vmName: String, reason: NoBootableSystemReason)
+    case baseImageError(imageID: String, reason: BaseImageErrorReason)
     case vmNameAlreadyExists(name: String, existingID: VMID)
     case guestAgentNotConnected(vmName: String, state: String)
     case invalidConfiguration(issues: [ValidationIssue])
@@ -319,6 +332,16 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .virtualizationUnsupported: return "ERR_VZ_UNSUPPORTED"
         case .virtualizationEntitlementMissing: return "ERR_VZ_ENTITLEMENT_MISSING"
         case .noBootableSystem: return "ERR_NO_BOOTABLE_SYSTEM"
+        case let .baseImageError(_, reason):
+            switch reason {
+            case .unknownImage: return "ERR_IMAGE_NOT_FOUND"
+            case .unsupportedImage: return "ERR_IMAGE_UNSUPPORTED"
+            case .missingFromCache: return "ERR_IMAGE_NOT_CACHED"
+            case .insecureDownloadURL, .insecureRedirect: return "ERR_IMAGE_INSECURE_URL"
+            case .downloadFailed: return "ERR_IMAGE_DOWNLOAD_FAILED"
+            case .sizeMismatch: return "ERR_IMAGE_SIZE_MISMATCH"
+            case .checksumMismatch: return "ERR_IMAGE_CHECKSUM_MISMATCH"
+            }
         case .vmNameAlreadyExists: return "ERR_VM_NAME_EXISTS"
         case .guestAgentNotConnected: return "ERR_GUEST_AGENT_UNAVAILABLE"
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
@@ -370,6 +393,45 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "虚拟机「\(vmName)」磁盘上没有可引导的客户机系统（内核或根文件系统缺失）：\(detail)若仅需验证主机侧协议演练，请显式传入 --backend simulation。"
                 : "VM '\(vmName)' has no bootable guest OS or kernel on its disk: \(detail) Pass --backend simulation explicitly if you want to run the host-side simulation responder."
+        case let .baseImageError(imageID, reason):
+            switch reason {
+            case let .unknownImage(availableIDs):
+                if isZh {
+                    let avail = availableIDs.isEmpty ? "无" : availableIDs.joined(separator: "、")
+                    return "基础镜像目录中未找到条目「\(imageID)」（当前目录包含：\(avail)）。"
+                } else {
+                    let avail = availableIDs.isEmpty ? "none" : availableIDs.joined(separator: ", ")
+                    return "Base image '\(imageID)' was not found in the catalog (available: \(avail))."
+                }
+            case .unsupportedImage:
+                return isZh
+                    ? "基础镜像「\(imageID)」当前暂不支持，无法下载或校验；请运行 'agentvm image list' 查看可用条目。"
+                    : "Base image '\(imageID)' is currently unsupported and cannot be pulled or verified; run 'agentvm image list' to inspect supported entries."
+            case .missingFromCache:
+                return isZh
+                    ? "基础镜像「\(imageID)」尚未缓存在本地；请先运行 'agentvm image pull \(imageID)' 下载镜像。"
+                    : "Base image '\(imageID)' is not present in the local cache; run 'agentvm image pull \(imageID)' first."
+            case let .insecureDownloadURL(url):
+                return isZh
+                    ? "拒绝非 https 下载地址「\(url)」（镜像「\(imageID)」仅允许通过 https 下载）。"
+                    : "Refused non-https download URL '\(url)' for image '\(imageID)' (https is required)."
+            case let .insecureRedirect(targetURL):
+                return isZh
+                    ? "下载镜像「\(imageID)」时遇到跳转到非 https 地址「\(targetURL)」，已拒绝连接。"
+                    : "Refused insecure redirect to non-https URL '\(targetURL)' while pulling image '\(imageID)'."
+            case let .downloadFailed(detail):
+                return isZh
+                    ? "下载基础镜像「\(imageID)」失败：\(detail)"
+                    : "Failed to download base image '\(imageID)': \(detail)"
+            case let .sizeMismatch(expectedBytes, actualBytes):
+                return isZh
+                    ? "基础镜像「\(imageID)」文件大小不符（期望 \(expectedBytes) 字节，实际 \(actualBytes) 字节）。"
+                    : "Base image '\(imageID)' size mismatch (expected \(expectedBytes) bytes, got \(actualBytes) bytes)."
+            case let .checksumMismatch(expectedSHA512, actualSHA512):
+                return isZh
+                    ? "基础镜像「\(imageID)」的 SHA-512 校验和不符（期望 \(expectedSHA512)，实际 \(actualSHA512)）。"
+                    : "Base image '\(imageID)' SHA-512 checksum mismatch (expected \(expectedSHA512), computed \(actualSHA512))."
+            }
         case let .vmNameAlreadyExists(name, existingID):
             return isZh
                 ? "工作区里已经有一台名为「\(name)」的虚拟机（\(existingID.rawValue)），没有创建新的。请换一个名字。"
@@ -487,6 +549,13 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         switch self {
         case .virtualizationUnsupported, .virtualizationEntitlementMissing:
             return "Sign the binary with com.apple.security.virtualization entitlement on Apple Silicon macOS 14+."
+        case let .baseImageError(imageID, reason):
+            switch reason {
+            case .unknownImage, .unsupportedImage:
+                return "Run 'agentvm image list' to see supported base image IDs."
+            default:
+                return "Run 'agentvm image pull \(imageID)' over HTTPS to fetch and verify the image."
+            }
         case .vmNameAlreadyExists:
             return "Run 'agentvm ps' to list existing virtual machines."
         case .cowCloneFailed:

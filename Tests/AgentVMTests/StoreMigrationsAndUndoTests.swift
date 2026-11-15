@@ -1,5 +1,6 @@
 import AgentVMModels
 import AgentVMStore
+import Darwin
 import Foundation
 import Testing
 
@@ -13,6 +14,13 @@ struct StoreMigrationsAndUndoTests {
             .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    private func posixStat(_ url: URL) throws -> Darwin.stat {
+        var st = Darwin.stat()
+        let rc = stat(url.path, &st)
+        try #require(rc == 0, "stat failed for \(url.path) (errno=\(errno))")
+        return st
     }
 
     private func makeCleanVMRecord(
@@ -597,7 +605,7 @@ struct StoreMigrationsAndUndoTests {
         let offlineFile = tempDir.appendingPathComponent("alpine-agent-golden.img")
         let imageBytes = Data((0..<32_768).map { UInt8(($0 * 13 + 5) & 0xFF) })
         try imageBytes.write(to: offlineFile)
-        let expectedSHA = BinaryChecksums.sha256Hex(imageBytes)
+        let expectedSHA = BinaryChecksums.sha512Hex(imageBytes)
 
         let registered = try await catalog.registerOfflineImage(
             fileURL: offlineFile,
@@ -605,11 +613,11 @@ struct StoreMigrationsAndUndoTests {
             displayName: "Custom Alpine ARM64",
             copyIntoCacheDirectory: true
         )
-        #expect(registered.expectedSHA256 == expectedSHA)
+        #expect(registered.expectedSHA512 == expectedSHA)
 
         let validReport = try await catalog.verifyCachedImage(id: "custom-alpine", enforceExpectedDigest: true)
         #expect(validReport.isValid == true)
-        #expect(validReport.actualSHA256 == expectedSHA)
+        #expect(validReport.actualSHA512 == expectedSHA)
 
         // Tamper with the cached file inside cacheDir and verify mismatch detection
         let cachedURL = URL(fileURLWithPath: try #require(registered.cachedLocalPath))
@@ -1013,14 +1021,14 @@ struct StoreMigrationsAndUndoTests {
         let standaloneURL = tempDir.appendingPathComponent("standalone-kernel.bin")
         let payload = Data("AgentVM-ARM64-Linux-Image-Payload".utf8)
         try payload.write(to: standaloneURL)
-        let digest = BinaryChecksums.sha256Hex(payload)
+        let digest = BinaryChecksums.sha512Hex(payload)
 
-        let okReport = try catalog.verifyStandaloneFile(at: standaloneURL, expectedSHA256: digest.uppercased())
+        let okReport = try catalog.verifyStandaloneFile(at: standaloneURL, expectedSHA512: digest.uppercased())
         #expect(okReport.isValid == true)
 
         let badReport = try catalog.verifyStandaloneFile(
             at: standaloneURL,
-            expectedSHA256: String(repeating: "0", count: 64)
+            expectedSHA512: String(repeating: "0", count: 128)
         )
         #expect(badReport.isValid == false)
     }
@@ -1061,4 +1069,591 @@ struct StoreMigrationsAndUndoTests {
         #expect(changedFields.contains { $0.hasPrefix("portForwards") })
         #expect(changedFields.contains { $0.hasPrefix("labels") })
     }
+
+    // MARK: - 7. M1 Curated Catalog (A26), Shared Cache Path (A30) & Offline URLProtocol Pull/Verify Suite
+
+    @Test("A26: builtInCuratedEntries pins Debian 12 Bookworm 20261112-2660 SHA-512/size and marks all other entries unsupported without fabricated checksums")
+    func curatedCatalogPinsDebianAndMarksOthersUnsupported() throws {
+        let entries = BaseImageRegistryCatalog.builtInCuratedEntries()
+        #expect(entries.count == 6)
+
+        let debian = try #require(entries.first(where: { $0.id == "debian-12-bookworm-arm64" }))
+        #expect(debian.isSupported == true)
+        #expect(debian.version == "20261112-2660")
+        #expect(debian.guestOS == .linuxARM64)
+        #expect(debian.downloadURL == "https://cloud.debian.org/images/cloud/bookworm/20261112-2660/debian-12-genericcloud-arm64-20261112-2660.raw")
+        #expect(debian.expectedSizeBytes == 3_221_225_472)
+        #expect(debian.defaultVirtualSizeBytes == 3_221_225_472)
+        #expect(debian.expectedSHA512 == "708a1a19d3aa4f5441c8160f6493aafccd3c36bfee3113869fa9248965223b8d263a3fbb86b7cf282723fb011180ade0c4a75d331b1addc8d4d1687c897de58b")
+        #expect(debian.expectedSHA512?.count == 128)
+        #expect(debian.cacheFileName == "debian-12-bookworm-arm64.raw")
+        #expect(debian.includesPreinstalledToolchains.contains("python3.11"))
+        #expect(debian.includesPreinstalledToolchains.contains("cloud-init"))
+
+        let others = entries.filter { $0.id != "debian-12-bookworm-arm64" }
+        #expect(others.count == 5)
+        for unsupported in others {
+            #expect(unsupported.isSupported == false, "Expected \(unsupported.id) to be marked unsupported")
+            #expect(unsupported.downloadURL == nil, "Expected \(unsupported.id) to have no downloadURL")
+            #expect(unsupported.expectedSHA512 == nil, "Expected \(unsupported.id) to have no fabricated checksum")
+            #expect(unsupported.expectedSizeBytes == nil, "Expected \(unsupported.id) to have no fabricated size")
+            #expect(unsupported.defaultVirtualSizeBytes == 0)
+            #expect(unsupported.includesPreinstalledToolchains.isEmpty)
+        }
+    }
+
+    @Test("A30: defaultCacheDirectoryURL defaults to ~/Library/Caches/AgentVM/images and honors AGENTVM_IMAGE_CACHE")
+    func sharedCacheDirectoryResolutionAndReadOnlyInit() throws {
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-cache-env")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let defaultURL = BaseImageRegistryCatalog.defaultCacheDirectoryURL(environment: [
+            "HOME": mockHome.path
+        ])
+        let expectedDefault = mockHome
+            .appendingPathComponent("Library/Caches/AgentVM/images", isDirectory: true)
+            .standardizedFileURL
+        #expect(defaultURL == expectedDefault)
+
+        let explicitDir = tempDir.appendingPathComponent("explicit-cache", isDirectory: true).standardizedFileURL
+        let overriddenURL = BaseImageRegistryCatalog.defaultCacheDirectoryURL(environment: [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": explicitDir.path
+        ])
+        #expect(overriddenURL == explicitDir)
+
+        let tildeURL = BaseImageRegistryCatalog.defaultCacheDirectoryURL(environment: [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": "~/custom-pool/images"
+        ])
+        #expect(tildeURL == mockHome.appendingPathComponent("custom-pool/images", isDirectory: true).standardizedFileURL)
+
+        // Read-only init (`createIfMissing: false` default) must not materialize the cache directory on disk.
+        let uncreatedDir = tempDir.appendingPathComponent("uncreated-cache", isDirectory: true)
+        _ = try BaseImageRegistryCatalog(cacheDirectoryURL: uncreatedDir)
+        #expect(FileManager.default.fileExists(atPath: uncreatedDir.path) == false)
+    }
+
+    @Test("Offline URLProtocol stub: pullImage resumes with Range (206), restarts on 200, cleans up .part on mismatch, enforces HTTPS redirects, and rejects unsupported entries")
+    func pullImageOfflineURLProtocolScenarios() async throws {
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-pull-stub")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let payloadCount = 2 * 1024 * 1024 + 524_288 // 2.5 MiB
+        var rawBytes = [UInt8](repeating: 0, count: payloadCount)
+        for i in 0..<payloadCount {
+            rawBytes[i] = UInt8((i &* 97 &+ 41) & 0xFF)
+        }
+        let fullPayload = Data(rawBytes)
+        let fullSHA512 = BinaryChecksums.sha512Hex(fullPayload)
+
+        // 1. Unsupported entry must fail immediately with zero network requests
+        do {
+            let sessionID = UUID().uuidString
+            let config = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: sessionID) { req in
+                Issue.record("Unexpected network call for unsupported image: \(req.url?.absoluteString ?? "")")
+                throw URLError(.cannotConnectToHost)
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: sessionID) }
+
+            let cacheDir = tempDir.appendingPathComponent("unsupported-cache", isDirectory: true)
+            let catalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: cacheDir,
+                urlSessionConfiguration: config
+            )
+            do {
+                _ = try await catalog.pullImage(id: "ubuntu-24.04-noble-arm64")
+                Issue.record("Expected unsupported image pull to throw")
+            } catch let err as AgentVMError {
+                #expect(err.errorCode == "ERR_IMAGE_UNSUPPORTED")
+            }
+            #expect(CatalogStubURLProtocol.recordedRequests(sessionID: sessionID).isEmpty)
+        }
+
+        // 2. Resume via HTTP 206 Partial Content + HTTPS 302 redirect preserving Range header
+        do {
+            let sessionID = UUID().uuidString
+            let splitOffset = 1_048_576 // 1 MiB already in .part
+            let primaryURL = "https://primary.stub.agentvm.invalid/images/test-debian.raw"
+            let mirrorURL = "https://mirror.stub.agentvm.invalid/images/test-debian.raw"
+
+            let config = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: sessionID) { req in
+                let urlStr = req.url?.absoluteString ?? ""
+                if urlStr == primaryURL {
+                    let redirectResp = HTTPURLResponse(
+                        url: req.url!,
+                        statusCode: 302,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Location": mirrorURL]
+                    )!
+                    return .redirect(response: redirectResp, newURL: URL(string: mirrorURL)!)
+                }
+                #expect(urlStr == mirrorURL)
+                let rangeHeader = req.value(forHTTPHeaderField: "Range")
+                #expect(rangeHeader == "bytes=\(splitOffset)-")
+                let remaining = fullPayload.subdata(in: splitOffset..<payloadCount)
+                let resp = HTTPURLResponse(
+                    url: req.url!,
+                    statusCode: 206,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: [
+                        "Accept-Ranges": "bytes",
+                        "Content-Range": "bytes \(splitOffset)-\(payloadCount - 1)/\(payloadCount)",
+                        "Content-Length": "\(remaining.count)"
+                    ]
+                )!
+                return .chunks(response: resp, chunks: [
+                    remaining.prefix(524_288),
+                    remaining.dropFirst(524_288)
+                ].map(Data.init))
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: sessionID) }
+
+            let cacheDir = tempDir.appendingPathComponent("resume-206-cache", isDirectory: true)
+            try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+            let partURL = cacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw.part")
+            try fullPayload.prefix(splitOffset).write(to: partURL)
+
+            let testEntry = BaseImageCatalogEntry(
+                id: "debian-12-bookworm-arm64",
+                displayName: "Debian Test Resume",
+                distribution: "debian",
+                version: "20261112-2660",
+                guestOS: .linuxARM64,
+                isSupported: true,
+                downloadURL: primaryURL,
+                expectedSHA512: fullSHA512,
+                expectedSizeBytes: UInt64(payloadCount),
+                defaultVirtualSizeBytes: UInt64(payloadCount)
+            )
+            let catalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: cacheDir,
+                curatedEntries: [testEntry],
+                urlSessionConfiguration: config
+            )
+
+            let tracker = LockedProgressBox()
+            let outcome = try await catalog.pullImage(id: "debian-12-bookworm-arm64") { prog in
+                tracker.append(prog)
+            }
+            #expect(outcome.wasAlreadyCached == false)
+            #expect(outcome.resumedFromBytes == UInt64(splitOffset))
+            #expect(outcome.restartedFromZeroAfterRangeIgnored == false)
+            #expect(outcome.sizeBytes == UInt64(payloadCount))
+            #expect(outcome.sha512Hex == fullSHA512)
+            #expect(FileManager.default.fileExists(atPath: partURL.path) == false)
+
+            let finalURL = cacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw")
+            #expect(outcome.localFileURL == finalURL.standardizedFileURL)
+            #expect(try Data(contentsOf: finalURL) == fullPayload)
+
+            let st = try posixStat(finalURL)
+            #expect((st.st_mode & 0o777) == 0o444, "Cached image must be read-only (0444)")
+
+            let phases = tracker.snapshot().map(\.phase)
+            #expect(phases.contains(.resuming))
+            #expect(phases.contains(.verifying))
+            #expect(phases.contains(.completed))
+        }
+
+        // 3. Server ignores Range and returns HTTP 200 -> truncates stale .part and restarts from byte 0
+        do {
+            let sessionID = UUID().uuidString
+            let url = "https://origin200.stub.agentvm.invalid/images/debian.raw"
+            let config = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: sessionID) { req in
+                #expect(req.value(forHTTPHeaderField: "Range") == "bytes=524288-")
+                let resp = HTTPURLResponse(
+                    url: req.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Length": "\(payloadCount)"]
+                )!
+                return .chunks(response: resp, chunks: [fullPayload])
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: sessionID) }
+
+            let cacheDir = tempDir.appendingPathComponent("range-200-cache", isDirectory: true)
+            try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+            let partURL = cacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw.part")
+            // Fill .part with corrupted bytes (0xFF) so appending instead of truncating would fail size & SHA-512!
+            try Data(repeating: 0xFF, count: 524_288).write(to: partURL)
+
+            let testEntry = BaseImageCatalogEntry(
+                id: "debian-12-bookworm-arm64",
+                displayName: "Debian Test 200",
+                distribution: "debian",
+                version: "20261112-2660",
+                guestOS: .linuxARM64,
+                isSupported: true,
+                downloadURL: url,
+                expectedSHA512: fullSHA512,
+                expectedSizeBytes: UInt64(payloadCount),
+                defaultVirtualSizeBytes: UInt64(payloadCount)
+            )
+            let catalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: cacheDir,
+                curatedEntries: [testEntry],
+                urlSessionConfiguration: config
+            )
+
+            let outcome = try await catalog.pullImage(id: "debian-12-bookworm-arm64")
+            #expect(outcome.wasAlreadyCached == false)
+            #expect(outcome.restartedFromZeroAfterRangeIgnored == true)
+            #expect(FileManager.default.fileExists(atPath: partURL.path) == false)
+            let finalURL = cacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw")
+            #expect(try Data(contentsOf: finalURL) == fullPayload)
+        }
+
+        // 4. Checksum mismatch and size mismatch delete .part and leave zero cached image
+        do {
+            let sessionID = UUID().uuidString
+            let badChecksumURL = "https://badsum.stub.agentvm.invalid/images/debian.raw"
+            let badSizeURL = "https://badsize.stub.agentvm.invalid/images/debian.raw"
+            let config = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: sessionID) { req in
+                let urlStr = req.url?.absoluteString ?? ""
+                if urlStr == badChecksumURL {
+                    var tampered = fullPayload
+                    tampered[1024] ^= 0x5A
+                    let resp = HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                    return .chunks(response: resp, chunks: [tampered])
+                } else {
+                    let truncated = fullPayload.prefix(65_536)
+                    let resp = HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                    return .chunks(response: resp, chunks: [Data(truncated)])
+                }
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: sessionID) }
+
+            let sumCacheDir = tempDir.appendingPathComponent("mismatch-sum-cache", isDirectory: true)
+            let sumCatalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: sumCacheDir,
+                curatedEntries: [
+                    BaseImageCatalogEntry(
+                        id: "debian-12-bookworm-arm64",
+                        displayName: "Debian Bad Sum",
+                        distribution: "debian",
+                        version: "20261112-2660",
+                        guestOS: .linuxARM64,
+                        isSupported: true,
+                        downloadURL: badChecksumURL,
+                        expectedSHA512: fullSHA512,
+                        expectedSizeBytes: UInt64(payloadCount)
+                    )
+                ],
+                urlSessionConfiguration: config
+            )
+            do {
+                _ = try await sumCatalog.pullImage(id: "debian-12-bookworm-arm64")
+                Issue.record("Expected SHA-512 mismatch to throw")
+            } catch let err as AgentVMError {
+                #expect(err.errorCode == "ERR_IMAGE_CHECKSUM_MISMATCH")
+            }
+            #expect(!FileManager.default.fileExists(atPath: sumCacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw.part").path))
+            #expect(!FileManager.default.fileExists(atPath: sumCacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw").path))
+            #expect(await sumCatalog.isImageCached(id: "debian-12-bookworm-arm64") == false)
+
+            let sizeCacheDir = tempDir.appendingPathComponent("mismatch-size-cache", isDirectory: true)
+            let sizeCatalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: sizeCacheDir,
+                curatedEntries: [
+                    BaseImageCatalogEntry(
+                        id: "debian-12-bookworm-arm64",
+                        displayName: "Debian Bad Size",
+                        distribution: "debian",
+                        version: "20261112-2660",
+                        guestOS: .linuxARM64,
+                        isSupported: true,
+                        downloadURL: badSizeURL,
+                        expectedSHA512: fullSHA512,
+                        expectedSizeBytes: UInt64(payloadCount)
+                    )
+                ],
+                urlSessionConfiguration: config
+            )
+            do {
+                _ = try await sizeCatalog.pullImage(id: "debian-12-bookworm-arm64")
+                Issue.record("Expected size mismatch to throw")
+            } catch let err as AgentVMError {
+                #expect(err.errorCode == "ERR_IMAGE_SIZE_MISMATCH")
+            }
+            #expect(!FileManager.default.fileExists(atPath: sizeCacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw.part").path))
+            #expect(!FileManager.default.fileExists(atPath: sizeCacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw").path))
+        }
+
+        // 5. Redirect from https:// to http:// is rejected and never connects to the http:// target
+        do {
+            let sessionID = UUID().uuidString
+            let startHTTPS = "https://secure.stub.agentvm.invalid/images/debian.raw"
+            let insecureHTTP = "http://insecure.stub.agentvm.invalid/images/debian.raw"
+            let config = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: sessionID) { req in
+                let urlStr = req.url?.absoluteString ?? ""
+                if urlStr == startHTTPS {
+                    let redirect = HTTPURLResponse(
+                        url: req.url!,
+                        statusCode: 302,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Location": insecureHTTP]
+                    )!
+                    return .redirect(response: redirect, newURL: URL(string: insecureHTTP)!)
+                }
+                Issue.record("Must never request downgraded http:// target: \(urlStr)")
+                throw URLError(.badURL)
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: sessionID) }
+
+            let cacheDir = tempDir.appendingPathComponent("http-redirect-cache", isDirectory: true)
+            let catalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: cacheDir,
+                curatedEntries: [
+                    BaseImageCatalogEntry(
+                        id: "debian-12-bookworm-arm64",
+                        displayName: "Debian Redirect HTTP",
+                        distribution: "debian",
+                        version: "20261112-2660",
+                        guestOS: .linuxARM64,
+                        isSupported: true,
+                        downloadURL: startHTTPS,
+                        expectedSHA512: fullSHA512,
+                        expectedSizeBytes: UInt64(payloadCount)
+                    )
+                ],
+                urlSessionConfiguration: config
+            )
+
+            do {
+                _ = try await catalog.pullImage(id: "debian-12-bookworm-arm64")
+                Issue.record("Expected redirect to http:// to throw ERR_IMAGE_INSECURE_URL")
+            } catch let err as AgentVMError {
+                #expect(err.errorCode == "ERR_IMAGE_INSECURE_URL")
+            }
+            let urlsHit = CatalogStubURLProtocol.recordedRequests(sessionID: sessionID).compactMap { $0.url?.absoluteString }
+            #expect(urlsHit == [startHTTPS])
+            #expect(!urlsHit.contains(insecureHTTP))
+        }
+    }
+
+    @Test("Local 3 MiB image file exercises cache-hit pullImage (zero network, inode/mtime untouched) and verifyCachedImage (APFS clone tamper detection)")
+    func localMultiMBFileVerifyAndCacheHitZeroNetwork() async throws {
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-local-3mb")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Build a 3 MiB local payload in temporary storage
+        let sizeBytes = 3 * 1024 * 1024
+        var raw = [UInt8](repeating: 0, count: sizeBytes)
+        for i in 0..<sizeBytes {
+            raw[i] = UInt8((i &* 53 &+ 17) & 0xFF)
+        }
+        let localPayload = Data(raw)
+        let expectedSHA512 = BinaryChecksums.sha512Hex(localPayload)
+        let originURL = "https://local-seed.stub.agentvm.invalid/debian-3mb.raw"
+
+        let testEntry = BaseImageCatalogEntry(
+            id: "debian-12-bookworm-arm64",
+            displayName: "Debian Local 3 MiB Verification Fixture",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: originURL,
+            expectedSHA512: expectedSHA512,
+            expectedSizeBytes: UInt64(sizeBytes),
+            defaultVirtualSizeBytes: UInt64(sizeBytes)
+        )
+
+        let cacheDir = tempDir.appendingPathComponent("shared-cache", isDirectory: true)
+
+        // Seed cache once via offline stub
+        do {
+            let seedSession = UUID().uuidString
+            let seedConfig = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: seedSession) { req in
+                let resp = HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return .chunks(response: resp, chunks: [localPayload])
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: seedSession) }
+
+            let seeder = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: cacheDir,
+                curatedEntries: [testEntry],
+                urlSessionConfiguration: seedConfig
+            )
+            let initialPull = try await seeder.pullImage(id: "debian-12-bookworm-arm64")
+            #expect(initialPull.wasAlreadyCached == false)
+        }
+
+        let cachedImageURL = cacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw")
+        let manifestURL = cacheDir.appendingPathComponent("catalog-index.json")
+        let beforeStat = try posixStat(cachedImageURL)
+        let beforeIndexStat = try posixStat(manifestURL)
+
+        // Re-open catalog in a new instance configured to FAIL if any network request is made
+        let noNetSession = UUID().uuidString
+        let noNetConfig = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: noNetSession) { req in
+            Issue.record("Cache-hit pullImage must NOT touch network: \(req.url?.absoluteString ?? "")")
+            throw URLError(.notConnectedToInternet)
+        }
+        defer { CatalogStubURLProtocol.unregister(sessionID: noNetSession) }
+
+        let offlineCatalog = try BaseImageRegistryCatalog(
+            cacheDirectoryURL: cacheDir,
+            curatedEntries: [testEntry],
+            urlSessionConfiguration: noNetConfig
+        )
+        #expect(await offlineCatalog.isImageCached(id: "debian-12-bookworm-arm64") == true)
+        #expect(try await offlineCatalog.verifiedCachedImageURL(forID: "debian-12-bookworm-arm64") == cachedImageURL.standardizedFileURL)
+
+        // Cache-hit pullImage: 0 network calls, inode and mtime unchanged
+        let cachedPull = try await offlineCatalog.pullImage(id: "debian-12-bookworm-arm64")
+        #expect(cachedPull.wasAlreadyCached == true)
+        #expect(CatalogStubURLProtocol.recordedRequests(sessionID: noNetSession).isEmpty)
+
+        let afterPullStat = try posixStat(cachedImageURL)
+        let afterPullIndexStat = try posixStat(manifestURL)
+        #expect(afterPullStat.st_ino == beforeStat.st_ino)
+        #expect(afterPullStat.st_mtimespec.tv_sec == beforeStat.st_mtimespec.tv_sec)
+        #expect(afterPullStat.st_mtimespec.tv_nsec == beforeStat.st_mtimespec.tv_nsec)
+        #expect(afterPullIndexStat.st_mtimespec.tv_sec == beforeIndexStat.st_mtimespec.tv_sec)
+        #expect(afterPullIndexStat.st_mtimespec.tv_nsec == beforeIndexStat.st_mtimespec.tv_nsec)
+
+        // verifyCachedImage on original cache passes and leaves catalog-index.json untouched
+        let okVerify = try await offlineCatalog.verifyCachedImage(id: "debian-12-bookworm-arm64", enforceExpectedDigest: true)
+        #expect(okVerify.isValid == true)
+        #expect(okVerify.actualSHA512 == expectedSHA512)
+        #expect(okVerify.logicalSizeBytes == UInt64(sizeBytes))
+
+        let afterVerifyIndexStat = try posixStat(manifestURL)
+        #expect(afterVerifyIndexStat.st_mtimespec.tv_sec == beforeIndexStat.st_mtimespec.tv_sec)
+        #expect(afterVerifyIndexStat.st_mtimespec.tv_nsec == beforeIndexStat.st_mtimespec.tv_nsec)
+
+        // APFS clonefile copy into separate temp cache dir, flip 1 byte -> verify fails on copy, still passes on original
+        let clonedCacheDir = tempDir.appendingPathComponent("cloned-tampered-cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: clonedCacheDir, withIntermediateDirectories: true)
+        let clonedImageURL = clonedCacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw")
+        #expect(Darwin.clonefile(cachedImageURL.path, clonedImageURL.path, 0) == 0)
+        #expect(Darwin.chmod(clonedImageURL.path, 0o644) == 0)
+        do {
+            let handle = try FileHandle(forUpdating: clonedImageURL)
+            try handle.seek(toOffset: UInt64(sizeBytes / 2))
+            let origByte = localPayload[sizeBytes / 2]
+            try handle.write(contentsOf: Data([origByte ^ 0x01]))
+            try handle.close()
+        }
+        #expect(Darwin.chmod(clonedImageURL.path, 0o444) == 0)
+
+        let tamperedCatalog = try BaseImageRegistryCatalog(
+            cacheDirectoryURL: clonedCacheDir,
+            curatedEntries: [testEntry],
+            urlSessionConfiguration: noNetConfig
+        )
+        let badVerify = try await tamperedCatalog.verifyCachedImage(id: "debian-12-bookworm-arm64", enforceExpectedDigest: true)
+        #expect(badVerify.isValid == false)
+        #expect(badVerify.actualSHA512 != expectedSHA512)
+
+        let stillGoodOriginal = try await offlineCatalog.verifyCachedImage(id: "debian-12-bookworm-arm64", enforceExpectedDigest: true)
+        #expect(stillGoodOriginal.isValid == true)
+    }
+}
+
+// MARK: - Offline URLProtocol Stub Harness (Zero Real Network Access)
+
+private final class LockedProgressBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [BaseImagePullProgress] = []
+
+    func append(_ item: BaseImagePullProgress) {
+        lock.lock()
+        defer { lock.unlock() }
+        items.append(item)
+    }
+
+    func snapshot() -> [BaseImagePullProgress] {
+        lock.lock()
+        defer { lock.unlock() }
+        return items
+    }
+}
+
+private final class CatalogStubURLProtocol: URLProtocol, @unchecked Sendable {
+    enum StubReply {
+        case chunks(response: HTTPURLResponse, chunks: [Data])
+        case redirect(response: HTTPURLResponse, newURL: URL)
+    }
+
+    typealias Handler = @Sendable (URLRequest) throws -> StubReply
+
+    private static let sessionHeader = "X-AgentVM-Test-Stub-Session"
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var handlers: [String: Handler] = [:]
+    private nonisolated(unsafe) static var requestsBySession: [String: [URLRequest]] = [:]
+
+    static func makeSessionConfiguration(sessionID: String, handler: @escaping Handler) -> URLSessionConfiguration {
+        lock.lock()
+        handlers[sessionID] = handler
+        requestsBySession[sessionID] = []
+        lock.unlock()
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [CatalogStubURLProtocol.self]
+        config.httpAdditionalHeaders = [sessionHeader: sessionID]
+        config.urlCache = nil
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        return config
+    }
+
+    static func unregister(sessionID: String) {
+        lock.lock()
+        handlers.removeValue(forKey: sessionID)
+        requestsBySession.removeValue(forKey: sessionID)
+        lock.unlock()
+    }
+
+    static func recordedRequests(sessionID: String) -> [URLRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestsBySession[sessionID] ?? []
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        let sessionID = request.value(forHTTPHeaderField: Self.sessionHeader) ?? ""
+        Self.lock.lock()
+        if !sessionID.isEmpty {
+            Self.requestsBySession[sessionID, default: []].append(request)
+        }
+        let handler = Self.handlers[sessionID]
+        Self.lock.unlock()
+
+        guard let handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+            return
+        }
+
+        do {
+            switch try handler(request) {
+            case let .redirect(response, newURL):
+                var redirected = request
+                redirected.url = newURL
+                client?.urlProtocol(self, wasRedirectedTo: redirected, redirectResponse: response)
+                client?.urlProtocolDidFinishLoading(self)
+            case let .chunks(response, chunks):
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                for chunk in chunks where !chunk.isEmpty {
+                    client?.urlProtocol(self, didLoad: chunk)
+                }
+                client?.urlProtocolDidFinishLoading(self)
+            }
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }

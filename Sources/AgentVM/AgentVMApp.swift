@@ -12,8 +12,31 @@ import SwiftUI
 
 @main
 enum AgentVMEntryPoint {
+    private final class LiveStderrForwarder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var forwarded = ""
+
+        func write(_ chunk: String) {
+            guard !chunk.isEmpty else { return }
+            lock.lock()
+            forwarded += chunk
+            lock.unlock()
+            FileHandle.standardError.write(Data(chunk.utf8))
+        }
+
+        func unforwardedSuffix(of fullStderr: String) -> String {
+            lock.lock()
+            let prefix = forwarded
+            lock.unlock()
+            guard !prefix.isEmpty, fullStderr.hasPrefix(prefix) else {
+                return fullStderr
+            }
+            return String(fullStderr.dropFirst(prefix.count))
+        }
+    }
+
     private static let cliSubcommands: Set<String> = [
-        "doctor", "init", "ps", "list", "create",
+        "doctor", "init", "ps", "list", "image", "create",
         "up", "boot", "start", "pause", "resume", "halt", "stop",
         "branch", "fork", "snapshot", "restore",
         "exec", "pcap", "policy", "plugin",
@@ -63,12 +86,17 @@ enum AgentVMEntryPoint {
         // 3. Headless Multi-Subcommand CLI (`agentvm <subcommand> ...`)
         if isCLIInvocation(rawArgs) {
             let runner = AgentVMCLIRunner()
-            let outcome = await runner.execute(arguments: rawArgs)
+            let forwarder = LiveStderrForwarder()
+            let outcome = await runner.execute(
+                arguments: rawArgs,
+                liveStderrHandler: { forwarder.write($0) }
+            )
             if !outcome.stdout.isEmpty {
                 FileHandle.standardOutput.write(Data(outcome.stdout.utf8))
             }
-            if !outcome.stderr.isEmpty {
-                FileHandle.standardError.write(Data(outcome.stderr.utf8))
+            let remainingStderr = forwarder.unforwardedSuffix(of: outcome.stderr)
+            if !remainingStderr.isEmpty {
+                FileHandle.standardError.write(Data(remainingStderr.utf8))
             }
             Darwin.exit(outcome.exitCode)
         }

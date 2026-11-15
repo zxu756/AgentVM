@@ -127,10 +127,15 @@ public struct UndoJournalRecord: Codable, Hashable, Sendable, Identifiable {
 public struct CachedImageIndexRecord: Codable, Hashable, Sendable, Identifiable {
     public var id: String { entry.id }
     public var entry: BaseImageCatalogEntry
+    public var fileName: String
     public var localPath: String
-    public var sha256Hex: String
+    public var sha512Hex: String
+    public var logicalBytes: UInt64
     public var physicalBytes: UInt64
     public var virtualBytes: UInt64
+    public var mtimeSeconds: Int64
+    public var mtimeNanoseconds: Int64
+    public var verified: Bool
     public var isCustomOffline: Bool
     public var verifiedAt: Date
     public var lastAccessedAt: Date
@@ -138,20 +143,31 @@ public struct CachedImageIndexRecord: Codable, Hashable, Sendable, Identifiable 
 
     public init(
         entry: BaseImageCatalogEntry,
+        fileName: String? = nil,
         localPath: String,
-        sha256Hex: String,
+        sha512Hex: String,
+        logicalBytes: UInt64 = 0,
         physicalBytes: UInt64,
         virtualBytes: UInt64,
+        mtimeSeconds: Int64 = 0,
+        mtimeNanoseconds: Int64 = 0,
+        verified: Bool = true,
         isCustomOffline: Bool,
         verifiedAt: Date = Date(),
         lastAccessedAt: Date = Date(),
         accessCount: Int = 1
     ) {
         self.entry = entry
+        let derivedFileName = URL(fileURLWithPath: localPath).lastPathComponent
+        self.fileName = (fileName?.isEmpty == false) ? fileName! : (derivedFileName.isEmpty ? entry.cacheFileName : derivedFileName)
         self.localPath = localPath
-        self.sha256Hex = sha256Hex
+        self.sha512Hex = sha512Hex
+        self.logicalBytes = logicalBytes > 0 ? logicalBytes : physicalBytes
         self.physicalBytes = physicalBytes
         self.virtualBytes = virtualBytes
+        self.mtimeSeconds = mtimeSeconds
+        self.mtimeNanoseconds = mtimeNanoseconds
+        self.verified = verified
         self.isCustomOffline = isCustomOffline
         self.verifiedAt = verifiedAt
         self.lastAccessedAt = lastAccessedAt
@@ -766,7 +782,7 @@ extension AgentVMProjectStore {
                 record.entry.version.sqliteValue,
                 record.entry.guestOS.rawValue.sqliteValue,
                 record.localPath.sqliteValue,
-                record.sha256Hex.sqliteValue,
+                record.sha512Hex.sqliteValue,
                 record.physicalBytes.sqliteValue,
                 record.virtualBytes.sqliteValue,
                 record.isCustomOffline.sqliteValue,
@@ -790,11 +806,14 @@ extension AgentVMProjectStore {
         )
         return try rows.map { row in
             let entry = try row.json(BaseImageCatalogEntry.self, column: "entry_json", decoder: jsonDecoder)
+            let localPath = try row.string("local_path")
+            let physicalBytes = try row.uint64("physical_bytes")
             return CachedImageIndexRecord(
                 entry: entry,
-                localPath: try row.string("local_path"),
-                sha256Hex: try row.string("sha256_hex"),
-                physicalBytes: try row.uint64("physical_bytes"),
+                localPath: localPath,
+                sha512Hex: try row.string("sha256_hex"),
+                logicalBytes: entry.expectedSizeBytes ?? physicalBytes,
+                physicalBytes: physicalBytes,
                 virtualBytes: try row.uint64("virtual_bytes"),
                 isCustomOffline: try row.bool("is_custom_offline"),
                 verifiedAt: try row.date("verified_at"),

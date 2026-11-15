@@ -4,7 +4,7 @@ import Foundation
 // MARK: - Linux Guest Vsock Daemon & Systemd Bootstrap Generator
 
 /// Generates the self-contained Linux Guest Agent (`agentvm-guestd.py`), `systemd` unit file
-/// (`agentvm-guestd.service`), kernel `virtio_vsock` autoload configuration, and `CloudInitWriteFile`
+/// (`agentvm-guestd.service`), kernel `vmw_vsock_virtio_transport` autoload configuration, and `CloudInitWriteFile`
 /// entries speaking the exact 24-byte `AVM1` (`0x41564D31`) binary wire protocol on `AF_VSOCK` port `1025`.
 public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
     public static let defaultVsockPort: UInt32 = VsockWireConstants.defaultGuestVsockPort
@@ -68,7 +68,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         return [
             "mkdir -p \(defaultWorkspacePath)",
             "modprobe virtio_console || true",
-            "modprobe virtio_vsock || modprobe vmw_vsock_virtio_transport || true",
+            "modprobe vmw_vsock_virtio_transport || true",
             "systemctl daemon-reload",
             "systemctl enable --now serial-getty@hvc0.service || true",
             "systemctl enable --now \(unitName)"

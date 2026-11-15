@@ -498,7 +498,7 @@ public struct ISO9660CloudInitBuilder: Sendable {
             "final_message: \"AgentVM guest \(spec.hostname) (\(spec.instanceID)) ready after $UPTIME seconds\""
         ]
         if spec.injectGuestVsockAgent {
-            lines.insert("kernel_modules: [virtio_pci, virtio_blk, virtio_net, virtio_fs, virtio_console, vmw_vsock_virtio_transport_common, vmw_vsock_virtio_transport]", at: 2)
+            lines.insert("kernel_modules: [virtio_pci, virtio_blk, virtio_net, virtio_console, vsock, vmw_vsock_virtio_transport_common, vmw_vsock_virtio_transport]", at: 2)
         }
         return lines.joined(separator: "\n") + "\n"
     }

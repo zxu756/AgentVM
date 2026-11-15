@@ -1,4 +1,5 @@
 import AgentVMModels
+import AgentVMStorageCoW
 import AgentVMVsockRPC
 import Darwin
 import Foundation
@@ -625,6 +626,30 @@ struct VsockRPCAndTerminalTests {
         let untouched = generator.applying(to: optOut)
         #expect(untouched.writeFiles.isEmpty)
         #expect(untouched.runCommands.isEmpty)
+    }
+
+    @Test("Generated kernel module configs and cloud-init commands omit non-existent virtio_vsock and virtio_fs module names")
+    func guestKernelModuleConfigsOmitNonExistentVirtioVsockModuleName() throws {
+        let generator = GuestAgentBootstrapGenerator()
+        let modulesConfig = generator.kernelModulesConfig()
+        let unit = generator.systemdServiceUnit()
+        let runCommands = generator.cloudInitRunCommands()
+
+        #expect(!modulesConfig.contains("virtio_vsock"))
+        #expect(!unit.contains("virtio_vsock"))
+        #expect(!runCommands.contains { $0.contains("virtio_vsock") })
+
+        #expect(modulesConfig.contains("vmw_vsock_virtio_transport"))
+        #expect(unit.contains("vmw_vsock_virtio_transport"))
+        #expect(runCommands.contains { $0.contains("vmw_vsock_virtio_transport") })
+
+        let enrichedSpec = generator.applying(to: CloudInitSpec(hostname: "mod-check", injectGuestVsockAgent: true))
+        let renderedFiles = ISO9660CloudInitBuilder().renderNoCloudFiles(from: enrichedSpec)
+        for entry in renderedFiles {
+            let text = try #require(entry.utf8String)
+            #expect(!text.contains("virtio_vsock"), "Found non-existent module virtio_vsock in \(entry.path)")
+            #expect(!text.contains("virtio_fs"), "Found non-existent module virtio_fs in \(entry.path)")
+        }
     }
 
     @Test("Generated Python guest daemon converts signal-killed child exit codes (-N) to 128 + N")

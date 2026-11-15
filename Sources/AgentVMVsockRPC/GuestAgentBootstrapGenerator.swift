@@ -67,15 +67,17 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         let unitName = URL(fileURLWithPath: systemdUnitPath).lastPathComponent
         return [
             "mkdir -p \(defaultWorkspacePath)",
+            "modprobe virtio_console || true",
             "modprobe virtio_vsock || modprobe vmw_vsock_virtio_transport || true",
             "systemctl daemon-reload",
+            "systemctl enable --now serial-getty@hvc0.service || true",
             "systemctl enable --now \(unitName)"
         ]
     }
 
     /// Returns a copy of `spec` enriched with `agentvm-guestd` files and `runcmd` activation steps
     /// when `spec.injectGuestVsockAgent` is enabled, deduplicating by `guestPath`.
-    public func applying(to spec: CloudInitSpec, includePythonAptPackage: Bool = true) -> CloudInitSpec {
+    public func applying(to spec: CloudInitSpec, includePythonAptPackage: Bool = false) -> CloudInitSpec {
         guard spec.injectGuestVsockAgent else { return spec }
         var updated = spec
         let existingPaths = Set(updated.writeFiles.map(\.guestPath))
@@ -96,7 +98,8 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
 
     public func kernelModulesConfig() -> String {
         """
-        # Autoloaded by systemd-modules-load.service for AgentVM VirtioSocket RPC
+        # Autoloaded by systemd-modules-load.service for AgentVM VirtioSocket RPC & Console
+        virtio_console
         vsock
         vmw_vsock_virtio_transport_common
         vmw_vsock_virtio_transport
@@ -121,7 +124,9 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         Group=root
         WorkingDirectory=-\(defaultWorkspacePath)
         ExecStartPre=-/bin/mkdir -p \(defaultWorkspacePath)
+        ExecStartPre=-/sbin/modprobe virtio_console
         ExecStartPre=-/sbin/modprobe vmw_vsock_virtio_transport
+        ExecStartPre=-/bin/sh -c '/bin/dmesg > /dev/hvc0 2>/dev/null || true'
         ExecStart=/usr/bin/python3 -u \(daemonPath) --port \(vsockPort) --heartbeat-interval \(heartbeatIntervalSeconds) --workspace \(defaultWorkspacePath)
         Restart=always
         RestartSec=1
@@ -733,6 +738,10 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                     if os.geteuid() == 0 and run_as_user and run_as_user != "root":
                         try:
                             pw = pwd.getpwnam(run_as_user)
+                            try:
+                                os.initgroups(run_as_user, pw.pw_gid)
+                            except Exception:
+                                pass
                             os.setgid(pw.pw_gid)
                             os.setuid(pw.pw_uid)
                         except KeyError:
@@ -782,7 +791,8 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                             elif proc.poll() is not None:
                                 break
                         os.close(master_fd)
-                        exit_code = 124 if timed_out else proc.wait()
+                        rc = proc.wait()
+                        exit_code = 124 if timed_out else (128 - rc if rc < 0 else rc)
                     else:
                         proc = subprocess.Popen(
                             cmd,
@@ -807,7 +817,8 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                                     self._emit_exec_chunk(
                                         stream_id, req_id, stream_label, seq, buf[off : off + MAX_CHUNK_BYTES]
                                     )
-                        exit_code = 124 if timed_out else proc.returncode
+                        rc = proc.returncode if proc.returncode is not None else 0
+                        exit_code = 124 if timed_out else (128 - rc if rc < 0 else rc)
                 except FileNotFoundError as fnf:
                     seq += 1
                     self._emit_exec_chunk(stream_id, req_id, "stderr", seq, f"{fnf}\n".encode("utf-8"))

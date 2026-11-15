@@ -866,14 +866,34 @@ struct HypervisorCoordinatorTests {
         let cacheDir = tempDir.appendingPathComponent("SharedCache", isDirectory: true).standardizedFileURL
         try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
 
-        var payload = Data(repeating: 0, count: sizeBytes)
-        let headerBlock = Data((0..<8192).map { UInt8(($0 * 37 + 19) & 0xFF) })
-        let tailBlock = Data((0..<8192).map { UInt8(($0 * 53 + 7) & 0xFF) })
-        payload.replaceSubrange(0..<headerBlock.count, with: headerBlock)
-        payload.replaceSubrange((sizeBytes - tailBlock.count)..<sizeBytes, with: tailBlock)
-
         let stagingSourceURL = tempDir.appendingPathComponent("staging-\(imageID).raw")
-        try payload.write(to: stagingSourceURL)
+        try APFSCoWDiskEngine().createSparseRawDisk(
+            at: stagingSourceURL,
+            virtualSizeBytes: UInt64(sizeBytes),
+            overwrite: true
+        )
+        let partitions = try PartitionAndContainerInspector().writeProtectiveMBRAndGPT(
+            to: stagingSourceURL,
+            partitions: [
+                (
+                    name: "RootExt4",
+                    typeGUID: GPTWellKnownTypeGUID.linuxRootARM64.rawValue,
+                    sizeBytes: UInt64(max(512 * 1024, sizeBytes / 2))
+                )
+            ]
+        )
+        let part0Offset = partitions[0].firstLBA * 512
+        var ext4Super = [UInt8](repeating: 0, count: 256)
+        ext4Super[0x38] = 0x53
+        ext4Super[0x39] = 0xEF
+        ext4Super[0x5C] = 0x04
+        ext4Super[0x60] = 0xC0
+        let stagingHandle = try FileHandle(forUpdating: stagingSourceURL)
+        try stagingHandle.seek(toOffset: part0Offset + 1024)
+        try stagingHandle.write(contentsOf: Data(ext4Super))
+        try stagingHandle.close()
+
+        let payload = try Data(contentsOf: stagingSourceURL)
         let sha512 = try BinaryChecksums.sha512HexFile(at: stagingSourceURL)
 
         let entry = BaseImageCatalogEntry(
@@ -1235,5 +1255,221 @@ struct HypervisorCoordinatorTests {
         let platOther = try #require(vzCfgOtherVM.platform as? VZGenericPlatformConfiguration)
         #expect(platOther.machineIdentifier.dataRepresentation == savedMachineIDData2)
         #expect(platOther.machineIdentifier.dataRepresentation != platFirst.machineIdentifier.dataRepresentation)
+    }
+
+    @Test("createVMFromImage and VZConfigurationTranslator attach VZFileSerialPortAttachment at <workspace>/logs/<vm>.console.log")
+    func vzConfigurationAttachesFileSerialPortForImageCreatedVM() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-vz-serial-log")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let fix = try await makeFakeCuratedImageFixture(in: tempDir)
+        defer { _ = Darwin.chmod(fix.cachedFileURL.path, 0o644) }
+
+        let bundleURL = tempDir.appendingPathComponent("Fleet.agentvm", isDirectory: true)
+        let coordinator = try AgentVMFleetCoordinator(
+            bundleURL: bundleURL,
+            executionBackend: .strictHardwareVZ,
+            imageCacheDirectoryURL: fix.cacheDir,
+            curatedImageEntries: [fix.entry]
+        )
+
+        let created = try await coordinator.createVMFromImage(name: "t1", imageID: fix.entry.id)
+        let expectedConsoleLogURL = coordinator.store.logsDirectoryURL.appendingPathComponent("t1.console.log")
+        #expect(created.vmRecord.spec.serialAndDisplay.serialLogPath == expectedConsoleLogURL.path)
+
+        let translator = VZConfigurationTranslator()
+        let vzConfig = try translator.buildVZConfiguration(from: created.vmRecord.spec, validateConfiguration: false)
+        #expect(vzConfig.serialPorts.count == 1)
+        let isFileSerialAttachment = vzConfig.serialPorts.first?.attachment is VZFileSerialPortAttachment
+        #expect(isFileSerialAttachment)
+    }
+
+    private final class MockHardwareVMBackend: HardwareVMLowLevelBackend, HardwareVMInstanceHandle, @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var capturedNetworkSocketFD: Int32?
+        private(set) var capturedConsoleLogURL: URL?
+        private(set) var capturedSpec: VMSpec?
+        private(set) var connectPorts: [UInt32] = []
+        private(set) var events: [String] = []
+        var failConnectAttemptsBeforeSuccess: Int
+        var alwaysFailConnect: Bool
+        var socketPairHostFD: Int32 = -1
+        var peerFDForClosingCheck: Int32 = -1
+        var peerSawSessionEOFBeforeShutdown: Bool = false
+
+        init(failConnectAttemptsBeforeSuccess: Int = 0, alwaysFailConnect: Bool = false) {
+            self.failConnectAttemptsBeforeSuccess = failConnectAttemptsBeforeSuccess
+            self.alwaysFailConnect = alwaysFailConnect
+        }
+
+        func startMachine(
+            spec: VMSpec,
+            networkSocketFD: Int32?,
+            consoleLogURL: URL,
+            translator: VZConfigurationTranslator
+        ) async throws -> any HardwareVMInstanceHandle {
+            _ = try translator.buildVZConfiguration(
+                from: spec,
+                networkSocketFD: networkSocketFD,
+                serialLogFileURL: consoleLogURL,
+                validateConfiguration: false
+            )
+            lock.withLock {
+                capturedSpec = spec
+                capturedNetworkSocketFD = networkSocketFD
+                capturedConsoleLogURL = consoleLogURL
+                events.append("startMachine")
+            }
+            return self
+        }
+
+        func prematureStopReason() -> String? { nil }
+
+        func connectVsock(port: UInt32) async throws -> HardwareVsockFDDescriptor {
+            let (attemptIndex, alwaysFail, failCount, fd) = lock.withLock {
+                connectPorts.append(port)
+                return (connectPorts.count, alwaysFailConnect, failConnectAttemptsBeforeSuccess, socketPairHostFD)
+            }
+
+            if alwaysFail || attemptIndex <= failCount {
+                throw NSError(domain: "VZErrorDomain", code: 1, userInfo: [NSLocalizedDescriptionKey: "Connection refused on vsock port \(port)"])
+            }
+            return HardwareVsockFDDescriptor(fileDescriptor: fd, closeWhenSessionEnds: false)
+        }
+
+        func closeVsockConnection() async {
+            let fd = lock.withLock { () -> Int32 in
+                events.append("closeVsockConnection")
+                let current = socketPairHostFD
+                socketPairHostFD = -1
+                return current
+            }
+            if fd >= 0 {
+                _ = Darwin.close(fd)
+            }
+        }
+
+        func pause() async throws {}
+        func resume() async throws {}
+        func saveMachineState(to url: URL) async throws {}
+
+        func shutdown(gracefulTimeoutNanoseconds: UInt64) async {
+            let peerFD = lock.withLock { peerFDForClosingCheck }
+            if peerFD >= 0 {
+                var pfd = pollfd(fd: peerFD, events: Int16(POLLIN | POLLHUP), revents: 0)
+                if Darwin.poll(&pfd, 1, 50) > 0 {
+                    var byte: UInt8 = 0
+                    let n = Darwin.read(peerFD, &byte, 1)
+                    if n == 0 || (pfd.revents & Int16(POLLHUP)) != 0 {
+                        lock.withLock {
+                            peerSawSessionEOFBeforeShutdown = true
+                        }
+                    }
+                }
+            }
+            lock.withLock {
+                events.append("shutdown")
+            }
+        }
+    }
+
+    @Test("bootVM in systemNAT mode does not create L2 switch port pairs, retries vsock port 1025, and haltVM closes vsock before VM shutdown")
+    func bootVMHardwarePathSkipsSwitchPortOnSystemNATAndRetriesVsockAndHaltVMOrdersShutdown() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-hw-nat-vsock")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let fix = try await makeFakeCuratedImageFixture(in: tempDir)
+        defer { _ = Darwin.chmod(fix.cachedFileURL.path, 0o644) }
+
+        var fds: [Int32] = [-1, -1]
+        #expect(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+        defer {
+            if fds[1] >= 0 {
+                _ = Darwin.close(fds[1])
+            }
+        }
+
+        let mockBackend = MockHardwareVMBackend(failConnectAttemptsBeforeSuccess: 2)
+        mockBackend.socketPairHostFD = fds[0]
+        mockBackend.peerFDForClosingCheck = fds[1]
+
+        let bundleURL = tempDir.appendingPathComponent("NATBoot.agentvm", isDirectory: true)
+        let coordinator = try AgentVMFleetCoordinator(
+            bundleURL: bundleURL,
+            executionBackend: .strictHardwareVZ,
+            imageCacheDirectoryURL: fix.cacheDir,
+            curatedImageEntries: [fix.entry],
+            hardwareBackendOverride: mockBackend,
+            vsockConnectTimeoutNanoseconds: 5_000_000_000,
+            vsockRetryIntervalNanoseconds: 5_000_000,
+            gracefulStopTimeoutNanoseconds: 50_000_000
+        )
+
+        let created = try await coordinator.createVMFromImage(name: "t1", imageID: fix.entry.id)
+        let booted = try await coordinator.bootVM(created.vmRecord.id)
+
+        // 1. NAT mode must NOT create any UserSpaceL2Switch port socket pair
+        let switchPorts = await coordinator.l2Switch.attachedPorts()
+        #expect(switchPorts.isEmpty)
+        #expect(mockBackend.capturedNetworkSocketFD == nil)
+
+        // 2. Console log URL must point to <workspace>/logs/t1.console.log
+        let expectedLogURL = coordinator.store.logsDirectoryURL.appendingPathComponent("t1.console.log")
+        #expect(mockBackend.capturedConsoleLogURL?.standardizedFileURL == expectedLogURL.standardizedFileURL)
+
+        // 3. Vsock retried port 1025 until attempt 3 succeeded, with zero simulation fallback
+        #expect(mockBackend.connectPorts == [1025, 1025, 1025])
+        #expect(booted.telemetry.state == .running)
+        #expect(booted.telemetry.guestAgentConnected == true)
+        #expect(booted.telemetry.simulated == false)
+
+        // 4. haltVM closes vsock session & connection BEFORE stopping the VM
+        let halted = try await coordinator.haltVM(created.vmRecord.id)
+        #expect(halted.telemetry.state == .stopped)
+        #expect(halted.telemetry.guestAgentConnected == false)
+        #expect(mockBackend.events == ["startMachine", "closeVsockConnection", "shutdown"])
+        #expect(mockBackend.peerSawSessionEOFBeforeShutdown == true)
+    }
+
+    @Test("bootVM stops the VM and returns an error containing the console log path when vsock port 1025 times out")
+    func bootVMHardwarePathShutsDownVMAndIncludesConsoleLogPathWhenVsockTimesOut() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-hw-vsock-timeout")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let fix = try await makeFakeCuratedImageFixture(in: tempDir)
+        defer { _ = Darwin.chmod(fix.cachedFileURL.path, 0o644) }
+
+        let mockBackend = MockHardwareVMBackend(alwaysFailConnect: true)
+        let bundleURL = tempDir.appendingPathComponent("TimeoutBoot.agentvm", isDirectory: true)
+        let coordinator = try AgentVMFleetCoordinator(
+            bundleURL: bundleURL,
+            executionBackend: .strictHardwareVZ,
+            imageCacheDirectoryURL: fix.cacheDir,
+            curatedImageEntries: [fix.entry],
+            hardwareBackendOverride: mockBackend,
+            vsockConnectTimeoutNanoseconds: 20_000_000,
+            vsockRetryIntervalNanoseconds: 5_000_000,
+            gracefulStopTimeoutNanoseconds: 50_000_000
+        )
+
+        let created = try await coordinator.createVMFromImage(name: "t1", imageID: fix.entry.id)
+        let expectedConsolePath = coordinator.store.logsDirectoryURL.appendingPathComponent("t1.console.log").path
+
+        var caughtError: AgentVMError?
+        do {
+            _ = try await coordinator.bootVM(created.vmRecord.id)
+        } catch let err as AgentVMError {
+            caughtError = err
+        }
+
+        let err = try #require(caughtError)
+        #expect(err.errorCode == "ERR_VSOCK_CONNECT_TIMEOUT")
+        #expect(err.localizedMessage(in: .en).contains(expectedConsolePath))
+        #expect(err.localizedMessage(in: .zhHans).contains(expectedConsolePath))
+        #expect(mockBackend.connectPorts.count >= 2)
+        #expect(mockBackend.events == ["startMachine", "closeVsockConnection", "shutdown"])
+
+        let storedAfterTimeout = try #require(try await coordinator.store.fetchVM(created.vmRecord.id))
+        #expect(storedAfterTimeout.telemetry.state == .stopped)
     }
 }

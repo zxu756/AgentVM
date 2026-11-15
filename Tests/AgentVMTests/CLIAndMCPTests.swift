@@ -5,8 +5,10 @@ import AgentVMNetSwitch
 import AgentVMPluginHost
 import AgentVMStorageCoW
 import AgentVMStore
+import AgentVMVsockRPC
 import Darwin
 import Foundation
+import Security
 import Testing
 
 @Suite("M11.7b Headless CLI Runner, MCP JSON-RPC Server & HTML Export", .timeLimit(.minutes(1)))
@@ -1743,6 +1745,455 @@ struct CLIAndMCPTests {
         #expect((statAfter.st_mode & 0o777) == 0o444)
         #expect(statAfter.st_mtimespec.tv_sec == statBefore.st_mtimespec.tv_sec)
         #expect(try Data(contentsOf: cachedURL) == payload)
+    }
+
+    @Test("M1 CLI 'run': argument parsing and CLI subcommand registration")
+    func cliRunArgumentParsingAndEntryPointSubcommandRegistration() async throws {
+        #expect(AgentVMCLIRunner.cliSubcommands.contains("run"))
+
+        let parsedBasic = try AgentVMCLIRunner.parseRunArguments(["t1", "--", "uname", "-r"]).get()
+        #expect(parsedBasic == ParsedRunArguments(
+            vmToken: "t1",
+            verbose: false,
+            executable: "uname",
+            arguments: ["-r"]
+        ))
+
+        let parsedVerboseAfterVM = try AgentVMCLIRunner.parseRunArguments(
+            ["t1", "--verbose", "--", "sh", "-c", "echo out; echo err >&2"]
+        ).get()
+        #expect(parsedVerboseAfterVM == ParsedRunArguments(
+            vmToken: "t1",
+            verbose: true,
+            executable: "sh",
+            arguments: ["-c", "echo out; echo err >&2"]
+        ))
+
+        let parsedVerboseBeforeVM = try AgentVMCLIRunner.parseRunArguments(
+            ["--verbose", "t1", "--", "curl", "-sI", "https://deb.debian.org", "--verbose", "--"]
+        ).get()
+        #expect(parsedVerboseBeforeVM == ParsedRunArguments(
+            vmToken: "t1",
+            verbose: true,
+            executable: "curl",
+            arguments: ["-sI", "https://deb.debian.org", "--verbose", "--"]
+        ))
+
+        let invalidForms: [[String]] = [
+            [],
+            ["t1"],
+            ["--verbose", "t1"],
+            ["--", "uname", "-r"],
+            ["t1", "--"],
+            ["t1", "extra-vm", "--", "uname"],
+            ["t1", "--unknown", "--", "uname"],
+            ["--unknown", "t1", "--", "uname"],
+            ["t1", "uname", "-r"]
+        ]
+        for bad in invalidForms {
+            switch AgentVMCLIRunner.parseRunArguments(bad) {
+            case .success(let unexpected):
+                Issue.record("Expected parseRunArguments(\(bad)) to fail, got \(unexpected)")
+            case .failure:
+                break
+            }
+
+            let tempDir = try makeTempDirectory(prefix: "avm-cli-run-bad")
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let bundleURL = tempDir.appendingPathComponent("BadRun.agentvm", isDirectory: true)
+            let cli = AgentVMCLIRunner()
+            let res = await cli.execute(
+                arguments: ["--lang", "en", "run"] + bad,
+                bundleURLOverride: bundleURL
+            )
+            #expect(
+                res.exitCode == AgentVMCLIRunner.usageErrorExitCode,
+                "Expected exit code 2 for run \(bad), got \(res.exitCode) (stderr: \(res.stderr))"
+            )
+            #expect(res.stdoutData.isEmpty)
+        }
+    }
+
+    @Test("M1 CLI 'run': 1 MiB random binary stdout/stderr passes from fake session to process output unaltered with exact SHA-256, exit codes, and --verbose")
+    func cliRunPreserves1MiBRandomBinaryStdoutStderrExitCodesAndVerboseProgress() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-cli-run-1mib")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let cacheDir = tempDir.appendingPathComponent("shared-images", isDirectory: true)
+        let bundleURL = tempDir.appendingPathComponent("RunFleet.agentvm", isDirectory: true)
+        let env = [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+
+        // Build a bootable GPT + ext4 fake cached base image
+        let imageBytes = 4 * 1024 * 1024
+        let stagingURL = tempDir.appendingPathComponent("staging-run.raw")
+        try APFSCoWDiskEngine().createSparseRawDisk(at: stagingURL, virtualSizeBytes: UInt64(imageBytes), overwrite: true)
+        let parts = try PartitionAndContainerInspector().writeProtectiveMBRAndGPT(
+            to: stagingURL,
+            partitions: [(name: "RootExt4", typeGUID: GPTWellKnownTypeGUID.linuxRootARM64.rawValue, sizeBytes: 2 * 1024 * 1024)]
+        )
+        var ext4Super = [UInt8](repeating: 0, count: 256)
+        ext4Super[0x38] = 0x53
+        ext4Super[0x39] = 0xEF
+        ext4Super[0x5C] = 0x04
+        ext4Super[0x60] = 0xC0
+        let fh = try FileHandle(forUpdating: stagingURL)
+        try fh.seek(toOffset: parts[0].firstLBA * 512 + 1024)
+        try fh.write(contentsOf: Data(ext4Super))
+        try fh.close()
+
+        let sha512 = try BinaryChecksums.sha512HexFile(at: stagingURL)
+        let imageID = "debian-12-bookworm-arm64"
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Test Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian.raw",
+            expectedSHA512: sha512,
+            expectedSizeBytes: UInt64(imageBytes),
+            defaultVirtualSizeBytes: UInt64(imageBytes)
+        )
+        let seeder = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, curatedEntries: [entry], createIfMissing: true)
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedURL.path, 0o444) == 0)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let cli = AgentVMCLIRunner()
+        let createOut = await cli.execute(
+            arguments: ["--lang", "en", "create", "t1", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env
+        )
+        #expect(createOut.exitCode == 0, "stderr: \(createOut.stderr)")
+
+        // Generate 1 MiB (1,048,576 bytes) of random bytes and force invalid UTF-8 byte sequences inside
+        let oneMiBCount = 1_048_576
+        var randomStdoutBytes = [UInt8](repeating: 0, count: oneMiBCount)
+        #expect(SecRandomCopyBytes(kSecRandomDefault, oneMiBCount, &randomStdoutBytes) == errSecSuccess)
+        let nonUTF8Probe: [UInt8] = [0xFF, 0xFE, 0x00, 0x80, 0xC0, 0xAF, 0xF8, 0xFF]
+        for (i, b) in nonUTF8Probe.enumerated() {
+            randomStdoutBytes[i] = b
+            randomStdoutBytes[524_288 + i] = b
+            randomStdoutBytes[oneMiBCount - nonUTF8Probe.count + i] = b
+        }
+        let expectedStdoutData = Data(randomStdoutBytes)
+        let expectedStdoutSHA256 = BinaryChecksums.sha256Hex(expectedStdoutData)
+
+        let binaryStderrBytes = Data([0x00, 0xFF, 0xFE, 0x81, 0x45, 0x52, 0x52, 0x0A])
+        let expectedStderrSHA256 = BinaryChecksums.sha256Hex(binaryStderrBytes)
+
+        // 1. Silent `run` (no --verbose) with 1 MiB binary stdout + binary stderr -> process output matches byte-for-byte
+        let backend1 = FakeVsockResponderHardwareBackend(
+            stdoutPayload: expectedStdoutData,
+            stderrPayload: binaryStderrBytes,
+            exitCode: 0
+        )
+        let forwarder1 = CLIStandardStreamForwarder()
+        let stdoutPipe1 = Pipe()
+        let stderrPipe1 = Pipe()
+
+        let readStdoutTask = Task.detached { () -> Data in
+            stdoutPipe1.fileHandleForReading.readDataToEndOfFile()
+        }
+        let readStderrTask = Task.detached { () -> Data in
+            stderrPipe1.fileHandleForReading.readDataToEndOfFile()
+        }
+
+        let runOut1 = await cli.execute(
+            arguments: ["run", "t1", "--", "cat", "/tmp/random1m.bin"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: backend1,
+            liveStderrHandler: { forwarder1.writeProgress($0, to: stderrPipe1.fileHandleForWriting) }
+        )
+        runOut1.writeProcessOutput(
+            stdoutHandle: stdoutPipe1.fileHandleForWriting,
+            stderrHandle: stderrPipe1.fileHandleForWriting,
+            forwarder: forwarder1
+        )
+        try stdoutPipe1.fileHandleForWriting.close()
+        try stderrPipe1.fileHandleForWriting.close()
+
+        let processStdout1 = await readStdoutTask.value
+        let processStderr1 = await readStderrTask.value
+
+        #expect(runOut1.exitCode == 0)
+        #expect(runOut1.stdoutData.count == oneMiBCount)
+        #expect(BinaryChecksums.sha256Hex(runOut1.stdoutData) == expectedStdoutSHA256)
+        #expect(processStdout1.count == oneMiBCount)
+        #expect(BinaryChecksums.sha256Hex(processStdout1) == expectedStdoutSHA256)
+        #expect(processStderr1 == binaryStderrBytes)
+        #expect(BinaryChecksums.sha256Hex(processStderr1) == expectedStderrSHA256)
+        #expect(backend1.lifecycleEvents == ["startMachine", "connectVsock", "closeVsockConnection", "shutdown"])
+        #expect(backend1.lastCapturedRequest?.executable == "cat")
+        #expect(backend1.lastCapturedRequest?.arguments == ["/tmp/random1m.bin"])
+
+        // Verify VM is back in stopped state after `run`
+        let coordCheck = try AgentVMFleetCoordinator(bundleURL: bundleURL, imageCacheDirectoryURL: cacheDir, curatedImageEntries: [entry])
+        let vmsAfterRun = try await coordCheck.store.listVMs()
+        #expect(vmsAfterRun.first?.telemetry.state == .stopped)
+
+        // 2. Exit code 7 and signal exit code 137 propagate verbatim with zero extra stdout/stderr
+        let backendExit7 = FakeVsockResponderHardwareBackend(stdoutPayload: Data(), stderrPayload: Data(), exitCode: 7)
+        let runExit7 = await cli.execute(
+            arguments: ["run", "t1", "--", "sh", "-c", "exit 7"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: backendExit7
+        )
+        #expect(runExit7.exitCode == 7)
+        #expect(runExit7.stdoutData.isEmpty)
+        #expect(runExit7.stderrData.isEmpty)
+
+        let backendExit137 = FakeVsockResponderHardwareBackend(stdoutPayload: Data(), stderrPayload: Data(), exitCode: 137)
+        let runExit137 = await cli.execute(
+            arguments: ["run", "t1", "--", "sh", "-c", "kill -9 $$"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: backendExit137
+        )
+        #expect(runExit137.exitCode == 137)
+        #expect(runExit137.stdoutData.isEmpty)
+        #expect(runExit137.stderrData.isEmpty)
+
+        // 3. With `--verbose`, progress is written to stderr while stdout remains untouched
+        let backendVerbose = FakeVsockResponderHardwareBackend(
+            stdoutPayload: Data("6.1.0-54-cloud-arm64\n".utf8),
+            stderrPayload: Data(),
+            exitCode: 0
+        )
+        let forwarderVerbose = CLIStandardStreamForwarder()
+        let stdoutPipeV = Pipe()
+        let stderrPipeV = Pipe()
+        let runVerbose = await cli.execute(
+            arguments: ["run", "t1", "--verbose", "--", "uname", "-r"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hardwareBackendOverride: backendVerbose,
+            liveStderrHandler: { forwarderVerbose.writeProgress($0, to: stderrPipeV.fileHandleForWriting) }
+        )
+        runVerbose.writeProcessOutput(
+            stdoutHandle: stdoutPipeV.fileHandleForWriting,
+            stderrHandle: stderrPipeV.fileHandleForWriting,
+            forwarder: forwarderVerbose
+        )
+        try stdoutPipeV.fileHandleForWriting.close()
+        try stderrPipeV.fileHandleForWriting.close()
+        let verboseStdout = stdoutPipeV.fileHandleForReading.readDataToEndOfFile()
+        let verboseStderr = stderrPipeV.fileHandleForReading.readDataToEndOfFile()
+        #expect(runVerbose.exitCode == 0)
+        #expect(verboseStdout == Data("6.1.0-54-cloud-arm64\n".utf8))
+        #expect(!verboseStderr.isEmpty)
+    }
+}
+
+private final class FakeVsockResponderHardwareBackend: HardwareVMLowLevelBackend, HardwareVMInstanceHandle, @unchecked Sendable {
+    private let lock = NSLock()
+    private let stdoutPayload: Data
+    private let stderrPayload: Data
+    private let exitCode: Int32
+    private var hostFD: Int32 = -1
+    private var peerFD: Int32 = -1
+    private var responderTask: Task<Void, Never>?
+
+    private(set) var lifecycleEvents: [String] = []
+    private(set) var lastCapturedRequest: GuestExecRequest?
+
+    init(stdoutPayload: Data, stderrPayload: Data, exitCode: Int32) {
+        self.stdoutPayload = stdoutPayload
+        self.stderrPayload = stderrPayload
+        self.exitCode = exitCode
+    }
+
+    func startMachine(
+        spec: VMSpec,
+        networkSocketFD: Int32?,
+        consoleLogURL: URL,
+        translator: VZConfigurationTranslator
+    ) async throws -> any HardwareVMInstanceHandle {
+        lock.withLock {
+            lifecycleEvents.append("startMachine")
+        }
+        return self
+    }
+
+    func prematureStopReason() -> String? { nil }
+
+    func connectVsock(port: UInt32) async throws -> HardwareVsockFDDescriptor {
+        var fds: [Int32] = [-1, -1]
+        guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
+            throw AgentVMError.vsockProtocolViolation(detail: "socketpair failed")
+        }
+        let hFD = fds[0]
+        let pFD = fds[1]
+        let outData = stdoutPayload
+        let errData = stderrPayload
+        let rc = exitCode
+
+        let task = Task.detached { [weak self] in
+            let codec = VsockWireCodec()
+            let acc = VsockStreamAccumulator(codec: codec)
+            var readBuf = [UInt8](repeating: 0, count: 65_536)
+            var streamBuffers: [UInt32: Data] = [:]
+
+            func writeAll(_ data: Data) -> Bool {
+                data.withUnsafeBytes { rawBuf -> Bool in
+                    guard let base = rawBuf.baseAddress else { return true }
+                    var offset = 0
+                    while offset < rawBuf.count {
+                        let n = Darwin.write(pFD, base.advanced(by: offset), rawBuf.count - offset)
+                        if n > 0 {
+                            offset += n
+                        } else if n < 0 && Darwin.errno == EINTR {
+                            continue
+                        } else {
+                            return false
+                        }
+                    }
+                    return true
+                }
+            }
+
+            outer: while !Task.isCancelled {
+                let n = Darwin.read(pFD, &readBuf, readBuf.count)
+                if n <= 0 { break }
+                let frames: [(header: VsockFrameHeader, payload: Data)]
+                do {
+                    frames = try acc.ingest(Data(readBuf[0..<n]))
+                } catch {
+                    break
+                }
+                for frame in frames where frame.header.channel == .execProcess {
+                    let sid = frame.header.streamID
+                    streamBuffers[sid, default: Data()].append(frame.payload)
+                    guard frame.header.flags.contains(.endOfMessage) else { continue }
+                    let fullReqData = streamBuffers.removeValue(forKey: sid) ?? Data()
+                    guard let req = try? VsockWireJSON.decode(GuestExecRequest.self, from: fullReqData) else {
+                        break outer
+                    }
+                    self?.recordCapturedRequest(req)
+
+                    var seq: UInt32 = 1
+                    let chunkSize = 32_768
+                    var offset = 0
+                    while offset < outData.count {
+                        let end = min(offset + chunkSize, outData.count)
+                        let chunk = GuestExecOutputChunk(
+                            requestID: req.id,
+                            stream: .stdout,
+                            sequence: seq,
+                            data: Data(outData[offset..<end])
+                        )
+                        if let payload = try? VsockWireJSON.encode(chunk),
+                           let wire = try? codec.encodeFrame(
+                               channel: .execProcess,
+                               flags: [.ack],
+                               streamID: sid,
+                               sequence: seq,
+                               payload: payload,
+                               compressIfBeneficial: false
+                           ) {
+                            if !writeAll(wire) { break outer }
+                        }
+                        seq += 1
+                        offset = end
+                    }
+
+                    if !errData.isEmpty {
+                        let errChunk = GuestExecOutputChunk(
+                            requestID: req.id,
+                            stream: .stderr,
+                            sequence: seq,
+                            data: errData
+                        )
+                        if let payload = try? VsockWireJSON.encode(errChunk),
+                           let wire = try? codec.encodeFrame(
+                               channel: .execProcess,
+                               flags: [.ack],
+                               streamID: sid,
+                               sequence: seq,
+                               payload: payload,
+                               compressIfBeneficial: false
+                           ) {
+                            if !writeAll(wire) { break outer }
+                        }
+                        seq += 1
+                    }
+
+                    let completion = VsockExecCompletionEnvelope(
+                        requestID: req.id,
+                        exitCode: rc,
+                        durationMilliseconds: 2,
+                        timedOut: false
+                    )
+                    if let payload = try? VsockWireJSON.encode(completion),
+                       let wire = try? codec.encodeFrame(
+                           channel: .execProcess,
+                           flags: [.fin, .endOfMessage],
+                           streamID: sid,
+                           sequence: seq,
+                           payload: payload,
+                           compressIfBeneficial: false
+                       ) {
+                        _ = writeAll(wire)
+                    }
+                }
+            }
+        }
+
+        lock.withLock {
+            hostFD = hFD
+            peerFD = pFD
+            responderTask = task
+            lifecycleEvents.append("connectVsock")
+        }
+        return HardwareVsockFDDescriptor(fileDescriptor: hFD, closeWhenSessionEnds: false)
+    }
+
+    private func recordCapturedRequest(_ req: GuestExecRequest) {
+        lock.withLock {
+            lastCapturedRequest = req
+        }
+    }
+
+    func closeVsockConnection() async {
+        let (hFD, pFD, task) = lock.withLock { () -> (Int32, Int32, Task<Void, Never>?) in
+            lifecycleEvents.append("closeVsockConnection")
+            let currentHost = hostFD
+            let currentPeer = peerFD
+            let currentTask = responderTask
+            hostFD = -1
+            peerFD = -1
+            responderTask = nil
+            return (currentHost, currentPeer, currentTask)
+        }
+        task?.cancel()
+        if hFD >= 0 { _ = Darwin.close(hFD) }
+        if pFD >= 0 { _ = Darwin.close(pFD) }
+        await task?.value
+    }
+
+    func pause() async throws {}
+    func resume() async throws {}
+    func saveMachineState(to url: URL) async throws {}
+
+    func shutdown(gracefulTimeoutNanoseconds: UInt64) async {
+        lock.withLock {
+            lifecycleEvents.append("shutdown")
+        }
     }
 }
 

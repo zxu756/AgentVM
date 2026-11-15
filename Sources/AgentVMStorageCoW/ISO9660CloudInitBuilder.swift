@@ -384,7 +384,7 @@ public struct ISO9660CloudInitBuilder: Sendable {
         // Users & SSH keys
         lines.append("users:")
         lines.append("  - name: \(Self.yamlScalar(spec.defaultUser))")
-        lines.append("    groups: [sudo, adm, wheel, systemd-journal]")
+        lines.append("    groups: [sudo, adm, systemd-journal]")
         lines.append("    shell: /bin/bash")
         lines.append("    sudo: ALL=(ALL) NOPASSWD:ALL")
         if let hash = spec.passwordHash, !hash.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -400,14 +400,9 @@ public struct ISO9660CloudInitBuilder: Sendable {
             }
         }
 
-        // Packages
-        if !spec.aptPackages.isEmpty {
-            lines.append("package_update: true")
-            lines.append("package_upgrade: false")
-            lines.append("packages:")
-            for pkg in spec.aptPackages {
-                lines.append("  - \(Self.yamlScalar(pkg))")
-            }
+        if spec.injectGuestVsockAgent {
+            lines.append("output:")
+            lines.append("  all: '| tee -a /var/log/cloud-init-output.log /dev/hvc0'")
         }
 
         // Write files (caller-enriched via GuestAgentBootstrapGenerator on port 1025, or explicit custom script)
@@ -503,7 +498,7 @@ public struct ISO9660CloudInitBuilder: Sendable {
             "final_message: \"AgentVM guest \(spec.hostname) (\(spec.instanceID)) ready after $UPTIME seconds\""
         ]
         if spec.injectGuestVsockAgent {
-            lines.insert("kernel_modules: [virtio_pci, virtio_blk, virtio_net, virtio_fs, vmw_vsock_virtio_transport_common]", at: 2)
+            lines.insert("kernel_modules: [virtio_pci, virtio_blk, virtio_net, virtio_fs, virtio_console, vmw_vsock_virtio_transport_common, vmw_vsock_virtio_transport]", at: 2)
         }
         return lines.joined(separator: "\n") + "\n"
     }

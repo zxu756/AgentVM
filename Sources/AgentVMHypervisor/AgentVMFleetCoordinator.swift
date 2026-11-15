@@ -65,6 +65,35 @@ public struct CoWBranchForkResult: Codable, Hashable, Sendable {
     }
 }
 
+public struct HardwareVsockFDDescriptor: Sendable {
+    public var fileDescriptor: Int32
+    public var closeWhenSessionEnds: Bool
+
+    public init(fileDescriptor: Int32, closeWhenSessionEnds: Bool = false) {
+        self.fileDescriptor = fileDescriptor
+        self.closeWhenSessionEnds = closeWhenSessionEnds
+    }
+}
+
+public protocol HardwareVMInstanceHandle: Sendable {
+    func prematureStopReason() -> String?
+    func connectVsock(port: UInt32) async throws -> HardwareVsockFDDescriptor
+    func closeVsockConnection() async
+    func pause() async throws
+    func resume() async throws
+    func saveMachineState(to url: URL) async throws
+    func shutdown(gracefulTimeoutNanoseconds: UInt64) async
+}
+
+public protocol HardwareVMLowLevelBackend: Sendable {
+    func startMachine(
+        spec: VMSpec,
+        networkSocketFD: Int32?,
+        consoleLogURL: URL,
+        translator: VZConfigurationTranslator
+    ) async throws -> any HardwareVMInstanceHandle
+}
+
 public actor AgentVMFleetCoordinator {
     public nonisolated let store: AgentVMProjectStore
     public nonisolated let undoRedo: UndoRedoController
@@ -81,24 +110,305 @@ public actor AgentVMFleetCoordinator {
     public let vzTranslator = VZConfigurationTranslator()
     public let guestBootstrap = GuestAgentBootstrapGenerator()
 
+    private let hardwareBackend: any HardwareVMLowLevelBackend
+    private let vsockConnectTimeoutNanoseconds: UInt64
+    private let vsockRetryIntervalNanoseconds: UInt64
+    private let gracefulStopTimeoutNanoseconds: UInt64
+
     private var executionBackend: HypervisorExecutionBackend
     private var vsockSessions: [VMID: VsockMultiplexSession] = [:]
     private var terminalBuffers: [VMID: VT100ScreenBuffer] = [:]
-    private var hardwareBoxes: [VMID: HardwareVZBox] = [:]
+    private var hardwareBoxes: [VMID: any HardwareVMInstanceHandle] = [:]
     private var bootTimestamps: [VMID: Date] = [:]
 
-    private final class HardwareVZBox: @unchecked Sendable {
+    private final class HardwareVZBox: NSObject, VZVirtualMachineDelegate, HardwareVMInstanceHandle, @unchecked Sendable {
         let queue: DispatchQueue
-        let vm: VZVirtualMachine
-        let serialReadPipe: Pipe
-        let serialWritePipe: Pipe
+        var vm: VZVirtualMachine?
+        var vsockConnection: VZVirtioSocketConnection?
 
-        init(queue: DispatchQueue, vm: VZVirtualMachine, serialReadPipe: Pipe, serialWritePipe: Pipe) {
+        private let stateLock = NSLock()
+        private var stopReasonStorage: String?
+        private var stopWaiters: [UUID: CheckedContinuation<String?, Never>] = [:]
+
+        init(queue: DispatchQueue, vm: VZVirtualMachine? = nil) {
             self.queue = queue
             self.vm = vm
-            self.serialReadPipe = serialReadPipe
-            self.serialWritePipe = serialWritePipe
         }
+
+        func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+            recordStop(reason: "guestDidStop")
+        }
+
+        func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
+            recordStop(reason: "didStopWithError: \(error.localizedDescription)")
+        }
+
+        private func recordStop(reason: String) {
+            let waiters = stateLock.withLock { () -> [CheckedContinuation<String?, Never>] in
+                if stopReasonStorage == nil {
+                    stopReasonStorage = reason
+                }
+                let current = Array(stopWaiters.values)
+                stopWaiters.removeAll()
+                return current
+            }
+            for waiter in waiters {
+                waiter.resume(returning: reason)
+            }
+        }
+
+        func prematureStopReason() -> String? {
+            stateLock.withLock { stopReasonStorage }
+        }
+
+        private func waitForStop(timeoutNanoseconds: UInt64) async -> String? {
+            let waiterID = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+                    let existing = stateLock.withLock { () -> String? in
+                        if let already = stopReasonStorage {
+                            return already
+                        }
+                        stopWaiters[waiterID] = cont
+                        return nil
+                    }
+                    if let existing {
+                        cont.resume(returning: existing)
+                        return
+                    }
+                    if Task.isCancelled {
+                        let removed = stateLock.withLock { stopWaiters.removeValue(forKey: waiterID) }
+                        removed?.resume(returning: nil)
+                        return
+                    }
+                    let clampedNs = Int(min(timeoutNanoseconds, UInt64(Int.max)))
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .nanoseconds(clampedNs)) { [weak self] in
+                        guard let self else { return }
+                        let expired = self.stateLock.withLock { self.stopWaiters.removeValue(forKey: waiterID) }
+                        expired?.resume(returning: nil)
+                    }
+                }
+            } onCancel: { [weak self] in
+                guard let self else { return }
+                let cancelled = self.stateLock.withLock { self.stopWaiters.removeValue(forKey: waiterID) }
+                cancelled?.resume(returning: nil)
+            }
+        }
+
+        func connectVsock(port: UInt32) async throws -> HardwareVsockFDDescriptor {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<HardwareVsockFDDescriptor, Error>) in
+                queue.async {
+                    guard let sockDevice = self.vm?.socketDevices.first as? VZVirtioSocketDevice else {
+                        cont.resume(throwing: AgentVMError.vsockProtocolViolation(
+                            detail: "VZVirtualMachine has no configured VZVirtioSocketDevice."
+                        ))
+                        return
+                    }
+                    sockDevice.connect(toPort: port) { result in
+                        switch result {
+                        case let .success(conn):
+                            self.vsockConnection?.close()
+                            self.vsockConnection = conn
+                            cont.resume(returning: HardwareVsockFDDescriptor(
+                                fileDescriptor: conn.fileDescriptor,
+                                closeWhenSessionEnds: false
+                            ))
+                        case let .failure(err):
+                            cont.resume(throwing: err)
+                        }
+                    }
+                }
+            }
+        }
+
+        func closeVsockConnection() async {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                queue.async {
+                    self.vsockConnection?.close()
+                    self.vsockConnection = nil
+                    cont.resume()
+                }
+            }
+        }
+
+        func pause() async throws {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                queue.async {
+                    guard let machine = self.vm else {
+                        cont.resume()
+                        return
+                    }
+                    machine.pause { result in
+                        switch result {
+                        case .success: cont.resume()
+                        case let .failure(err): cont.resume(throwing: err)
+                        }
+                    }
+                }
+            }
+        }
+
+        func resume() async throws {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                queue.async {
+                    guard let machine = self.vm else {
+                        cont.resume()
+                        return
+                    }
+                    machine.resume { result in
+                        switch result {
+                        case .success: cont.resume()
+                        case let .failure(err): cont.resume(throwing: err)
+                        }
+                    }
+                }
+            }
+        }
+
+        func saveMachineState(to url: URL) async throws {
+            if #available(macOS 14.0, *) {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    queue.async {
+                        guard let machine = self.vm else {
+                            cont.resume()
+                            return
+                        }
+                        machine.saveMachineStateTo(url: url) { err in
+                            if let err {
+                                cont.resume(throwing: err)
+                            } else {
+                                cont.resume()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        func shutdown(gracefulTimeoutNanoseconds: UInt64) async {
+            enum StopStep {
+                case alreadyStopped
+                case requestedGracefulStop
+                case needsHardStop
+            }
+
+            let step: StopStep = await withCheckedContinuation { cont in
+                queue.async {
+                    self.vsockConnection?.close()
+                    self.vsockConnection = nil
+                    guard let machine = self.vm else {
+                        self.recordStop(reason: "no-vm")
+                        cont.resume(returning: .alreadyStopped)
+                        return
+                    }
+                    if machine.state == .stopped {
+                        self.recordStop(reason: "already-stopped")
+                        cont.resume(returning: .alreadyStopped)
+                        return
+                    }
+                    if machine.canRequestStop {
+                        do {
+                            try machine.requestStop()
+                            cont.resume(returning: .requestedGracefulStop)
+                            return
+                        } catch {
+                            // Fall through to hard stop
+                        }
+                    }
+                    cont.resume(returning: .needsHardStop)
+                }
+            }
+
+            var stoppedGracefully = (step == .alreadyStopped)
+            if step == .requestedGracefulStop {
+                if await waitForStop(timeoutNanoseconds: gracefulTimeoutNanoseconds) != nil {
+                    stoppedGracefully = true
+                }
+            }
+
+            if !stoppedGracefully {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    queue.async {
+                        guard let machine = self.vm, machine.state != .stopped, machine.canStop else {
+                            cont.resume()
+                            return
+                        }
+                        machine.stop { _ in
+                            self.recordStop(reason: "hard-stop")
+                            cont.resume()
+                        }
+                    }
+                }
+            }
+
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                queue.async {
+                    self.vm?.delegate = nil
+                    self.vm = nil
+                    cont.resume()
+                }
+            }
+        }
+    }
+
+    private struct DefaultVZHardwareBackend: HardwareVMLowLevelBackend {
+        func startMachine(
+            spec: VMSpec,
+            networkSocketFD: Int32?,
+            consoleLogURL: URL,
+            translator: VZConfigurationTranslator
+        ) async throws -> any HardwareVMInstanceHandle {
+            guard VZVirtualMachine.isSupported else {
+                throw AgentVMError.virtualizationUnsupported(
+                    reason: "VZVirtualMachine.isSupported returned false (this host cannot run Virtualization.framework guests)."
+                )
+            }
+            guard HostHypervisorProbe.currentProcessHasBooleanEntitlement(HostHypervisorProbe.virtualizationEntitlementKey) else {
+                throw AgentVMError.virtualizationEntitlementMissing
+            }
+            let vmQueue = DispatchQueue(label: "io.zxu756.agentvm.vz.\(spec.id.rawValue)")
+            let box = HardwareVZBox(queue: vmQueue)
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                vmQueue.async {
+                    do {
+                        let vzConfig = try translator.buildVZConfiguration(
+                            from: spec,
+                            networkSocketFD: networkSocketFD,
+                            serialLogFileURL: consoleLogURL,
+                            validateConfiguration: true
+                        )
+                        let machine = VZVirtualMachine(configuration: vzConfig, queue: vmQueue)
+                        machine.delegate = box
+                        box.vm = machine
+                        machine.start { result in
+                            switch result {
+                            case .success:
+                                cont.resume()
+                            case let .failure(err):
+                                box.vm?.delegate = nil
+                                box.vm = nil
+                                cont.resume(throwing: AgentVMError.virtualizationUnsupported(
+                                    reason: "VZVirtualMachine.start failed: \(err.localizedDescription)"
+                                ))
+                            }
+                        }
+                    } catch {
+                        box.vm?.delegate = nil
+                        box.vm = nil
+                        cont.resume(throwing: error)
+                    }
+                }
+            }
+            return box
+        }
+    }
+
+    public nonisolated func consoleLogURL(forVMName vmName: String) -> URL {
+        let sanitizedComponent = vmName
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "..", with: "_")
+        let baseName = sanitizedComponent.isEmpty ? "vm" : sanitizedComponent
+        return store.logsDirectoryURL.appendingPathComponent("\(baseName).console.log")
     }
 
     public init(
@@ -106,7 +416,11 @@ public actor AgentVMFleetCoordinator {
         executionBackend: HypervisorExecutionBackend = .strictHardwareVZ,
         imageCacheDirectoryURL: URL? = nil,
         curatedImageEntries: [BaseImageCatalogEntry]? = nil,
-        diskEngine: APFSCoWDiskEngine = APFSCoWDiskEngine()
+        diskEngine: APFSCoWDiskEngine = APFSCoWDiskEngine(),
+        hardwareBackendOverride: (any HardwareVMLowLevelBackend)? = nil,
+        vsockConnectTimeoutNanoseconds: UInt64 = 180_000_000_000,
+        vsockRetryIntervalNanoseconds: UInt64 = 1_000_000_000,
+        gracefulStopTimeoutNanoseconds: UInt64 = 30_000_000_000
     ) throws {
         let createdStore = try AgentVMProjectStore(bundleURL: bundleURL, createIfMissing: true)
         self.store = createdStore
@@ -130,6 +444,10 @@ public actor AgentVMFleetCoordinator {
         )
         self.diskEngine = diskEngine
         self.executionBackend = executionBackend
+        self.hardwareBackend = hardwareBackendOverride ?? DefaultVZHardwareBackend()
+        self.vsockConnectTimeoutNanoseconds = vsockConnectTimeoutNanoseconds
+        self.vsockRetryIntervalNanoseconds = vsockRetryIntervalNanoseconds
+        self.gracefulStopTimeoutNanoseconds = gracefulStopTimeoutNanoseconds
     }
 
     public func hostCapabilities() -> HostCapabilityReport {
@@ -328,6 +646,11 @@ public actor AgentVMFleetCoordinator {
                 )
             ],
             portForwards: portForwards,
+            serialAndDisplay: SerialAndDisplaySpec(
+                enableVirtioSerialConsole: true,
+                serialLogPath: consoleLogURL(forVMName: name).path,
+                enableVirtioGraphics: false
+            ),
             cloudInit: enrichedCloudInit,
             machineIdentifierPath: machineIDURL.path,
             cloudInitISOPath: isoURL.path
@@ -515,6 +838,11 @@ public actor AgentVMFleetCoordinator {
                 )
             ],
             portForwards: portForwards,
+            serialAndDisplay: SerialAndDisplaySpec(
+                enableVirtioSerialConsole: true,
+                serialLogPath: consoleLogURL(forVMName: name).path,
+                enableVirtioGraphics: false
+            ),
             cloudInit: enrichedCloudInit,
             machineIdentifierPath: machineIDURL.path,
             cloudInitISOPath: isoURL.path,
@@ -649,7 +977,10 @@ public actor AgentVMFleetCoordinator {
 
     // MARK: - Boot, Pause, Resume & Halt Lifecycle
 
-    public func bootVM(_ vmID: VMID) async throws -> VMInstanceRecord {
+    public func bootVM(
+        _ vmID: VMID,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> VMInstanceRecord {
         var record = try await loadVMForOperation(vmID)
         if record.telemetry.state == .running {
             if isSimulationBackend && !record.telemetry.simulated {
@@ -712,58 +1043,140 @@ public actor AgentVMFleetCoordinator {
 
         try verifyBootableGuestSystem(for: record.spec)
 
-        guard VZVirtualMachine.isSupported else {
-            throw AgentVMError.virtualizationUnsupported(
-                reason: "VZVirtualMachine.isSupported returned false (this host cannot run Virtualization.framework guests)."
-            )
-        }
-        guard HostHypervisorProbe.currentProcessHasBooleanEntitlement(HostHypervisorProbe.virtualizationEntitlementKey) else {
-            throw AgentVMError.virtualizationEntitlementMissing
+        var vmFD: Int32? = nil
+        if let primaryNIC = record.spec.networkInterfaces.first, primaryNIC.mode == .userSpaceSwitch {
+            let nicMAC = MACAddress(parsing: primaryNIC.macAddress)
+                ?? MACAddress.deterministicGuestMAC(seed: vmID.rawValue)
+            let (createdFD, _) = try await l2Switch.createPortSocketPair(for: vmID, macAddress: nicMAC)
+            vmFD = createdFD
         }
 
-        let nicMAC = record.spec.networkInterfaces.first.flatMap { MACAddress(parsing: $0.macAddress) }
-            ?? MACAddress.deterministicGuestMAC(seed: vmID.rawValue)
-        let (vmFD, _) = try await l2Switch.createPortSocketPair(for: vmID, macAddress: nicMAC)
-        let readPipe = Pipe()
-        let writePipe = Pipe()
-        let specCopy = record.spec
-        let translator = vzTranslator
-        let vmQueue = DispatchQueue(label: "io.zxu756.agentvm.vz.\(vmID.rawValue)")
-        let box: HardwareVZBox
+        let resolvedConsoleLogURL: URL = {
+            if let explicitPath = record.spec.serialAndDisplay.serialLogPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !explicitPath.isEmpty {
+                return URL(fileURLWithPath: explicitPath)
+            }
+            return consoleLogURL(forVMName: record.spec.name)
+        }()
+
+        onProgress?("Booting VM '\(record.spec.name)' via Apple Virtualization.framework (console log: \(resolvedConsoleLogURL.path))...")
+
+        let box: any HardwareVMInstanceHandle
         do {
-            box = try await withCheckedThrowingContinuation { cont in
-                vmQueue.async {
-                    do {
-                        let vzConfig = try translator.buildVZConfiguration(
-                            from: specCopy,
-                            networkSocketFD: vmFD,
-                            serialReadPipe: readPipe,
-                            serialWritePipe: writePipe
-                        )
-                        let machine = VZVirtualMachine(configuration: vzConfig, queue: vmQueue)
-                        machine.start { result in
-                            switch result {
-                            case .success:
-                                cont.resume(returning: HardwareVZBox(
-                                    queue: vmQueue,
-                                    vm: machine,
-                                    serialReadPipe: readPipe,
-                                    serialWritePipe: writePipe
-                                ))
-                            case let .failure(err):
-                                cont.resume(throwing: err)
-                            }
+            box = try await hardwareBackend.startMachine(
+                spec: record.spec,
+                networkSocketFD: vmFD,
+                consoleLogURL: resolvedConsoleLogURL,
+                translator: vzTranslator
+            )
+        } catch {
+            if vmFD != nil {
+                await l2Switch.detachPort(for: vmID)
+            }
+            throw error
+        }
+
+        let guestPort = VsockWireConstants.defaultGuestVsockPort
+        onProgress?("Waiting for guest agent on vsock port \(guestPort)...")
+
+        let connectStartNs = DispatchTime.now().uptimeNanoseconds
+        let deadlineNs = connectStartNs &+ vsockConnectTimeoutNanoseconds
+        var connectedDescriptor: HardwareVsockFDDescriptor?
+        var lastConnectErrorDetail = "no connection attempt completed"
+        var attempt = 0
+
+        do {
+            while true {
+                if let stopReason = box.prematureStopReason() {
+                    lastConnectErrorDetail = "VM stopped before vsock connected (\(stopReason))"
+                    break
+                }
+                attempt += 1
+                do {
+                    let desc = try await box.connectVsock(port: guestPort)
+                    connectedDescriptor = desc
+                    break
+                } catch {
+                    lastConnectErrorDetail = error.localizedDescription
+                }
+
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                if nowNs >= deadlineNs {
+                    break
+                }
+                let remainingNs = deadlineNs - nowNs
+                let sleepNs = min(vsockRetryIntervalNanoseconds, remainingNs)
+                if sleepNs > 0 {
+                    try await Task.sleep(nanoseconds: sleepNs)
+                }
+                if DispatchTime.now().uptimeNanoseconds >= deadlineNs {
+                    if let stopReason = box.prematureStopReason() {
+                        lastConnectErrorDetail = "VM stopped before vsock connected (\(stopReason))"
+                    } else {
+                        attempt += 1
+                        if let desc = try? await box.connectVsock(port: guestPort) {
+                            connectedDescriptor = desc
                         }
-                    } catch {
-                        cont.resume(throwing: error)
                     }
+                    break
                 }
             }
         } catch {
-            await l2Switch.detachPort(for: vmID)
+            await box.closeVsockConnection()
+            await box.shutdown(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
+            if vmFD != nil {
+                await l2Switch.detachPort(for: vmID)
+            }
             throw error
         }
+
+        guard let connectedDescriptor, connectedDescriptor.fileDescriptor >= 0 else {
+            await box.closeVsockConnection()
+            await box.shutdown(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
+            if vmFD != nil {
+                await l2Switch.detachPort(for: vmID)
+            }
+            record.telemetry.state = .stopped
+            record.telemetry.guestAgentConnected = false
+            record.telemetry.vsockStreamsOpen = 0
+            stampRuntimeOrigin(&record)
+            try? await store.upsertVM(record)
+
+            let timeoutSec = max(1, Int(vsockConnectTimeoutNanoseconds / 1_000_000_000))
+            throw AgentVMError.guestVsockConnectTimedOut(
+                vmName: record.spec.name,
+                port: guestPort,
+                timeoutSeconds: timeoutSec,
+                consoleLogPath: resolvedConsoleLogURL.path,
+                detail: lastConnectErrorDetail
+            )
+        }
+
+        let session = VsockMultiplexSession(vmID: vmID)
+        do {
+            try await session.attachPOSIXFileDescriptor(
+                connectedDescriptor.fileDescriptor,
+                closeWhenDone: connectedDescriptor.closeWhenSessionEnds
+            )
+        } catch {
+            await session.shutdown()
+            await box.closeVsockConnection()
+            await box.shutdown(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
+            if vmFD != nil {
+                await l2Switch.detachPort(for: vmID)
+            }
+            throw error
+        }
+
+        await session.attachTerminalScreenBuffer(tty)
         hardwareBoxes[vmID] = box
+        vsockSessions[vmID] = session
+
+        for rule in record.spec.portForwards where rule.enabled {
+            _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
+        }
+
+        onProgress?("Guest agent connected on vsock port \(guestPort) (attempt \(attempt)).")
         tty.feed("[VZBoot] Started Apple Virtualization.framework guest '\(record.spec.name)'.\r\n")
 
         bootTimestamps[vmID] = Date()
@@ -772,8 +1185,8 @@ public actor AgentVMFleetCoordinator {
         record.telemetry.cpuUsagePercent = 0.0
         record.telemetry.memoryResidentMB = 0
         record.telemetry.hasLiveGuestTelemetry = false
-        record.telemetry.guestAgentConnected = false
-        record.telemetry.vsockStreamsOpen = 0
+        record.telemetry.guestAgentConnected = true
+        record.telemetry.vsockStreamsOpen = await session.openStreamCount()
         stampRuntimeOrigin(&record)
         try await store.upsertVM(record)
 
@@ -782,7 +1195,7 @@ public actor AgentVMFleetCoordinator {
             subsystem: "Hypervisor",
             vmID: vmID,
             code: "VM_BOOTED",
-            message: "Booted VM '\(record.spec.name)' via Virtualization.framework."
+            message: "Booted VM '\(record.spec.name)' via Virtualization.framework and connected vsock port \(guestPort)."
         ))
 
         return record
@@ -841,13 +1254,7 @@ public actor AgentVMFleetCoordinator {
         }
 
         if let box = hardwareBoxes[vmID] {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                box.queue.async {
-                    box.vm.pause { result in
-                        cont.resume(with: result)
-                    }
-                }
-            }
+            try await box.pause()
         }
 
         record.telemetry.state = .paused
@@ -875,13 +1282,7 @@ public actor AgentVMFleetCoordinator {
         }
 
         if let box = hardwareBoxes[vmID] {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                box.queue.async {
-                    box.vm.resume { result in
-                        cont.resume(with: result)
-                    }
-                }
-            }
+            try await box.resume()
         }
 
         record.telemetry.state = .running
@@ -890,27 +1291,22 @@ public actor AgentVMFleetCoordinator {
         return record
     }
 
-    public func haltVM(_ vmID: VMID) async throws -> VMInstanceRecord {
+    public func haltVM(
+        _ vmID: VMID,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> VMInstanceRecord {
         guard var record = try await store.fetchVM(vmID) else {
             throw AgentVMError.vmNotFound(vmID)
         }
-        if let box = hardwareBoxes.removeValue(forKey: vmID) {
-            _ = try? await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                box.queue.async {
-                    if box.vm.canStop {
-                        box.vm.stop { err in
-                            if let err { cont.resume(throwing: err) } else { cont.resume(returning: ()) }
-                        }
-                    } else {
-                        cont.resume(returning: ())
-                    }
-                }
-            }
-        }
+        await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
             await session.shutdown()
         }
-        await portForwardManager.stopAllRules(for: vmID)
+        if let box = hardwareBoxes.removeValue(forKey: vmID) {
+            onProgress?("Shutting down VM '\(record.spec.name)'...")
+            await box.closeVsockConnection()
+            await box.shutdown(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
+        }
         await l2Switch.detachPort(for: vmID)
         bootTimestamps.removeValue(forKey: vmID)
 
@@ -962,13 +1358,7 @@ public actor AgentVMFleetCoordinator {
         if kind == .liveMemoryAndDisk && record.telemetry.state == .running {
             let stateFileURL = store.snapshotsDirectoryURL.appendingPathComponent("\(vmID.rawValue)-\(snapID.rawValue).vzstate")
             if #available(macOS 14.0, *), let box = hardwareBoxes[vmID] {
-                try? await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    box.queue.async {
-                        box.vm.saveMachineStateTo(url: stateFileURL) { err in
-                            if let err { cont.resume(throwing: err) } else { cont.resume(returning: ()) }
-                        }
-                    }
-                }
+                try? await box.saveMachineState(to: stateFileURL)
             }
             // The simulation backend has no guest RAM. It records a disk-only snapshot and writes no
             // placeholder memory-state file, so nothing simulated ends up in the snapshot lineage.
@@ -1106,6 +1496,9 @@ public actor AgentVMFleetCoordinator {
         }
         // Reassign port forwards to avoid host port collision
         childSpec.portForwards = []
+        if childSpec.serialAndDisplay.serialLogPath != nil {
+            childSpec.serialAndDisplay.serialLogPath = consoleLogURL(forVMName: branchName).path
+        }
 
         let childSnapDiskURL = store.snapshotsDirectoryURL.appendingPathComponent("\(childID.rawValue)-head.raw")
         try diskEngine.cloneDiskCoW(from: childDiskURL, to: childSnapDiskURL, overwrite: true)
@@ -1266,6 +1659,39 @@ public actor AgentVMFleetCoordinator {
         }
         try await store.appendExecResult(ledgerEntry)
         return execResult
+    }
+
+    /// Executes a single guest command in a complete in-process boot -> vsock connect -> exec -> halt lifecycle (`agentvm run`).
+    /// Preserves raw `stdoutData` and `stderrData` byte-for-byte without UTF-8 string conversion.
+    public func runOneShotCommand(
+        vmID: VMID,
+        request: GuestExecRequest,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> GuestExecResult {
+        let bootedRecord = try await bootVM(vmID, onProgress: onProgress)
+        do {
+            guard let session = vsockSessions[vmID] else {
+                throw AgentVMError.guestAgentNotConnected(
+                    vmName: bootedRecord.spec.name,
+                    state: bootedRecord.telemetry.state.rawValue
+                )
+            }
+            onProgress?("Executing command in '\(bootedRecord.spec.name)': \(request.commandLineSummary)")
+            let execResult = try await session.executeCommand(request)
+
+            var ledgerEntry = execResult
+            if isSimulationBackend {
+                ledgerEntry.commandLine = "[SIMULATED] \(execResult.commandLine)"
+            }
+            try? await store.appendExecResult(ledgerEntry)
+
+            _ = try await haltVM(vmID, onProgress: onProgress)
+            onProgress?("VM '\(bootedRecord.spec.name)' stopped.")
+            return execResult
+        } catch {
+            _ = try? await haltVM(vmID, onProgress: onProgress)
+            throw error
+        }
     }
 
     public func processOutboundGuestFrame(

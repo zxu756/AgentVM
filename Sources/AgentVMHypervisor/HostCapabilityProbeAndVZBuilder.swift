@@ -119,6 +119,7 @@ public struct VZConfigurationTranslator: Sendable {
         networkSocketFD: Int32? = nil,
         serialReadPipe: Pipe? = nil,
         serialWritePipe: Pipe? = nil,
+        serialLogFileURL: URL? = nil,
         validateConfiguration: Bool = true
     ) throws -> VZVirtualMachineConfiguration {
         let caps = HostHypervisorProbe.probeCapabilities()
@@ -360,15 +361,33 @@ public struct VZConfigurationTranslator: Sendable {
         }
 
         // Serial Console
-        if spec.serialAndDisplay.enableVirtioSerialConsole,
-           let readPipe = serialReadPipe,
-           let writePipe = serialWritePipe {
-            let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
-            serialPort.attachment = VZFileHandleSerialPortAttachment(
-                fileHandleForReading: readPipe.fileHandleForReading,
-                fileHandleForWriting: writePipe.fileHandleForWriting
-            )
-            config.serialPorts = [serialPort]
+        if spec.serialAndDisplay.enableVirtioSerialConsole {
+            if let logURL = serialLogFileURL {
+                try FileManager.default.createDirectory(
+                    at: logURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+                serialPort.attachment = try VZFileSerialPortAttachment(url: logURL, append: true)
+                config.serialPorts = [serialPort]
+            } else if let readPipe = serialReadPipe, let writePipe = serialWritePipe {
+                let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+                serialPort.attachment = VZFileHandleSerialPortAttachment(
+                    fileHandleForReading: readPipe.fileHandleForReading,
+                    fileHandleForWriting: writePipe.fileHandleForWriting
+                )
+                config.serialPorts = [serialPort]
+            } else if let rawLogPath = spec.serialAndDisplay.serialLogPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !rawLogPath.isEmpty {
+                let logURL = URL(fileURLWithPath: rawLogPath)
+                try FileManager.default.createDirectory(
+                    at: logURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let serialPort = VZVirtioConsoleDeviceSerialPortConfiguration()
+                serialPort.attachment = try VZFileSerialPortAttachment(url: logURL, append: true)
+                config.serialPorts = [serialPort]
+            }
         }
 
         // Optional Virtio Graphics Display

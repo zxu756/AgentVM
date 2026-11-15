@@ -10,20 +10,161 @@ import Foundation
 
 // MARK: - Complete Headless Multi-Subcommand CLI Engine (`agentvm <subcommand>`)
 
+public final class CLIStandardStreamForwarder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var forwardedBytes = Data()
+
+    public init() {}
+
+    public func writeProgress(_ chunk: String, to stderrHandle: FileHandle = .standardError) {
+        guard !chunk.isEmpty else { return }
+        let chunkData = Data(chunk.utf8)
+        lock.withLock {
+            forwardedBytes.append(chunkData)
+        }
+        stderrHandle.write(chunkData)
+    }
+
+    public func unforwardedSuffix(of fullStderrData: Data) -> Data {
+        let prefix = lock.withLock { forwardedBytes }
+        guard !prefix.isEmpty,
+              fullStderrData.count >= prefix.count,
+              fullStderrData.prefix(prefix.count) == prefix else {
+            return fullStderrData
+        }
+        return Data(fullStderrData.dropFirst(prefix.count))
+    }
+}
+
 public struct CLIExecutionOutcome: Codable, Hashable, Sendable {
     public var exitCode: Int32
-    public var stdout: String
-    public var stderr: String
+    public var stdoutData: Data
+    public var stderrData: Data
+
+    public var stdout: String {
+        get { String(decoding: stdoutData, as: UTF8.self) }
+        set { stdoutData = Data(newValue.utf8) }
+    }
+
+    public var stderr: String {
+        get { String(decoding: stderrData, as: UTF8.self) }
+        set { stderrData = Data(newValue.utf8) }
+    }
+
+    public init(exitCode: Int32, stdoutData: Data, stderrData: Data = Data()) {
+        self.exitCode = exitCode
+        self.stdoutData = stdoutData
+        self.stderrData = stderrData
+    }
 
     public init(exitCode: Int32, stdout: String = "", stderr: String = "") {
         self.exitCode = exitCode
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdoutData = Data(stdout.utf8)
+        self.stderrData = Data(stderr.utf8)
+    }
+
+    public func writeProcessOutput(
+        stdoutHandle: FileHandle = .standardOutput,
+        stderrHandle: FileHandle = .standardError,
+        forwarder: CLIStandardStreamForwarder? = nil
+    ) {
+        if !stdoutData.isEmpty {
+            stdoutHandle.write(stdoutData)
+        }
+        let remaining = forwarder?.unforwardedSuffix(of: stderrData) ?? stderrData
+        if !remaining.isEmpty {
+            stderrHandle.write(remaining)
+        }
+    }
+}
+
+public struct ParsedRunArguments: Equatable, Sendable {
+    public var vmToken: String
+    public var verbose: Bool
+    public var executable: String
+    public var arguments: [String]
+
+    public init(vmToken: String, verbose: Bool, executable: String, arguments: [String]) {
+        self.vmToken = vmToken
+        self.verbose = verbose
+        self.executable = executable
+        self.arguments = arguments
     }
 }
 
 public struct AgentVMCLIRunner: Sendable {
+    public static let cliSubcommands: Set<String> = [
+        "doctor", "init", "ps", "list", "image", "create", "run",
+        "up", "boot", "start", "pause", "resume", "halt", "stop",
+        "branch", "fork", "snapshot", "restore",
+        "exec", "pcap", "policy", "plugin",
+        "export-hcl", "export-html",
+        "help", "--help", "-h", "version", "--version", "-v"
+    ]
+
     public init() {}
+
+    public static func parseRunArguments(
+        _ arguments: [String],
+        language: AppLanguage = .en
+    ) -> Result<ParsedRunArguments, SubcommandUsageError> {
+        let isZh = (language == .zhHans)
+        let usageMsg = isZh
+            ? "用法：agentvm run <vm> [--verbose] -- <命令> [参数...]。运行 'agentvm help' 查看用法。"
+            : "Usage: agentvm run <vm> [--verbose] -- <command> [args...]. Run 'agentvm help' for usage."
+
+        guard let separatorIndex = arguments.firstIndex(of: "--") else {
+            return .failure(SubcommandUsageError(message: usageMsg))
+        }
+
+        let beforeSeparator = arguments[..<separatorIndex]
+        let afterSeparator = Array(arguments[(separatorIndex + 1)...])
+
+        var verbose = false
+        var vmToken: String?
+        for token in beforeSeparator {
+            if token == "--verbose" {
+                verbose = true
+            } else if token.hasPrefix("-") && token != "-" {
+                let err = isZh
+                    ? "子命令「run」不认识选项「\(token)」。运行 'agentvm help' 查看用法。"
+                    : "Unknown option '\(token)' for 'run'. Run 'agentvm help' for usage."
+                return .failure(SubcommandUsageError(message: err))
+            } else if vmToken == nil {
+                let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    return .failure(SubcommandUsageError(message: usageMsg))
+                }
+                vmToken = trimmed
+            } else {
+                let err = isZh
+                    ? "子命令「run」在「--」之前不接受多余的参数「\(token)」。运行 'agentvm help' 查看用法。"
+                    : "Unexpected argument '\(token)' before '--' for 'run'. Run 'agentvm help' for usage."
+                return .failure(SubcommandUsageError(message: err))
+            }
+        }
+
+        guard let resolvedVM = vmToken else {
+            let err = isZh
+                ? "子命令「run」缺少 <vm> 参数。\(usageMsg)"
+                : "Missing <vm> argument for 'run'. \(usageMsg)"
+            return .failure(SubcommandUsageError(message: err))
+        }
+
+        guard let executable = afterSeparator.first, !executable.isEmpty else {
+            let err = isZh
+                ? "子命令「run」在「--」之后缺少要执行的 <命令>。\(usageMsg)"
+                : "Missing <command> after '--' for 'run'. \(usageMsg)"
+            return .failure(SubcommandUsageError(message: err))
+        }
+
+        return .success(ParsedRunArguments(
+            vmToken: resolvedVM,
+            verbose: verbose,
+            executable: executable,
+            arguments: Array(afterSeparator.dropFirst())
+        ))
+    }
 
     public static func defaultWorkspaceBundleURL(
         environment: [String: String] = ProcessInfo.processInfo.environment
@@ -47,6 +188,7 @@ public struct AgentVMCLIRunner: Sendable {
         urlSessionConfiguration: URLSessionConfiguration? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         diskEngineOverride: APFSCoWDiskEngine? = nil,
+        hardwareBackendOverride: (any HardwareVMLowLevelBackend)? = nil,
         liveStderrHandler: (@Sendable (String) -> Void)? = nil
     ) async -> CLIExecutionOutcome {
         let language: AppLanguage
@@ -198,6 +340,19 @@ public struct AgentVMCLIRunner: Sendable {
                 )
             }
         }
+        var parsedRun: ParsedRunArguments?
+        if subcommand == "run" {
+            switch Self.parseRunArguments(rest, language: language) {
+            case let .success(value):
+                parsedRun = value
+            case let .failure(usage):
+                let rawStderr = usage.message + "\n"
+                return CLIExecutionOutcome(
+                    exitCode: Self.usageErrorExitCode,
+                    stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                )
+            }
+        }
 
         let streamedProgressStderr = StreamedStderrCollector()
         let resolvedCacheURL = (
@@ -269,7 +424,8 @@ public struct AgentVMCLIRunner: Sendable {
                 executionBackend: executionBackend,
                 imageCacheDirectoryURL: resolvedCacheURL,
                 curatedImageEntries: curatedEntriesOverride,
-                diskEngine: diskEngineOverride ?? APFSCoWDiskEngine()
+                diskEngine: diskEngineOverride ?? APFSCoWDiskEngine(),
+                hardwareBackendOverride: hardwareBackendOverride
             )
 
             switch subcommand {
@@ -286,6 +442,16 @@ public struct AgentVMCLIRunner: Sendable {
                     coordinator: coordinator,
                     parsed: parsed,
                     language: language,
+                    progressStderrCollector: streamedProgressStderr,
+                    liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
+                )
+            case "run":
+                guard let parsedRun else {
+                    return CLIExecutionOutcome(exitCode: Self.usageErrorExitCode)
+                }
+                rawOutcome = try await runOneShot(
+                    coordinator: coordinator,
+                    parsedRun: parsedRun,
                     progressStderrCollector: streamedProgressStderr,
                     liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
                 )
@@ -724,8 +890,56 @@ public struct AgentVMCLIRunner: Sendable {
         )
         return CLIExecutionOutcome(
             exitCode: result.exitCode,
-            stdout: result.stdoutUTF8,
-            stderr: result.stderrUTF8
+            stdoutData: result.stdoutData,
+            stderrData: result.stderrData
+        )
+    }
+
+    private func runOneShot(
+        coordinator: AgentVMFleetCoordinator,
+        parsedRun: ParsedRunArguments,
+        progressStderrCollector: StreamedStderrCollector,
+        liveStderrHandler: (@Sendable (String) -> Void)?
+    ) async throws -> CLIExecutionOutcome {
+        let vmID = try await resolveVMID(parsedRun.vmToken, coordinator: coordinator)
+        let request = GuestExecRequest(
+            executable: parsedRun.executable,
+            arguments: parsedRun.arguments,
+            workingDirectory: "/",
+            runAsUser: "root",
+            timeoutSeconds: 3600
+        )
+        let progressCallback: (@Sendable (String) -> Void)?
+        if parsedRun.verbose {
+            progressCallback = { message in
+                progressStderrCollector.emit("[agentvm run] \(message)\n", liveHandler: liveStderrHandler)
+            }
+        } else {
+            progressCallback = nil
+        }
+
+        let execResult = try await coordinator.runOneShotCommand(
+            vmID: vmID,
+            request: request,
+            onProgress: progressCallback
+        )
+
+        let stderrData: Data
+        if parsedRun.verbose {
+            let prefixBytes = Data(progressStderrCollector.snapshot().utf8)
+            var combined = Data()
+            combined.reserveCapacity(prefixBytes.count + execResult.stderrData.count)
+            combined.append(prefixBytes)
+            combined.append(execResult.stderrData)
+            stderrData = combined
+        } else {
+            stderrData = execResult.stderrData
+        }
+
+        return CLIExecutionOutcome(
+            exitCode: execResult.exitCode,
+            stdoutData: execResult.stdoutData,
+            stderrData: stderrData
         )
     }
 
@@ -1269,8 +1483,12 @@ public struct AgentVMCLIRunner: Sendable {
         var options: [String: String] = [:]
     }
 
-    struct SubcommandUsageError: Error, Sendable {
-        var message: String
+    public struct SubcommandUsageError: Error, Sendable {
+        public var message: String
+
+        public init(message: String) {
+            self.message = message
+        }
     }
 
     static let subcommandGrammars: [String: SubcommandGrammar] = {
@@ -1297,6 +1515,7 @@ public struct AgentVMCLIRunner: Sendable {
             "branch": branch, "fork": branch,
             "snapshot": SubcommandGrammar(valueOptions: ["--title"], maxPositionals: 2),
             "restore": SubcommandGrammar(maxPositionals: 1),
+            "run": SubcommandGrammar(maxPositionals: nil),
             "exec": SubcommandGrammar(maxPositionals: nil),
             "pcap": SubcommandGrammar(valueOptions: ["--filter", "--export"]),
             "policy": SubcommandGrammar(maxPositionals: 1, allowedFirstPositional: ["strict", "airgap"]),
@@ -1514,6 +1733,8 @@ public struct AgentVMCLIRunner: Sendable {
               branch <源虚拟机> <新分支名>    基于 APFS clonefile(2) 派生写时复制磁盘与快照分支
               snapshot [list | <vm> <标题>]   列出或捕获 CoW 磁盘快照检查点
               restore <快照ID>                将虚拟机磁盘回滚至指定快照节点
+              run <vm> [--verbose] -- <命令> [参数...]
+                                              单进程无界面启动真机、等待 vsock 守护进程、执行命令并关机（原始字节流直通）
               exec <vm> -- <命令> [参数...]   在已连接客户机代理的虚拟机中执行命令（或配合 --backend simulation 演练协议栈）
               pcap [--filter <表达式>] [--export <文件.pcapng>]
               policy [strict | airgap]        查看或选择工作区的防火墙规则预设（选择会保存到工作区；M5 之前不作用于任何客户机流量）
@@ -1552,6 +1773,8 @@ public struct AgentVMCLIRunner: Sendable {
           branch <src-vm> <branch-name>   Fork an APFS clonefile(2) Copy-on-Write disk & snapshot branch
           snapshot [list | <vm> <title>]  List or capture CoW disk snapshot checkpoints
           restore <snapshot-id>           Roll back VM disk & topology to a snapshot node
+          run <vm> [--verbose] -- <cmd> [args...]
+                                          Boot VM headlessly, wait for vsock guest daemon, execute command & shut down (byte-exact I/O)
           exec <vm> -- <cmd> [args...]    Execute command over AVM1 VirtioSocket (requires live guest agent or --backend simulation)
           pcap [--filter <expr>] [--export <file.pcapng>]
           policy [strict | airgap]        Inspect or select the workspace firewall preset (saved to the workspace; not enforced on guest traffic before M5)

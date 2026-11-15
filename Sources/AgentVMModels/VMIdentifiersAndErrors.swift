@@ -301,6 +301,13 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case diskSizeTooSmallForImage(imageID: String, requestedBytes: UInt64, imageBytes: UInt64)
     case vmNameAlreadyExists(name: String, existingID: VMID)
     case guestAgentNotConnected(vmName: String, state: String)
+    case guestVsockConnectTimedOut(
+        vmName: String,
+        port: UInt32,
+        timeoutSeconds: Int,
+        consoleLogPath: String,
+        detail: String
+    )
     case invalidConfiguration(issues: [ValidationIssue])
     case vmNotFound(VMID)
     case snapshotNotFound(SnapshotID)
@@ -346,6 +353,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .diskSizeTooSmallForImage: return "ERR_DISK_SIZE_TOO_SMALL"
         case .vmNameAlreadyExists: return "ERR_VM_NAME_EXISTS"
         case .guestAgentNotConnected: return "ERR_GUEST_AGENT_UNAVAILABLE"
+        case .guestVsockConnectTimedOut: return "ERR_VSOCK_CONNECT_TIMEOUT"
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
         case .vmNotFound: return "ERR_VM_NOT_FOUND"
         case .snapshotNotFound: return "ERR_SNAPSHOT_NOT_FOUND"
@@ -446,6 +454,10 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "虚拟机「\(vmName)」当前状态为 \(state)，尚未连接真实客户机代理（agentvm-guestd），无法执行客户机命令。"
                 : "VM '\(vmName)' is in state '\(state)' with no live guest agent connection; cannot execute guest command."
+        case let .guestVsockConnectTimedOut(vmName, port, timeoutSeconds, consoleLogPath, detail):
+            return isZh
+                ? "虚拟机「\(vmName)」已启动，但在 \(timeoutSeconds) 秒内未能连上客户机 vsock 端口 \(port)（\(detail)），已停止虚拟机。串口日志：\(consoleLogPath)"
+                : "VM '\(vmName)' started, but failed to connect to guest vsock port \(port) within \(timeoutSeconds)s (\(detail)); the VM has been stopped. Serial console log: \(consoleLogPath)"
         case let .invalidConfiguration(issues):
             let summary = issues.map { "\($0.fieldPath): \($0.message)" }.joined(separator: "; ")
             return isZh

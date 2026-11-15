@@ -615,14 +615,131 @@ struct VsockRPCAndTerminalTests {
 
         #expect(once.writeFiles.count == 3)
         #expect(twice.writeFiles.count == 3)
-        #expect(once.runCommands.count == 4)
-        #expect(twice.runCommands.count == 4)
-        #expect(twice.aptPackages.contains("python3"))
+        #expect(once.runCommands == twice.runCommands)
+        #expect(once.runCommands.contains { $0.contains("serial-getty@hvc0.service") })
+        #expect(!once.aptPackages.contains("python3"))
+        #expect(!twice.aptPackages.contains("python3"))
 
         // When injectGuestVsockAgent == false, applying(to:) leaves CloudInitSpec untouched
         let optOut = CloudInitSpec(hostname: "minimal", aptPackages: ["curl"], injectGuestVsockAgent: false)
         let untouched = generator.applying(to: optOut)
         #expect(untouched.writeFiles.isEmpty)
         #expect(untouched.runCommands.isEmpty)
+    }
+
+    @Test("Generated Python guest daemon converts signal-killed child exit codes (-N) to 128 + N")
+    func guestDaemonScriptConvertsSignalExitCodeTo128PlusSignalNumber() async throws {
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-py-daemon")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let daemonModuleURL = tempDir.appendingPathComponent("agentvm_guestd.py")
+        try GuestAgentBootstrapGenerator().pythonDaemonScript().write(
+            to: daemonModuleURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let sockPath = "/tmp/avm-py-\(UUID().uuidString.prefix(8)).sock"
+        _ = Darwin.unlink(sockPath)
+        defer { _ = Darwin.unlink(sockPath) }
+
+        let serverFD = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        #expect(serverFD >= 0)
+        defer {
+            if serverFD >= 0 {
+                _ = Darwin.close(serverFD)
+            }
+        }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathUTF8 = Array(sockPath.utf8CString)
+        #expect(pathUTF8.count <= MemoryLayout.size(ofValue: addr.sun_path))
+        withUnsafeMutableBytes(of: &addr.sun_path) { rawBuf in
+            for (idx, ch) in pathUTF8.enumerated() {
+                rawBuf[idx] = UInt8(bitPattern: ch)
+            }
+        }
+        let bindRes = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                Darwin.bind(serverFD, saPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        #expect(bindRes == 0)
+        #expect(Darwin.listen(serverFD, 2) == 0)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = [
+            "-u",
+            "-c",
+            """
+            import socket, sys
+            sys.path.insert(0, sys.argv[1])
+            import agentvm_guestd
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(sys.argv[2])
+            session = agentvm_guestd.GuestVsockConnectionSession(
+                conn=sock,
+                heartbeat_interval=60,
+                default_workspace=sys.argv[1],
+            )
+            session.run()
+            """,
+            tempDir.path,
+            sockPath
+        ]
+        try proc.run()
+        defer {
+            if proc.isRunning {
+                proc.terminate()
+                proc.waitUntilExit()
+            }
+        }
+
+        let clientFD = Darwin.accept(serverFD, nil, nil)
+        #expect(clientFD >= 0)
+
+        let session = VsockMultiplexSession(vmID: VMID("py-daemon-signal-test"))
+        try await session.attachPOSIXFileDescriptor(clientFD, closeWhenDone: true)
+        defer {
+            Task { await session.shutdown() }
+        }
+
+        let normalRes = try await session.executeCommand(GuestExecRequest(
+            executable: "/bin/sh",
+            arguments: ["-c", "exit 7"],
+            workingDirectory: tempDir.path,
+            runAsUser: "root"
+        ))
+        #expect(normalRes.exitCode == 7)
+
+        let sigkillRes = try await session.executeCommand(GuestExecRequest(
+            executable: "/bin/sh",
+            arguments: ["-c", "kill -9 $$"],
+            workingDirectory: tempDir.path,
+            runAsUser: "root"
+        ))
+        #expect(sigkillRes.exitCode == 137)
+
+        let sigtermRes = try await session.executeCommand(GuestExecRequest(
+            executable: "/bin/sh",
+            arguments: ["-c", "kill -15 $$"],
+            workingDirectory: tempDir.path,
+            runAsUser: "root"
+        ))
+        #expect(sigtermRes.exitCode == 143)
+
+        let ptySigkillRes = try await session.executeCommand(GuestExecRequest(
+            executable: "/bin/sh",
+            arguments: ["-c", "kill -9 $$"],
+            workingDirectory: tempDir.path,
+            allocatePTY: true,
+            runAsUser: "root"
+        ))
+        #expect(ptySigkillRes.exitCode == 137)
+
+        await session.shutdown()
+        proc.waitUntilExit()
     }
 }

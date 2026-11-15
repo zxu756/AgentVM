@@ -12,38 +12,6 @@ import SwiftUI
 
 @main
 enum AgentVMEntryPoint {
-    private final class LiveStderrForwarder: @unchecked Sendable {
-        private let lock = NSLock()
-        private var forwarded = ""
-
-        func write(_ chunk: String) {
-            guard !chunk.isEmpty else { return }
-            lock.lock()
-            forwarded += chunk
-            lock.unlock()
-            FileHandle.standardError.write(Data(chunk.utf8))
-        }
-
-        func unforwardedSuffix(of fullStderr: String) -> String {
-            lock.lock()
-            let prefix = forwarded
-            lock.unlock()
-            guard !prefix.isEmpty, fullStderr.hasPrefix(prefix) else {
-                return fullStderr
-            }
-            return String(fullStderr.dropFirst(prefix.count))
-        }
-    }
-
-    private static let cliSubcommands: Set<String> = [
-        "doctor", "init", "ps", "list", "image", "create",
-        "up", "boot", "start", "pause", "resume", "halt", "stop",
-        "branch", "fork", "snapshot", "restore",
-        "exec", "pcap", "policy", "plugin",
-        "export-hcl", "export-html",
-        "help", "--help", "-h", "version", "--version", "-v"
-    ]
-
     static func main() async {
         let rawArgs = Array(CommandLine.arguments.dropFirst())
         if let cliLanguage = AppLanguage.extractCLILanguage(from: rawArgs) {
@@ -86,18 +54,12 @@ enum AgentVMEntryPoint {
         // 3. Headless Multi-Subcommand CLI (`agentvm <subcommand> ...`)
         if isCLIInvocation(rawArgs) {
             let runner = AgentVMCLIRunner()
-            let forwarder = LiveStderrForwarder()
+            let forwarder = CLIStandardStreamForwarder()
             let outcome = await runner.execute(
                 arguments: rawArgs,
-                liveStderrHandler: { forwarder.write($0) }
+                liveStderrHandler: { forwarder.writeProgress($0) }
             )
-            if !outcome.stdout.isEmpty {
-                FileHandle.standardOutput.write(Data(outcome.stdout.utf8))
-            }
-            let remainingStderr = forwarder.unforwardedSuffix(of: outcome.stderr)
-            if !remainingStderr.isEmpty {
-                FileHandle.standardError.write(Data(remainingStderr.utf8))
-            }
+            outcome.writeProcessOutput(forwarder: forwarder)
             Darwin.exit(outcome.exitCode)
         }
 
@@ -111,6 +73,9 @@ enum AgentVMEntryPoint {
 
     private static func extractScreenshotExportDirectory(from args: [String]) -> URL? {
         for (idx, arg) in args.enumerated() {
+            if arg == "--" {
+                break
+            }
             if arg == "--export-screenshots" {
                 if idx + 1 < args.count {
                     return URL(fileURLWithPath: args[idx + 1], isDirectory: true)
@@ -135,6 +100,9 @@ enum AgentVMEntryPoint {
         var sawMCP = false
         while idx < stripped.count {
             let token = stripped[idx]
+            if token == "--" {
+                return nil
+            }
             if (token == "--workspace" || token == "-w"), idx + 1 < stripped.count {
                 resolvedURL = URL(fileURLWithPath: stripped[idx + 1], isDirectory: true)
                 idx += 2
@@ -198,7 +166,7 @@ enum AgentVMEntryPoint {
             } else if token.hasPrefix("--backend=") {
                 idx += 1
             } else {
-                if cliSubcommands.contains(token) {
+                if AgentVMCLIRunner.cliSubcommands.contains(token) {
                     return true
                 }
                 // Any explicit non-system flag/subcommand routes to CLI for helpful usage reporting

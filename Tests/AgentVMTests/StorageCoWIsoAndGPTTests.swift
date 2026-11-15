@@ -894,4 +894,41 @@ struct StorageCoWIsoAndGPTTests {
 
         _ = Darwin.chmod(srcURL.path, 0o644)
     }
+
+    @Test("Generated cloud-init excludes package_update, packages, and wheel, and configures user-space /dev/hvc0 output without touching GRUB")
+    func cloudInitGeneratedConfigExcludesPackagesAndWheelAndConfiguresHvc0WithoutGrub() throws {
+        let builder = ISO9660CloudInitBuilder()
+        let bootstrap = GuestAgentBootstrapGenerator()
+        let spec = CloudInitSpec(
+            instanceID: "iid-m1-hvc0",
+            hostname: "t1",
+            defaultUser: "agent",
+            aptPackages: ["python3", "curl"],
+            injectGuestVsockAgent: true
+        )
+        let enriched = bootstrap.applying(to: spec)
+        let entries = builder.renderNoCloudFiles(from: enriched)
+
+        let userText = try #require(entries.first { $0.path == "user-data" }?.utf8String)
+        let vendorText = try #require(entries.first { $0.path == "vendor-data" }?.utf8String)
+
+        // Must never emit package installation directives or Debian-nonexistent 'wheel' group
+        #expect(!userText.contains("package_update"))
+        #expect(!userText.contains("package_upgrade"))
+        #expect(!userText.contains("\npackages:"))
+        #expect(!userText.contains("wheel"))
+        #expect(userText.contains("groups: [sudo, adm, systemd-journal]"))
+
+        // Must configure user-space /dev/hvc0 output (kernel module, dmesg pre-start, serial-getty)
+        #expect(userText.contains("virtio_console"))
+        #expect(userText.contains("/dev/hvc0"))
+        #expect(userText.contains("dmesg > /dev/hvc0"))
+        #expect(userText.contains("serial-getty@hvc0.service"))
+
+        // Must never modify GRUB console parameters (which hangs next boot when virtio_console=m)
+        #expect(!userText.contains("GRUB_CMDLINE"))
+        #expect(!userText.contains("update-grub"))
+        #expect(!userText.contains("console=hvc0"))
+        #expect(!vendorText.contains("console=hvc0"))
+    }
 }

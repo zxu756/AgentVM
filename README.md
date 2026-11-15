@@ -1,25 +1,25 @@
 **English** | **[简体中文](README.zh-CN.md)**
 
-# AgentVM `v1.2.0`
+# AgentVM `v1.3.0`
 
-> **Current Status (M0 — Baseline Honesty & Crash Fixes)**: APFS Copy-on-Write (`clonefile(2)`) sparse disk & snapshot lineage management, SQLite WAL workspace persistence, pure-Swift NoCloud `cidata` ISO-9660 generation, and sandboxed `JavaScriptCore` policy evaluation work locally today. Ethernet/IPv4/DNS/TLS frame dissection and `.pcapng` reading/writing exist as a library (`AgentVMNetSwitch`, covered by unit tests); neither the CLI nor the desktop UI can open a capture file yet. Real Linux image download, `VZVirtualMachine` guest boot, and live `AF_VSOCK` command execution are in development (M1–M3). No guest can be booted in this build, so there is no guest networking of any kind yet; user-space egress firewall enforcement and live VM packet capture are scheduled for M5.
+> **Current Status (M1 — Real Boot, Real Execution)**: APFS Copy-on-Write (`clonefile(2)`) sparse disk & snapshot lineage management, SQLite WAL workspace persistence, pure-Swift NoCloud `cidata` ISO-9660 generation, and sandboxed `JavaScriptCore` policy evaluation work locally today. Ethernet/IPv4/DNS/TLS frame dissection and `.pcapng` reading/writing exist as a library (`AgentVMNetSwitch`, covered by unit tests); neither the CLI nor the desktop UI can open a capture file yet. `agentvm image pull debian-12-bookworm-arm64` downloads a pinned Debian 12 arm64 cloud image and verifies its SHA-512, and `agentvm run <vm> -- <cmd>` boots a VM created from it on `VZVirtualMachine`, runs the command in the guest over `AF_VSOCK` and shuts the guest down; M1 acceptance checked that the output comes from the real guest. Booting needs a binary carrying the virtualization entitlement, which a plain `swift build` binary lacks. `up`, `exec`, `pause`, `resume` and `halt` still do not operate a real guest (scheduled for M2), and the desktop UI is not wired to real VMs (M4). Guest networking is the system NAT with no egress control; user-space egress firewall enforcement and live VM packet capture are scheduled for M5.
 
-[![Version](https://img.shields.io/badge/version-v1.2.0-D97724)](https://github.com/zxu756/AgentVM/releases)
+[![Version](https://img.shields.io/badge/version-v1.3.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
 [![Swift](https://img.shields.io/badge/Swift-6.0%20Strict%20Concurrency-D97724)](https://swift.org)
 [![Bilingual](https://img.shields.io/badge/UI-中文%20%7C%20EN-2A9D6F)](README.zh-CN.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2A9D6F)](LICENSE)
 
-`AgentVM` is a macOS (Apple Silicon) workspace manager and APFS Copy-on-Write disk & snapshot lineage tool with a CLI, a stdio MCP server and a desktop workbench, written in Swift 6, with live `中文 | EN` bilingual switching across the desktop UI and CLI (`--lang en` / `--lang zh`). It cannot boot a virtual machine yet, and the workbench's packet and firewall views have no real traffic to show before M5.
+`AgentVM` is a macOS (Apple Silicon) workspace manager and APFS Copy-on-Write disk & snapshot lineage tool with a CLI, a stdio MCP server and a desktop workbench, written in Swift 6, with live `中文 | EN` bilingual switching across the desktop UI and CLI (`--lang en` / `--lang zh`). A virtual machine can be booted only through `agentvm run`, and the workbench's packet and firewall views have no real traffic to show before M5.
 
 By default, launching the desktop app or initializing a `.agentvm` workspace starts completely empty (0 VMs, 0 packets, 0 alerts) and never fabricates guest execution or telemetry:
 
-- Creating a VM in M0 provisions a sparse GPT disk image and a NoCloud `cidata` ISO-9660 seed image, without a guest OS installed.
-- Running `agentvm up <vm>` or `agentvm exec <vm> -- ...` on an unbooted/empty disk exits non-zero with an explicit error instead of silently falling back to a simulator.
+- Creating a VM provisions a sparse GPT disk image and a NoCloud `cidata` ISO-9660 seed image. Without `--image` no guest OS is installed; with `--image debian-12-bookworm-arm64` the root disk is a clone of the cached image.
+- Running `agentvm up <vm>` or `agentvm exec <vm> -- ...` on an unbooted/empty disk exits non-zero with an explicit error instead of silently falling back to a simulator. `agentvm up` also refuses a bootable VM and points to `agentvm run`; `agentvm run` on an empty disk exits 125.
 - Host-side protocol & wire-session simulation is available only when explicitly requested via `--backend simulation` or in UI demonstration mode (`--demo` / **Load Demo**, labeled `[DEMO]`). Every output of a simulation run is marked: text lines are prefixed with `SIMULATED:`, `ps --json` and MCP `agentvm_list_fleet` records carry `"simulated": true`, `export-hcl` gets a `# SIMULATED:` comment line, and exported `.pcapng` and HTML files are marked inside the file.
 - State the simulator leaves in a workspace stays marked for everyone who reads it later: a default `agentvm ps` prints `SIMULATED:running`, `ps --json` shows `"simulated": true` next to `"state": "running"`, and the default backend never acts on it (`up`, `exec`, `pause` discard the simulated state and fail as they would on a VM that never ran).
 - Unmeasured CPU and memory fields are displayed as `—`.
-- There is no guest networking yet, because no guest can be booted. VM records are configured for the user-space switch, which has no route to the outside network before M5; `agentvm policy strict|airgap` only selects and saves a preset and enforces nothing on real traffic. The Wiretap and Firewall views display `Not connected to live traffic yet (scheduled for M5)`.
+- A guest started with `agentvm run` uses the system NAT, and nothing controls its egress before M5: `agentvm policy strict|airgap` only selects and saves a preset and enforces nothing on real traffic, and with `airgap` selected `agentvm run` exits 125 because booting without a network is not possible before M5. The user-space switch has no route to the outside network before M5. The Wiretap and Firewall views display `Not connected to live traffic yet (scheduled for M5)`.
 - `agentvm doctor` reports whether the running executable actually carries the `com.apple.security.virtualization` entitlement. A plain `swift build` binary does not, and `doctor` says so instead of printing `PASS`.
 
 ---
@@ -29,8 +29,8 @@ By default, launching the desktop app or initializing a `.agentvm` workspace sta
 | Milestone | Capability | Status |
 |---|---|---|
 | **M0** | Honest baseline: plain `agentvm ps` fix, real `clonefile(2)` probe and real entitlement check in `doctor`, empty default UI, explicit `--backend simulation` with `SIMULATED` markers on every output and on stored state, `[DEMO]` gating, `—` for unmeasured telemetry, preemptive `JavaScriptCore` hook watchdog | **Implemented** |
-| **M1** | `agentvm image pull debian-12-bookworm-arm64` + single-command `agentvm run` booting a real Linux kernel/rootfs on `VZVirtualMachine` with live `AF_VSOCK` stdout/stderr/exit-code streaming and `/proc` telemetry | Planned |
-| **M2** | Per-VM background daemon so `up`, `exec`, `pause`, `resume`, and `halt` work across separate CLI invocations | Planned |
+| **M1** | `agentvm image pull debian-12-bookworm-arm64` + single-command `agentvm run` booting a real Linux kernel/rootfs on `VZVirtualMachine` with live `AF_VSOCK` stdout/stderr/exit-code streaming | **Implemented** |
+| **M2** | Per-VM background daemon so `up`, `exec`, `pause`, `resume`, and `halt` work across separate CLI invocations, plus guest `/proc` telemetry (moved here from M1) | Planned |
 | **M3** | Measured APFS CoW branching (`branch`) and snapshot restore (`snapshot` / `restore`) against real Linux root filesystems (measured latency and dirty-byte delta to be reported after M3) | Planned |
 | **M4** | Desktop UI wired end-to-end to real running VMs, live serial console, and workspace state | Planned |
 | **M5** | Live guest NIC attachment to the user-space Layer-2 switch, outbound DNS/TLS SNI policy enforcement, and real guest `.pcapng` capture | Planned (under evaluation) |
@@ -134,6 +134,11 @@ agentvm --lang zh --workspace ./demo-check.agentvm ps
 # doctor entitlement check, policy persistence, clean repo check, default-UI empty-state check).
 # No script launches the desktop UI: the UI row is a windowless ViewModel test.
 ./Scripts/test.sh milestone 0
+
+# Run the M1 acceptance suite. With AGENTVM_REAL_VM=1 it downloads the pinned Debian 12 arm64 image if it is not
+# cached, signs a copy of the CLI with the virtualization entitlement and boots real guests without opening a window.
+# Without the variable it prints that the real-VM part did not run and exits non-zero.
+AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 1
 ```
 
 ---

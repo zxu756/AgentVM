@@ -171,6 +171,11 @@ internal struct IncrementalCRC32: Sendable {
 
 // MARK: - APFS Copy-on-Write Disk Engine
 
+public enum DiskCloneStrategyUsed: String, Codable, Hashable, Sendable {
+    case apfsClonefile
+    case fullCopyFallback
+}
+
 /// Production-grade APFS Copy-on-Write (`clonefile`), sparse extent scanner (`SEEK_DATA`/`SEEK_HOLE`),
 /// hole-punching compactor (`F_PUNCHHOLE`), and zlib-compressed binary delta patch engine (`AVMPATCH`).
 public struct APFSCoWDiskEngine: Sendable {
@@ -189,16 +194,25 @@ public struct APFSCoWDiskEngine: Sendable {
 
     public let comparisonChunkBytes: Int
     public let zlibCompressionLevel: Int32
+    public let forceCopyFallbackErrnoForTesting: Int32?
 
     public init() {
         self.comparisonChunkBytes = Self.defaultComparisonChunkBytes
         self.zlibCompressionLevel = Z_DEFAULT_COMPRESSION
+        self.forceCopyFallbackErrnoForTesting = nil
+    }
+
+    public init(forceCopyFallbackErrnoForTesting: Int32?) {
+        self.comparisonChunkBytes = Self.defaultComparisonChunkBytes
+        self.zlibCompressionLevel = Z_DEFAULT_COMPRESSION
+        self.forceCopyFallbackErrnoForTesting = forceCopyFallbackErrnoForTesting
     }
 
     public init(comparisonChunkBytes: Int, zlibCompressionLevel: Int32 = Z_DEFAULT_COMPRESSION) {
         let clampedChunk = max(4096, min(comparisonChunkBytes, 1_048_576))
         self.comparisonChunkBytes = clampedChunk
         self.zlibCompressionLevel = min(max(zlibCompressionLevel, Z_NO_COMPRESSION), Z_BEST_COMPRESSION)
+        self.forceCopyFallbackErrnoForTesting = nil
     }
 
     // MARK: - Sparse Raw Disk Lifecycle
@@ -362,6 +376,21 @@ public struct APFSCoWDiskEngine: Sendable {
         to destinationURL: URL,
         overwrite: Bool = false
     ) throws {
+        _ = try cloneDiskCoWReportingStrategy(
+            from: sourceURL,
+            to: destinationURL,
+            overwrite: overwrite
+        )
+    }
+
+    /// Clones a disk image using Darwin `clonefile(2)` on APFS and reports whether zero-copy `clonefile`
+    /// succeeded or fell back to a full sparse copy across volumes (`EXDEV` / `ENOTSUP` / `EOPNOTSUPP`).
+    @discardableResult
+    public func cloneDiskCoWReportingStrategy(
+        from sourceURL: URL,
+        to destinationURL: URL,
+        overwrite: Bool = false
+    ) throws -> DiskCloneStrategyUsed {
         let srcPath = sourceURL.path
         let dstPath = destinationURL.path
 
@@ -390,10 +419,18 @@ public struct APFSCoWDiskEngine: Sendable {
             }
         }
 
-        let cloneResult = srcPath.withCString { srcCStr in
-            dstPath.withCString { dstCStr in
-                avm_darwin_clonefile(srcCStr, dstCStr, 0)
+        let cloneResult: Int32
+        let cloneErr: Int32
+        if let simulatedErrno = forceCopyFallbackErrnoForTesting {
+            cloneResult = -1
+            cloneErr = simulatedErrno
+        } else {
+            cloneResult = srcPath.withCString { srcCStr in
+                dstPath.withCString { dstCStr in
+                    avm_darwin_clonefile(srcCStr, dstCStr, 0)
+                }
             }
+            cloneErr = cloneResult == 0 ? 0 : Darwin.errno
         }
 
         if cloneResult == 0 {
@@ -403,17 +440,16 @@ public struct APFSCoWDiskEngine: Sendable {
                 _ = Darwin.fsync(dstFD)
                 _ = Darwin.close(dstFD)
             }
-            return
+            return .apfsClonefile
         }
 
-        let cloneErr = Darwin.errno
         if cloneErr == EXDEV || cloneErr == ENOTSUP || cloneErr == EOPNOTSUPP {
             try Self.sparseHolePreservingCopy(
                 sourcePath: srcPath,
                 destinationPath: dstPath,
                 chunkSize: comparisonChunkBytes
             )
-            return
+            return .fullCopyFallback
         }
 
         throw AgentVMError.cowCloneFailed(source: srcPath, destination: dstPath, errnoCode: cloneErr)

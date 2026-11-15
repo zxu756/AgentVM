@@ -118,7 +118,8 @@ public struct VZConfigurationTranslator: Sendable {
         cloudInitISOURL: URL? = nil,
         networkSocketFD: Int32? = nil,
         serialReadPipe: Pipe? = nil,
-        serialWritePipe: Pipe? = nil
+        serialWritePipe: Pipe? = nil,
+        validateConfiguration: Bool = true
     ) throws -> VZVirtualMachineConfiguration {
         let caps = HostHypervisorProbe.probeCapabilities()
         let issues = spec.validate(
@@ -140,8 +141,48 @@ public struct VZConfigurationTranslator: Sendable {
             min(requestedBytes, VZVirtualMachineConfiguration.maximumAllowedMemorySize)
         )
 
-        // Platform
+        // Platform (reusing persisted VZGenericMachineIdentifier when configured)
         let platform = VZGenericPlatformConfiguration()
+        if let rawMachineIDPath = spec.machineIdentifierPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawMachineIDPath.isEmpty {
+            let machineIDURL = URL(fileURLWithPath: rawMachineIDPath)
+            if FileManager.default.fileExists(atPath: machineIDURL.path) {
+                let rawData: Data
+                do {
+                    rawData = try Data(contentsOf: machineIDURL)
+                } catch {
+                    throw AgentVMError.diskImageOperationFailed(
+                        path: rawMachineIDPath,
+                        errnoCode: errno,
+                        detail: "Failed reading persisted VZGenericMachineIdentifier: \(error.localizedDescription)"
+                    )
+                }
+                guard let restoredID = VZGenericMachineIdentifier(dataRepresentation: rawData) else {
+                    throw AgentVMError.diskImageOperationFailed(
+                        path: rawMachineIDPath,
+                        errnoCode: EINVAL,
+                        detail: "Invalid persisted VZGenericMachineIdentifier data representation."
+                    )
+                }
+                platform.machineIdentifier = restoredID
+            } else {
+                try FileManager.default.createDirectory(
+                    at: machineIDURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let generatedID = VZGenericMachineIdentifier()
+                do {
+                    try generatedID.dataRepresentation.write(to: machineIDURL, options: [.atomic])
+                } catch {
+                    throw AgentVMError.diskImageOperationFailed(
+                        path: rawMachineIDPath,
+                        errnoCode: errno,
+                        detail: "Failed persisting VZGenericMachineIdentifier: \(error.localizedDescription)"
+                    )
+                }
+                platform.machineIdentifier = generatedID
+            }
+        }
         config.platform = platform
 
         // Bootloader
@@ -235,8 +276,22 @@ public struct VZConfigurationTranslator: Sendable {
             storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
         }
 
-        if let cloudInitISOURL, FileManager.default.fileExists(atPath: cloudInitISOURL.path) {
-            let isoAttachment = try VZDiskImageStorageDeviceAttachment(url: cloudInitISOURL, readOnly: true)
+        let effectiveISOURL: URL? = {
+            if let cloudInitISOURL {
+                return cloudInitISOURL
+            }
+            if let specISOPath = spec.cloudInitISOPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !specISOPath.isEmpty {
+                return URL(fileURLWithPath: specISOPath)
+            }
+            return nil
+        }()
+        if let effectiveISOURL,
+           FileManager.default.fileExists(atPath: effectiveISOURL.path),
+           !spec.blockDevices.contains(where: {
+               URL(fileURLWithPath: $0.imagePath).standardizedFileURL == effectiveISOURL.standardizedFileURL
+           }) {
+            let isoAttachment = try VZDiskImageStorageDeviceAttachment(url: effectiveISOURL, readOnly: true)
             storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: isoAttachment))
         }
         config.storageDevices = storageDevices
@@ -328,7 +383,9 @@ public struct VZConfigurationTranslator: Sendable {
             config.graphicsDevices = [gpu]
         }
 
-        try config.validate()
+        if validateConfiguration {
+            try config.validate()
+        }
         return config
     }
 }

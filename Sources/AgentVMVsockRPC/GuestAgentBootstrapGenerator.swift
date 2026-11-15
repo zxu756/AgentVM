@@ -75,7 +75,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
 
     /// Returns a copy of `spec` enriched with `agentvm-guestd` files and `runcmd` activation steps
     /// when `spec.injectGuestVsockAgent` is enabled, deduplicating by `guestPath`.
-    public func applying(to spec: CloudInitSpec) -> CloudInitSpec {
+    public func applying(to spec: CloudInitSpec, includePythonAptPackage: Bool = true) -> CloudInitSpec {
         guard spec.injectGuestVsockAgent else { return spec }
         var updated = spec
         let existingPaths = Set(updated.writeFiles.map(\.guestPath))
@@ -86,7 +86,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         for cmd in cloudInitRunCommands() where !existingCommands.contains(cmd) {
             updated.runCommands.append(cmd)
         }
-        if !updated.aptPackages.contains("python3") {
+        if includePythonAptPackage && !updated.aptPackages.contains("python3") {
             updated.aptPackages.append("python3")
         }
         return updated
@@ -119,7 +119,8 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         Type=simple
         User=root
         Group=root
-        WorkingDirectory=\(defaultWorkspacePath)
+        WorkingDirectory=-\(defaultWorkspacePath)
+        ExecStartPre=-/bin/mkdir -p \(defaultWorkspacePath)
         ExecStartPre=-/sbin/modprobe vmw_vsock_virtio_transport
         ExecStart=/usr/bin/python3 -u \(daemonPath) --port \(vsockPort) --heartbeat-interval \(heartbeatIntervalSeconds) --workspace \(defaultWorkspacePath)
         Restart=always

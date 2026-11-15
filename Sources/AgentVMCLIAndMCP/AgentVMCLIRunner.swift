@@ -5,6 +5,7 @@ import AgentVMPluginHost
 import AgentVMStorageCoW
 import AgentVMStore
 import AgentVMVsockRPC
+import Darwin
 import Foundation
 
 // MARK: - Complete Headless Multi-Subcommand CLI Engine (`agentvm <subcommand>`)
@@ -45,6 +46,7 @@ public struct AgentVMCLIRunner: Sendable {
         curatedEntriesOverride: [BaseImageCatalogEntry]? = nil,
         urlSessionConfiguration: URLSessionConfiguration? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
+        diskEngineOverride: APFSCoWDiskEngine? = nil,
         liveStderrHandler: (@Sendable (String) -> Void)? = nil
     ) async -> CLIExecutionOutcome {
         let language: AppLanguage
@@ -187,7 +189,20 @@ public struct AgentVMCLIRunner: Sendable {
             }
         }
 
+        if subcommand == "create" {
+            if let usageErr = Self.validateCreateSubcommandUsage(parsed: parsed, language: language) {
+                let rawStderr = usageErr + "\n"
+                return CLIExecutionOutcome(
+                    exitCode: Self.usageErrorExitCode,
+                    stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                )
+            }
+        }
+
         let streamedProgressStderr = StreamedStderrCollector()
+        let resolvedCacheURL = (
+            imageCacheURLOverride ?? BaseImageRegistryCatalog.defaultCacheDirectoryURL(environment: environment)
+        ).standardizedFileURL
 
         do {
             let rawOutcome: CLIExecutionOutcome
@@ -197,9 +212,6 @@ public struct AgentVMCLIRunner: Sendable {
             if subcommand == "image" {
                 let asJSON = parsed.flags.contains("--json")
                 if asJSON { stdoutFormat = .json }
-                let resolvedCacheURL = (
-                    imageCacheURLOverride ?? BaseImageRegistryCatalog.defaultCacheDirectoryURL(environment: environment)
-                ).standardizedFileURL
                 let catalog = try BaseImageRegistryCatalog(
                     cacheDirectoryURL: resolvedCacheURL,
                     curatedEntries: curatedEntriesOverride,
@@ -221,10 +233,43 @@ public struct AgentVMCLIRunner: Sendable {
                 return rawOutcome
             }
 
+            // Preflight `create --image` BEFORE initializing the workspace bundle so a missing/unverified
+            // cached image or a `--disk-size` smaller than the image creates zero directories or files.
+            if subcommand == "create", let rawImage = parsed.options["--image"] {
+                let trimmedImageID = rawImage.trimmingCharacters(in: .whitespacesAndNewlines)
+                let preflightCatalog = try BaseImageRegistryCatalog(
+                    cacheDirectoryURL: resolvedCacheURL,
+                    curatedEntries: curatedEntriesOverride,
+                    urlSessionConfiguration: urlSessionConfiguration,
+                    createIfMissing: false
+                )
+                let cachedImageURL = try await preflightCatalog.verifiedCachedImageURL(forID: trimmedImageID)
+                var cachedStat = stat()
+                guard stat(cachedImageURL.path, &cachedStat) == 0, cachedStat.st_size > 0 else {
+                    throw AgentVMError.diskImageOperationFailed(
+                        path: cachedImageURL.path,
+                        errnoCode: errno,
+                        detail: "Unable to stat verified cached base image."
+                    )
+                }
+                let imageBytes = UInt64(cachedStat.st_size)
+                if let rawDiskSize = parsed.options["--disk-size"],
+                   let requestedBytes = Self.parseDiskSizeBytes(rawDiskSize),
+                   requestedBytes < imageBytes {
+                    throw AgentVMError.diskSizeTooSmallForImage(
+                        imageID: trimmedImageID,
+                        requestedBytes: requestedBytes,
+                        imageBytes: imageBytes
+                    )
+                }
+            }
+
             let coordinator = try AgentVMFleetCoordinator(
                 bundleURL: resolvedBundleURL,
                 executionBackend: executionBackend,
-                imageCacheDirectoryURL: imageCacheURLOverride
+                imageCacheDirectoryURL: resolvedCacheURL,
+                curatedImageEntries: curatedEntriesOverride,
+                diskEngine: diskEngineOverride ?? APFSCoWDiskEngine()
             )
 
             switch subcommand {
@@ -237,7 +282,13 @@ public struct AgentVMCLIRunner: Sendable {
                 if asJSON { stdoutFormat = .json }
                 rawOutcome = try await runListVMs(coordinator: coordinator, asJSON: asJSON, language: language)
             case "create":
-                rawOutcome = try await runCreateVM(coordinator: coordinator, parsed: parsed, language: language)
+                rawOutcome = try await runCreateVM(
+                    coordinator: coordinator,
+                    parsed: parsed,
+                    language: language,
+                    progressStderrCollector: streamedProgressStderr,
+                    liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
+                )
             case "up", "boot", "start":
                 rawOutcome = try await runLifecycle(coordinator: coordinator, action: "boot", parsed: parsed, language: language)
             case "pause":
@@ -294,6 +345,8 @@ public struct AgentVMCLIRunner: Sendable {
             if isZh {
                 if case .baseImageError = err {
                     hintLine = "提示：运行 'agentvm image list' 查看可用镜像条目，或运行 'agentvm image pull <id>' 下载镜像。"
+                } else if case .diskSizeTooSmallForImage = err {
+                    hintLine = "提示：请省略 --disk-size（默认等于镜像大小），或指定不小于镜像大小的容量（如 --disk-size 8G）。"
                 } else {
                     hintLine = "提示：查看审计日志抽屉或运行 'agentvm doctor' 进行环境自检。"
                 }
@@ -475,12 +528,53 @@ public struct AgentVMCLIRunner: Sendable {
         return String(decoding: try encoder.encode(vms), as: UTF8.self)
     }
 
-    private func runCreateVM(coordinator: AgentVMFleetCoordinator, parsed: ParsedSubcommandArguments, language: AppLanguage) async throws -> CLIExecutionOutcome {
+    private func runCreateVM(
+        coordinator: AgentVMFleetCoordinator,
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage,
+        progressStderrCollector: StreamedStderrCollector,
+        liveStderrHandler: (@Sendable (String) -> Void)?
+    ) async throws -> CLIExecutionOutcome {
         let isZh = (language == .zhHans)
         let name = parsed.positionals.first ?? "sandbox-01"
         let owner = parsed.options["--owner"] ?? "cli-agent"
         let cpus = parsed.options["--cpus"].flatMap(Int.init) ?? 2
         let mem = parsed.options["--memory-mb"].flatMap(UInt64.init) ?? 2048
+
+        if let rawImage = parsed.options["--image"] {
+            let imageID = rawImage.trimmingCharacters(in: .whitespacesAndNewlines)
+            let requestedDiskBytes = parsed.options["--disk-size"].flatMap(Self.parseDiskSizeBytes)
+            let summary = try await coordinator.createVMFromImage(
+                name: name,
+                imageID: imageID,
+                requestedDiskBytes: requestedDiskBytes,
+                agentOwnerTag: owner,
+                vcpus: cpus,
+                memoryMB: mem
+            )
+            if summary.diskCloneStrategy == .fullCopyFallback {
+                let copyNote = isZh
+                    ? "说明：镜像缓存与工作区不在同一个卷（无法使用 clonefile），已改为完整复制生成根磁盘。\n"
+                    : "Note: image cache and workspace are not on the same volume (clonefile unavailable); fell back to a full copy for the root disk.\n"
+                progressStderrCollector.emit(copyNote, liveHandler: liveStderrHandler)
+            }
+            let diskBytes = summary.vmRecord.spec.blockDevices.first?.virtualSizeBytes ?? summary.rootSnapshot.virtualDiskBytes
+            let sizeStr = ByteMetricsFormatter.formatBytes(diskBytes)
+            let msg: String
+            if isZh {
+                msg = "已从镜像「\(imageID)」创建虚拟机「\(summary.vmRecord.spec.name)」（\(summary.vmRecord.id.rawValue)），逻辑磁盘 \(sizeStr)，根快照 \(summary.rootSnapshot.id.rawValue)\n"
+                    + "网络是系统 NAT，出口策略在 M5 之前不生效。\n"
+            } else {
+                msg = "Created VM '\(summary.vmRecord.spec.name)' (\(summary.vmRecord.id.rawValue)) from image '\(imageID)' (disk \(sizeStr)) with root snapshot \(summary.rootSnapshot.id.rawValue)\n"
+                    + "Network uses system NAT; egress policies do not take effect before M5.\n"
+            }
+            return CLIExecutionOutcome(
+                exitCode: 0,
+                stdout: msg,
+                stderr: progressStderrCollector.snapshot()
+            )
+        }
+
         let summary = try await coordinator.createSandboxVM(
             name: name,
             agentOwnerTag: owner,
@@ -883,6 +977,95 @@ public struct AgentVMCLIRunner: Sendable {
         }
     }
 
+    private static func validateCreateSubcommandUsage(
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage
+    ) -> String? {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+
+        if let rawCPUs = parsed.options["--cpus"] {
+            guard let cpus = Int(rawCPUs), cpus >= 1 else {
+                return isZh
+                    ? "无效的「--cpus」值「\(rawCPUs)」（需要 >= 1 的整数）。\(helpHintZh)"
+                    : "Invalid '--cpus' value '\(rawCPUs)' (expected integer >= 1). \(helpHintEn)"
+            }
+        }
+        if let rawMem = parsed.options["--memory-mb"] {
+            guard let mem = UInt64(rawMem), mem >= 256 else {
+                return isZh
+                    ? "无效的「--memory-mb」值「\(rawMem)」（需要 >= 256 的整数）。\(helpHintZh)"
+                    : "Invalid '--memory-mb' value '\(rawMem)' (expected integer >= 256). \(helpHintEn)"
+            }
+        }
+        if parsed.options["--disk-size"] != nil && parsed.options["--image"] == nil {
+            return isZh
+                ? "选项「--disk-size」需要同时指定「--image <id>」。\(helpHintZh)"
+                : "Option '--disk-size' requires '--image <id>'. \(helpHintEn)"
+        }
+        if let rawImage = parsed.options["--image"] {
+            let trimmedImage = rawImage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedImage.isEmpty {
+                return isZh
+                    ? "选项「--image」需要非空的镜像 <id>。\(helpHintZh)"
+                    : "Option '--image' requires a non-empty image <id>. \(helpHintEn)"
+            }
+            guard let name = parsed.positionals.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !name.isEmpty else {
+                return isZh
+                    ? "「create --image」必须提供虚拟机 <名称>。\(helpHintZh)"
+                    : "Missing <name> argument for 'create --image'. \(helpHintEn)"
+            }
+            if let rawDiskSize = parsed.options["--disk-size"] {
+                guard parseDiskSizeBytes(rawDiskSize) != nil else {
+                    return isZh
+                        ? "无效的「--disk-size」值「\(rawDiskSize)」（格式：<正整数>G，例如 8G）。\(helpHintZh)"
+                        : "Invalid '--disk-size' value '\(rawDiskSize)' (expected <N>G, e.g. 8G). \(helpHintEn)"
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Parses `<N>G` / `<N>GiB` / `<N>GB` (`N * 1024^3`) or `<N>M` / `<N>MiB` / `<N>MB` (`N * 1024^2`) for `N >= 1`.
+    static func parseDiskSizeBytes(_ raw: String) -> UInt64? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let upper = trimmed.uppercased()
+        let multiplier: UInt64
+        let digitsPart: Substring
+        if upper.hasSuffix("GIB") {
+            multiplier = 1024 * 1024 * 1024
+            digitsPart = upper.dropLast(3)
+        } else if upper.hasSuffix("GB") {
+            multiplier = 1024 * 1024 * 1024
+            digitsPart = upper.dropLast(2)
+        } else if upper.hasSuffix("G") {
+            multiplier = 1024 * 1024 * 1024
+            digitsPart = upper.dropLast(1)
+        } else if upper.hasSuffix("MIB") {
+            multiplier = 1024 * 1024
+            digitsPart = upper.dropLast(3)
+        } else if upper.hasSuffix("MB") {
+            multiplier = 1024 * 1024
+            digitsPart = upper.dropLast(2)
+        } else if upper.hasSuffix("M") {
+            multiplier = 1024 * 1024
+            digitsPart = upper.dropLast(1)
+        } else {
+            return nil
+        }
+        guard !digitsPart.isEmpty,
+              digitsPart.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+              let count = UInt64(digitsPart),
+              count >= 1 else {
+            return nil
+        }
+        let (bytes, overflow) = count.multipliedReportingOverflow(by: multiplier)
+        return overflow ? nil : bytes
+    }
+
     private func runImage(
         catalog: BaseImageRegistryCatalog,
         parsed: ParsedSubcommandArguments,
@@ -1104,7 +1287,10 @@ public struct AgentVMCLIRunner: Sendable {
                 maxPositionals: 2,
                 allowedFirstPositional: ["list", "pull", "verify"]
             ),
-            "create": SubcommandGrammar(valueOptions: ["--owner", "--cpus", "--memory-mb"], maxPositionals: 1),
+            "create": SubcommandGrammar(
+                valueOptions: ["--owner", "--cpus", "--memory-mb", "--image", "--disk-size"],
+                maxPositionals: 1
+            ),
             "up": lifecycle, "boot": lifecycle, "start": lifecycle,
             "pause": lifecycle, "resume": lifecycle,
             "halt": lifecycle, "stop": lifecycle,
@@ -1322,7 +1508,8 @@ public struct AgentVMCLIRunner: Sendable {
               image list [--json]             列出基础镜像目录条目、支持状态与共享缓存状态（默认 ~/Library/Caches/AgentVM/images）
               image pull <id>                 通过 HTTPS（支持断点续传）下载基础镜像至共享缓存并校验大小与 SHA-512
               image verify <id>               在本地重新计算缓存镜像的 SHA-512 与大小并核对固定目录记录（不联网）
-              create <名称> [--cpus N]        创建带空稀疏 GPT 磁盘与 NoCloud ISO 的虚拟机配置记录（名称在工作区内不能重复）
+              create <名称> [--image <id>] [--disk-size <N>G] [--cpus N] [--memory-mb MB]
+                                              从已校验缓存镜像克隆创建虚拟机（不传 --image 则创建空稀疏 GPT 磁盘）
               up | pause | resume | halt <vm> 控制虚拟机生命周期（无客户机系统且未传 --backend simulation 时返回错误）
               branch <源虚拟机> <新分支名>    基于 APFS clonefile(2) 派生写时复制磁盘与快照分支
               snapshot [list | <vm> <标题>]   列出或捕获 CoW 磁盘快照检查点
@@ -1359,7 +1546,8 @@ public struct AgentVMCLIRunner: Sendable {
           image list [--json]             List curated base images, support status, and shared cache status (AGENTVM_IMAGE_CACHE)
           image pull <id>                 Download base image over HTTPS (resumable Range) and verify size & SHA-512
           image verify <id>               Recompute cached image SHA-512 & size against pinned catalog entry (offline)
-          create <name> [--cpus N]        Provision a new empty GPT sparse disk + NoCloud ISO sandbox VM record (names are unique per workspace)
+          create <name> [--image <id>] [--disk-size <N>G] [--cpus N] [--memory-mb MB]
+                                          Provision a VM cloned from a verified cached image (or an empty GPT disk without --image)
           up | pause | resume | halt <vm> Control VM lifecycle (fails honestly if disk has no bootable guest OS)
           branch <src-vm> <branch-name>   Fork an APFS clonefile(2) Copy-on-Write disk & snapshot branch
           snapshot [list | <vm> <title>]  List or capture CoW disk snapshot checkpoints

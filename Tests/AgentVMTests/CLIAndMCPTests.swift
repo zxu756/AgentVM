@@ -1236,6 +1236,514 @@ struct CLIAndMCPTests {
         let st = try cliPosixStat(finalURL)
         #expect((st.st_mode & 0o777) == 0o444)
     }
+
+    // MARK: - M1 Item 2: CLI `create <name> --image <id> [--disk-size <N>G]`
+
+    @Test("M1 CLI 'create --image': rejects missing cache, unverified index, and mtime/size mismatch without network or creating workspace files")
+    func cliCreateWithImageRejectsMissingAndMismatchedCacheWithoutCreatingFiles() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-cli-create-img-gate")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let cacheDir = tempDir.appendingPathComponent("shared-images", isDirectory: true)
+        let env = [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+
+        let noNetSession = UUID().uuidString
+        let noNetConfig = CLIImageStubURLProtocol.makeSessionConfiguration(sessionID: noNetSession) { req in
+            Issue.record("create --image must never access the network: \(req.url?.absoluteString ?? "")")
+            throw URLError(.notConnectedToInternet)
+        }
+        defer { CLIImageStubURLProtocol.unregister(sessionID: noNetSession) }
+
+        let fileSize = 4 * 1024 * 1024 // 4 MiB fake image
+        var payload = Data(repeating: 0, count: fileSize)
+        let pattern = Data((0..<8192).map { UInt8(($0 * 41 + 13) & 0xFF) })
+        payload.replaceSubrange(0..<pattern.count, with: pattern)
+        payload.replaceSubrange((fileSize - pattern.count)..<fileSize, with: pattern)
+        let expectedSHA512 = BinaryChecksums.sha512Hex(payload)
+        let imageID = "debian-12-bookworm-arm64"
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Fake 4 MiB CLI Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://create-never-downloads.agentvm.invalid/debian.raw",
+            expectedSHA512: expectedSHA512,
+            expectedSizeBytes: UInt64(fileSize),
+            defaultVirtualSizeBytes: UInt64(fileSize)
+        )
+
+        // 1. Cache directory does not have the image -> non-zero, hints `image pull`, creates zero workspace files
+        let wsMissingEn = tempDir.appendingPathComponent("MissingEn.agentvm", isDirectory: true)
+        let missingEn = await cli.execute(
+            arguments: ["--lang", "en", "create", "dev1", "--image", imageID],
+            bundleURLOverride: wsMissingEn,
+            curatedEntriesOverride: [entry],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(missingEn.exitCode != 0)
+        #expect(missingEn.stdout.isEmpty)
+        #expect(missingEn.stderr.contains("image pull"))
+        #expect(!FileManager.default.fileExists(atPath: wsMissingEn.path))
+
+        let wsMissingZh = tempDir.appendingPathComponent("MissingZh.agentvm", isDirectory: true)
+        let missingZh = await cli.execute(
+            arguments: ["--lang", "zh", "create", "dev1", "--image", imageID],
+            bundleURLOverride: wsMissingZh,
+            curatedEntriesOverride: [entry],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(missingZh.exitCode != 0)
+        #expect(missingZh.stdout.isEmpty)
+        #expect(missingZh.stderr.contains("image pull"))
+        #expect(!FileManager.default.fileExists(atPath: wsMissingZh.path))
+
+        // Seed valid 4 MiB cached image + catalog-index.json offline
+        let stagingURL = tempDir.appendingPathComponent("staging.raw")
+        try payload.write(to: stagingURL)
+        let seeder = try BaseImageRegistryCatalog(
+            cacheDirectoryURL: cacheDir,
+            curatedEntries: [entry],
+            createIfMissing: true
+        )
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedRawURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedRawURL.path, 0o444) == 0)
+
+        let manifestURL = cacheDir.appendingPathComponent("catalog-index.json")
+        let cleanManifestData = try Data(contentsOf: manifestURL)
+        let cleanStat = try cliPosixStat(cachedRawURL)
+
+        // 2. Index has `verified: false` -> rejected, hints `image pull`, zero workspace files
+        if var root = try JSONSerialization.jsonObject(with: cleanManifestData) as? [String: Any],
+           var records = root["records"] as? [[String: Any]], !records.isEmpty {
+            records[0]["verified"] = false
+            root["records"] = records
+            let unverifiedData = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            try unverifiedData.write(to: manifestURL, options: [.atomic])
+        }
+        let wsUnverified = tempDir.appendingPathComponent("Unverified.agentvm", isDirectory: true)
+        let unverifiedOut = await cli.execute(
+            arguments: ["--lang", "en", "create", "dev2", "--image", imageID],
+            bundleURLOverride: wsUnverified,
+            curatedEntriesOverride: [entry],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(unverifiedOut.exitCode != 0)
+        #expect(unverifiedOut.stderr.contains("image pull"))
+        #expect(!FileManager.default.fileExists(atPath: wsUnverified.path))
+
+        // Restore valid manifest, then alter file mtime so stat disagrees with index -> rejected
+        try cleanManifestData.write(to: manifestURL, options: [.atomic])
+        #expect(Darwin.chmod(cachedRawURL.path, 0o644) == 0)
+        var bumpedTimes = [
+            timeval(tv_sec: cleanStat.st_atimespec.tv_sec, tv_usec: Int32(cleanStat.st_atimespec.tv_nsec / 1000)),
+            timeval(tv_sec: cleanStat.st_mtimespec.tv_sec + 30, tv_usec: Int32(cleanStat.st_mtimespec.tv_nsec / 1000))
+        ]
+        #expect(Darwin.utimes(cachedRawURL.path, &bumpedTimes) == 0)
+        #expect(Darwin.chmod(cachedRawURL.path, 0o444) == 0)
+
+        let wsBadMtime = tempDir.appendingPathComponent("BadMtime.agentvm", isDirectory: true)
+        let badMtimeOut = await cli.execute(
+            arguments: ["--lang", "en", "create", "dev3", "--image", imageID],
+            bundleURLOverride: wsBadMtime,
+            curatedEntriesOverride: [entry],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(badMtimeOut.exitCode != 0)
+        #expect(badMtimeOut.stderr.contains("image pull"))
+        #expect(!FileManager.default.fileExists(atPath: wsBadMtime.path))
+
+        // Alter index recorded logicalBytes while matching current mtime -> rejected
+        let currentStat = try cliPosixStat(cachedRawURL)
+        if var root = try JSONSerialization.jsonObject(with: cleanManifestData) as? [String: Any],
+           var records = root["records"] as? [[String: Any]], !records.isEmpty {
+            records[0]["mtimeSeconds"] = currentStat.st_mtimespec.tv_sec
+            records[0]["mtimeNanoseconds"] = currentStat.st_mtimespec.tv_nsec
+            records[0]["logicalBytes"] = fileSize + 8192
+            root["records"] = records
+            let badSizeData = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            try badSizeData.write(to: manifestURL, options: [.atomic])
+        }
+        let wsBadSize = tempDir.appendingPathComponent("BadSize.agentvm", isDirectory: true)
+        let badSizeOut = await cli.execute(
+            arguments: ["--lang", "zh", "create", "dev4", "--image", imageID],
+            bundleURLOverride: wsBadSize,
+            curatedEntriesOverride: [entry],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(badSizeOut.exitCode != 0)
+        #expect(badSizeOut.stderr.contains("image pull"))
+        #expect(!FileManager.default.fileExists(atPath: wsBadSize.path))
+        #expect(CLIImageStubURLProtocol.recordedRequests(sessionID: noNetSession).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: mockHome.path))
+    }
+
+    @Test("M1 CLI 'create --image [--disk-size]': clones disk, resizes via ftruncate, rejects smaller disk size with zero leftovers, prints NAT/M5 notice, and keeps plain create unchanged")
+    func cliCreateWithImageClonesResizesPrintsNATNoticeAndPreservesPlainCreate() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-cli-create-img-ok")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let cacheDir = tempDir.appendingPathComponent("shared-images", isDirectory: true)
+        let env = [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+
+        let noNetSession = UUID().uuidString
+        let noNetConfig = CLIImageStubURLProtocol.makeSessionConfiguration(sessionID: noNetSession) { req in
+            Issue.record("create --image must never access the network: \(req.url?.absoluteString ?? "")")
+            throw URLError(.notConnectedToInternet)
+        }
+        defer { CLIImageStubURLProtocol.unregister(sessionID: noNetSession) }
+
+        // Seed 4 MiB fake image + valid index in temp cache
+        let fileSize = 4 * 1024 * 1024
+        var payload = Data(repeating: 0, count: fileSize)
+        let headerBlock = Data((0..<8192).map { UInt8(($0 * 29 + 7) & 0xFF) })
+        let footerBlock = Data((0..<8192).map { UInt8(($0 * 67 + 3) & 0xFF) })
+        payload.replaceSubrange(0..<headerBlock.count, with: headerBlock)
+        payload.replaceSubrange((fileSize - footerBlock.count)..<fileSize, with: footerBlock)
+        let expectedSHA512 = BinaryChecksums.sha512Hex(payload)
+
+        let imageID = "debian-12-bookworm-arm64"
+        let entry4M = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Fake 4 MiB CLI Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian-4m.raw",
+            expectedSHA512: expectedSHA512,
+            expectedSizeBytes: UInt64(fileSize),
+            defaultVirtualSizeBytes: UInt64(fileSize)
+        )
+
+        // Also prepare a 2 GiB sparse image entry (0 physical blocks) so `--disk-size 1G` (<N>G smaller than image) is tested too
+        let sparse2GID = "debian-2g-sparse-test"
+        let sparse2GBytes: UInt64 = 2 * 1024 * 1024 * 1024
+        let entry2G = BaseImageCatalogEntry(
+            id: sparse2GID,
+            displayName: "Debian 2 GiB Sparse Test Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian-2g.raw",
+            expectedSHA512: String(repeating: "b", count: 128),
+            expectedSizeBytes: sparse2GBytes,
+            defaultVirtualSizeBytes: sparse2GBytes
+        )
+
+        let stagingURL = tempDir.appendingPathComponent("staging-4m.raw")
+        try payload.write(to: stagingURL)
+        let seeder = try BaseImageRegistryCatalog(
+            cacheDirectoryURL: cacheDir,
+            curatedEntries: [entry4M, entry2G],
+            createIfMissing: true
+        )
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cached4MURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cached4MURL.path, 0o444) == 0)
+
+        // Add the 2 GiB sparse image file + verified index record into catalog-index.json (instant, 0 bytes allocated)
+        let cached2GURL = cacheDir.appendingPathComponent(entry2G.cacheFileName).standardizedFileURL
+        try APFSCoWDiskEngine().createSparseRawDisk(at: cached2GURL, virtualSizeBytes: sparse2GBytes, overwrite: true)
+        #expect(Darwin.chmod(cached2GURL.path, 0o444) == 0)
+        let stat2G = try cliPosixStat(cached2GURL)
+        let manifestURL = cacheDir.appendingPathComponent("catalog-index.json")
+        do {
+            let existingManifestData = try Data(contentsOf: manifestURL)
+            if var root = try JSONSerialization.jsonObject(with: existingManifestData) as? [String: Any],
+               var records = root["records"] as? [[String: Any]],
+               var templateRec = records.first {
+                let encodedEntry2G = try JSONSerialization.jsonObject(with: JSONEncoder().encode(entry2G))
+                templateRec["entry"] = encodedEntry2G
+                templateRec["fileName"] = entry2G.cacheFileName
+                templateRec["localPath"] = entry2G.cacheFileName
+                templateRec["logicalBytes"] = sparse2GBytes
+                templateRec["physicalBytes"] = 0
+                templateRec["virtualBytes"] = sparse2GBytes
+                templateRec["mtimeSeconds"] = stat2G.st_mtimespec.tv_sec
+                templateRec["mtimeNanoseconds"] = stat2G.st_mtimespec.tv_nsec
+                templateRec["verified"] = true
+                templateRec["sha512Hex"] = entry2G.expectedSHA512
+                records.append(templateRec)
+                root["records"] = records
+                let updatedData = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+                try updatedData.write(to: manifestURL, options: [.atomic])
+            }
+        }
+
+        let stat4MBefore = try cliPosixStat(cached4MURL)
+        let cachedBytesBefore = try Data(contentsOf: cached4MURL)
+
+        // 1. Smaller `--disk-size` on brand-new workspaces MUST fail non-zero and create ZERO files/directories
+        let wsTooSmallM = tempDir.appendingPathComponent("TooSmall2M.agentvm", isDirectory: true)
+        let smallMOut = await cli.execute(
+            arguments: ["--lang", "en", "create", "tiny-m", "--image", imageID, "--disk-size", "2M"],
+            bundleURLOverride: wsTooSmallM,
+            curatedEntriesOverride: [entry4M, entry2G],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(smallMOut.exitCode != 0)
+        #expect(smallMOut.stdout.isEmpty)
+        #expect(smallMOut.stderr.contains("ERR_DISK_SIZE_TOO_SMALL"))
+        #expect(!FileManager.default.fileExists(atPath: wsTooSmallM.path), "Failed create --disk-size 2M must leave zero files")
+
+        let wsTooSmallG = tempDir.appendingPathComponent("TooSmall1G.agentvm", isDirectory: true)
+        let smallGOut = await cli.execute(
+            arguments: ["--lang", "zh", "create", "tiny-g", "--image", sparse2GID, "--disk-size", "1G"],
+            bundleURLOverride: wsTooSmallG,
+            curatedEntriesOverride: [entry4M, entry2G],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(smallGOut.exitCode != 0)
+        #expect(smallGOut.stdout.isEmpty)
+        #expect(smallGOut.stderr.contains("ERR_DISK_SIZE_TOO_SMALL"))
+        #expect(!FileManager.default.fileExists(atPath: wsTooSmallG.path), "Failed create --disk-size 1G (< 2G image) must leave zero files")
+
+        // Invalid usage options also exit 2 and create zero files
+        for badArgs in [
+            ["--lang", "en", "create", "noimg", "--disk-size", "8G"],
+            ["--lang", "en", "create", "--image", imageID],
+            ["--lang", "en", "create", "bad0", "--image", imageID, "--disk-size", "0G"],
+            ["--lang", "en", "create", "badunit", "--image", imageID, "--disk-size", "8T"]
+        ] {
+            let badWS = tempDir.appendingPathComponent("BadUsage-\(UUID().uuidString).agentvm", isDirectory: true)
+            let badRes = await cli.execute(
+                arguments: badArgs,
+                bundleURLOverride: badWS,
+                curatedEntriesOverride: [entry4M, entry2G],
+                urlSessionConfiguration: noNetConfig,
+                environment: env
+            )
+            #expect(badRes.exitCode == 2, "Expected usage exit code 2 for \(badArgs), got \(badRes.exitCode)")
+            #expect(!FileManager.default.fileExists(atPath: badWS.path))
+        }
+
+        // 2. Default `create <name> --image <id>` (no --disk-size): logical size == image size, NAT + M5 notice on stdout
+        let bundleURL = tempDir.appendingPathComponent("FleetCreateImg.agentvm", isDirectory: true)
+        let createDefaultEn = await cli.execute(
+            arguments: ["--lang", "en", "create", "box-default", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry4M, entry2G],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(createDefaultEn.exitCode == 0, "stderr: \(createDefaultEn.stderr)")
+        #expect(createDefaultEn.stdout.contains("system NAT"))
+        #expect(createDefaultEn.stdout.contains("M5"))
+
+        // 3. `create <name> --image <id> --disk-size 1G` (`--lang zh`): logical size == 1 GiB, Chinese NAT + M5 notice
+        let createExpandedZh = await cli.execute(
+            arguments: ["--lang", "zh", "create", "box-expanded", "--image", imageID, "--disk-size", "1G"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry4M, entry2G],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(createExpandedZh.exitCode == 0, "stderr: \(createExpandedZh.stderr)")
+        #expect(createExpandedZh.stdout.contains("网络是系统 NAT"))
+        #expect(createExpandedZh.stdout.contains("出口策略在 M5 之前不生效"))
+
+        // 4. Simulation mode marks every line with SIMULATED: including the NAT/M5 notice
+        let createSim = await cli.execute(
+            arguments: ["--lang", "en", "--backend", "simulation", "create", "box-sim", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry4M, entry2G],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(createSim.exitCode == 0)
+        let simLines = createSim.stdout.split(separator: "\n", omittingEmptySubsequences: true)
+        #expect(simLines.count >= 2)
+        for line in simLines {
+            #expect(line.hasPrefix("SIMULATED:"))
+        }
+        #expect(createSim.stdout.contains("system NAT"))
+        #expect(createSim.stdout.contains("M5"))
+
+        // Verify cloned disk logical sizes & contents in workspace
+        let coordinator = try AgentVMFleetCoordinator(bundleURL: bundleURL, imageCacheDirectoryURL: cacheDir, curatedImageEntries: [entry4M, entry2G])
+        let vms = try await coordinator.store.listVMs()
+        let defaultVM = try #require(vms.first(where: { $0.spec.name == "box-default" }))
+        let expandedVM = try #require(vms.first(where: { $0.spec.name == "box-expanded" }))
+
+        let defaultDiskURL = URL(fileURLWithPath: try #require(defaultVM.spec.blockDevices.first?.imagePath)).standardizedFileURL
+        let expandedDiskURL = URL(fileURLWithPath: try #require(expandedVM.spec.blockDevices.first?.imagePath)).standardizedFileURL
+        #expect(defaultDiskURL != cached4MURL)
+        #expect(expandedDiskURL != cached4MURL)
+
+        let defaultDiskStat = try cliPosixStat(defaultDiskURL)
+        let expandedDiskStat = try cliPosixStat(expandedDiskURL)
+        #expect(UInt64(defaultDiskStat.st_size) == UInt64(fileSize))
+        #expect(UInt64(expandedDiskStat.st_size) == 1 * 1024 * 1024 * 1024)
+        #expect(defaultDiskStat.st_ino != stat4MBefore.st_ino)
+        #expect(try Data(contentsOf: defaultDiskURL) == cachedBytesBefore)
+        do {
+            let fh = try FileHandle(forReadingFrom: expandedDiskURL)
+            let head4M = try fh.read(upToCount: fileSize) ?? Data()
+            try fh.close()
+            #expect(head4M == cachedBytesBefore)
+        }
+
+        // 5. Smaller `--disk-size` inside an ALREADY initialized workspace also leaves zero new files or DB rows
+        let disksDir = bundleURL.appendingPathComponent("disks", isDirectory: true)
+        let isosDir = bundleURL.appendingPathComponent("isos", isDirectory: true)
+        let snapsDir = bundleURL.appendingPathComponent("snapshots", isDirectory: true)
+        let disksBefore = try FileManager.default.contentsOfDirectory(atPath: disksDir.path).sorted()
+        let isosBefore = try FileManager.default.contentsOfDirectory(atPath: isosDir.path).sorted()
+        let snapsBefore = try FileManager.default.contentsOfDirectory(atPath: snapsDir.path).sorted()
+        let vmCountBefore = vms.count
+
+        let failInExisting = await cli.execute(
+            arguments: ["--lang", "en", "create", "should-not-exist", "--image", sparse2GID, "--disk-size", "1G"],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry4M, entry2G],
+            urlSessionConfiguration: noNetConfig,
+            environment: env
+        )
+        #expect(failInExisting.exitCode != 0)
+        #expect(failInExisting.stderr.contains("ERR_DISK_SIZE_TOO_SMALL"))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: disksDir.path).sorted() == disksBefore)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: isosDir.path).sorted() == isosBefore)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: snapsDir.path).sorted() == snapsBefore)
+        #expect(try await coordinator.store.listVMs().count == vmCountBefore)
+
+        // 6. Cached image file bytes, permissions (0444), and mtime are untouched
+        let stat4MAfter = try cliPosixStat(cached4MURL)
+        #expect(stat4MAfter.st_ino == stat4MBefore.st_ino)
+        #expect((stat4MAfter.st_mode & 0o777) == 0o444)
+        #expect(stat4MAfter.st_size == stat4MBefore.st_size)
+        #expect(stat4MAfter.st_mtimespec.tv_sec == stat4MBefore.st_mtimespec.tv_sec)
+        #expect(stat4MAfter.st_mtimespec.tv_nsec == stat4MBefore.st_mtimespec.tv_nsec)
+        #expect(try Data(contentsOf: cached4MURL) == cachedBytesBefore)
+
+        // 7. Plain `create` without `--image` preserves existing behavior (empty disk; `up` fails with ERR_NO_BOOTABLE_SYSTEM)
+        let plainCreate = await cli.execute(
+            arguments: ["--lang", "en", "create", "plain-empty"],
+            bundleURLOverride: bundleURL,
+            environment: env
+        )
+        #expect(plainCreate.exitCode == 0)
+        #expect(plainCreate.stdout.contains("empty sparse GPT disk"))
+
+        let plainUp = await cli.execute(
+            arguments: ["--lang", "en", "up", "plain-empty"],
+            bundleURLOverride: bundleURL,
+            environment: env
+        )
+        #expect(plainUp.exitCode != 0)
+        #expect(plainUp.stderr.contains("ERR_NO_BOOTABLE_SYSTEM"))
+        #expect(CLIImageStubURLProtocol.recordedRequests(sessionID: noNetSession).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: mockHome.path))
+    }
+
+    @Test("M1 CLI 'create --image': cross-volume clonefile EXDEV falls back to full copy and explains on stderr in en and zh without mutating cache")
+    func cliCreateWithImageCrossVolumeCopyFallbackExplainsOnStderr() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-cli-create-exdev")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockHome = tempDir.appendingPathComponent("mock-home", isDirectory: true)
+        let cacheDir = tempDir.appendingPathComponent("shared-images", isDirectory: true)
+        let env = [
+            "HOME": mockHome.path,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+
+        let fileSize = 2 * 1024 * 1024
+        let payload = Data((0..<fileSize).map { UInt8(($0 * 17 + 5) & 0xFF) })
+        let expectedSHA512 = BinaryChecksums.sha512Hex(payload)
+        let imageID = "debian-12-bookworm-arm64"
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Fake Cross-Volume Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian-exdev.raw",
+            expectedSHA512: expectedSHA512,
+            expectedSizeBytes: UInt64(fileSize),
+            defaultVirtualSizeBytes: UInt64(fileSize)
+        )
+
+        let stagingURL = tempDir.appendingPathComponent("staging-exdev.raw")
+        try payload.write(to: stagingURL)
+        let seeder = try BaseImageRegistryCatalog(
+            cacheDirectoryURL: cacheDir,
+            curatedEntries: [entry],
+            createIfMissing: true
+        )
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedURL.path, 0o444) == 0)
+        let statBefore = try cliPosixStat(cachedURL)
+
+        let bundleURL = tempDir.appendingPathComponent("CrossVol.agentvm", isDirectory: true)
+        let fallbackEngine = APFSCoWDiskEngine(forceCopyFallbackErrnoForTesting: EXDEV)
+
+        let liveChunks = CLILockedStringBox()
+        let outEn = await cli.execute(
+            arguments: ["--lang", "en", "create", "xvol-en", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            diskEngineOverride: fallbackEngine
+        ) { chunk in
+            liveChunks.append(chunk)
+        }
+        #expect(outEn.exitCode == 0, "stderr: \(outEn.stderr)")
+        #expect(outEn.stdout.contains("system NAT"))
+        #expect(outEn.stdout.contains("M5"))
+        #expect(!outEn.stderr.isEmpty)
+        #expect(outEn.stderr.lowercased().contains("copy") && outEn.stderr.lowercased().contains("volume"))
+        #expect(liveChunks.value().lowercased().contains("copy"))
+
+        let outZh = await cli.execute(
+            arguments: ["--lang", "zh", "create", "xvol-zh", "--image", imageID],
+            bundleURLOverride: bundleURL,
+            curatedEntriesOverride: [entry],
+            environment: env,
+            diskEngineOverride: fallbackEngine
+        )
+        #expect(outZh.exitCode == 0, "stderr: \(outZh.stderr)")
+        #expect(outZh.stdout.contains("网络是系统 NAT"))
+        #expect(outZh.stderr.contains("完整复制") && outZh.stderr.contains("卷"))
+
+        let coordinator = try AgentVMFleetCoordinator(bundleURL: bundleURL, imageCacheDirectoryURL: cacheDir, curatedImageEntries: [entry])
+        let vms = try await coordinator.store.listVMs()
+        let enVM = try #require(vms.first(where: { $0.spec.name == "xvol-en" }))
+        let enDiskURL = URL(fileURLWithPath: try #require(enVM.spec.blockDevices.first?.imagePath))
+        #expect(try Data(contentsOf: enDiskURL) == payload)
+
+        let statAfter = try cliPosixStat(cachedURL)
+        #expect(statAfter.st_ino == statBefore.st_ino)
+        #expect((statAfter.st_mode & 0o777) == 0o444)
+        #expect(statAfter.st_mtimespec.tv_sec == statBefore.st_mtimespec.tv_sec)
+        #expect(try Data(contentsOf: cachedURL) == payload)
+    }
 }
 
 // MARK: - CLI Offline URLProtocol Test Helpers

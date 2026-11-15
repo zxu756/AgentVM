@@ -1,5 +1,6 @@
 import AgentVMModels
 import AgentVMStorageCoW
+import AgentVMVsockRPC
 import Darwin
 import Foundation
 import Testing
@@ -784,5 +785,113 @@ struct StorageCoWIsoAndGPTTests {
         #expect(FileManager.default.fileExists(atPath: d0.path) == true)
         #expect(FileManager.default.fileExists(atPath: d2.path) == true)
         #expect(survivors.first { $0.id == n2.id }?.parentSnapshotID == n0.id)
+    }
+
+    @Test("Default CloudInitSpec and ISO9660CloudInitBuilder enforce lock_passwd: true, no passwd/SSH keys, DHCPv4 without 10.211.55, and single port-1025 daemon")
+    func cloudInitDefaultsDHCPNoPasswordAndSinglePort1025Daemon() throws {
+        let builder = ISO9660CloudInitBuilder()
+        let bootstrap = GuestAgentBootstrapGenerator()
+        let defaultSpec = CloudInitSpec(instanceID: "iid-m1-defaults", hostname: "m1-node")
+        let enriched = bootstrap.applying(to: defaultSpec)
+        let entries = builder.renderNoCloudFiles(from: enriched)
+
+        let userText = try #require(entries.first { $0.path == "user-data" }?.utf8String)
+        let trimmedUserLines = userText
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        #expect(trimmedUserLines.contains("lock_passwd: true"))
+        #expect(!trimmedUserLines.contains { $0.hasPrefix("passwd:") })
+        #expect(!userText.contains("ssh_authorized_keys"))
+        #expect(userText.contains("/usr/local/sbin/agentvm-guestd.py"))
+        #expect(userText.contains("agentvm-guestd.service"))
+        #expect(userText.contains("--port 1025"))
+        #expect(!userText.contains("/usr/local/bin/agentvm-guest-agent"))
+        #expect(!userText.contains("agentvm-guest-agent.service"))
+        #expect(!userText.contains("7100"))
+
+        let netText = try #require(entries.first { $0.path == "network-config" }?.utf8String)
+        #expect(netText.contains("dhcp4: true"))
+        #expect(!netText.contains("10.211.55"))
+    }
+
+    @Test("Repository Sources contain only a single guest vsock daemon script and its port is 1025")
+    func repositoryHasOnlyOneGuestDaemonScriptOnPort1025() throws {
+        let testFileURL = URL(fileURLWithPath: #filePath)
+        let repoRootURL = testFileURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourcesURL = repoRootURL.appendingPathComponent("Sources", isDirectory: true)
+
+        let enumerator = try #require(FileManager.default.enumerator(
+            at: sourcesURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ))
+
+        var filesWithGuestVsockDaemon: [String] = []
+        var filesWithPort7100: [String] = []
+
+        for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
+            let content = try String(contentsOf: fileURL, encoding: .utf8)
+            let relPath = fileURL.path.replacingOccurrences(of: repoRootURL.path + "/", with: "")
+            if content.contains("AF_VSOCK") && content.contains("#!/usr/bin/env python3") {
+                filesWithGuestVsockDaemon.append(relPath)
+            }
+            if content.contains("7100") || content.contains("defaultGuestVsockAgentPythonScript") {
+                filesWithPort7100.append(relPath)
+            }
+        }
+
+        #expect(filesWithGuestVsockDaemon == ["Sources/AgentVMVsockRPC/GuestAgentBootstrapGenerator.swift"])
+        #expect(filesWithPort7100.isEmpty)
+        #expect(GuestAgentBootstrapGenerator.defaultVsockPort == 1025)
+    }
+
+    @Test("APFSCoWDiskEngine.cloneDiskCoWReportingStrategy reports apfsClonefile vs EXDEV fullCopyFallback without mutating read-only source")
+    func cloneDiskCoWReportingStrategyAndReadOnlySourceImmutability() throws {
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-clone-strategy")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let srcURL = tempDir.appendingPathComponent("cached-readonly.raw")
+        let sizeBytes = 4 * 1024 * 1024
+        var srcBytes = Data(repeating: 0, count: sizeBytes)
+        srcBytes.replaceSubrange(0..<4096, with: Data((0..<4096).map { UInt8(($0 * 13 + 5) & 0xFF) }))
+        srcBytes.replaceSubrange((sizeBytes - 4096)..<sizeBytes, with: Data((0..<4096).map { UInt8(($0 * 29 + 11) & 0xFF) }))
+        try srcBytes.write(to: srcURL)
+        #expect(Darwin.chmod(srcURL.path, 0o444) == 0)
+
+        var srcStatBefore = Darwin.stat()
+        #expect(stat(srcURL.path, &srcStatBefore) == 0)
+        let shaBefore = BinaryChecksums.sha256Hex(srcBytes)
+
+        // 1. Same-volume APFS clone
+        let cowDstURL = tempDir.appendingPathComponent("vm-cow.raw")
+        let defaultEngine = APFSCoWDiskEngine()
+        let cowStrategy = try defaultEngine.cloneDiskCoWReportingStrategy(from: srcURL, to: cowDstURL, overwrite: true)
+        #expect(cowStrategy == .apfsClonefile)
+        #expect(try Data(contentsOf: cowDstURL) == srcBytes)
+
+        // 2. Cross-volume EXDEV fallback to full copy
+        let copyDstURL = tempDir.appendingPathComponent("vm-copy-fallback.raw")
+        let fallbackEngine = APFSCoWDiskEngine(forceCopyFallbackErrnoForTesting: EXDEV)
+        let copyStrategy = try fallbackEngine.cloneDiskCoWReportingStrategy(from: srcURL, to: copyDstURL, overwrite: true)
+        #expect(copyStrategy == .fullCopyFallback)
+        #expect(try Data(contentsOf: copyDstURL) == srcBytes)
+
+        // Mutating destination must never mutate read-only source
+        #expect(Darwin.chmod(cowDstURL.path, 0o644) == 0)
+        try writeBytes(Data(repeating: 0xEE, count: 4096), to: cowDstURL, at: 0)
+        try writeBytes(Data(repeating: 0xDD, count: 4096), to: copyDstURL, at: 0)
+
+        var srcStatAfter = Darwin.stat()
+        #expect(stat(srcURL.path, &srcStatAfter) == 0)
+        #expect((srcStatAfter.st_mode & 0o777) == 0o444)
+        #expect(srcStatAfter.st_size == srcStatBefore.st_size)
+        #expect(srcStatAfter.st_mtimespec.tv_sec == srcStatBefore.st_mtimespec.tv_sec)
+        #expect(srcStatAfter.st_mtimespec.tv_nsec == srcStatBefore.st_mtimespec.tv_nsec)
+        #expect(BinaryChecksums.sha256Hex(try Data(contentsOf: srcURL)) == shaBefore)
+
+        _ = Darwin.chmod(srcURL.path, 0o644)
     }
 }

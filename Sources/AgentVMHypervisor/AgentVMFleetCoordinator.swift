@@ -4,6 +4,7 @@ import AgentVMPluginHost
 import AgentVMStorageCoW
 import AgentVMStore
 import AgentVMVsockRPC
+import Darwin
 import Foundation
 import Virtualization
 
@@ -25,17 +26,20 @@ public struct FleetCreationSummary: Codable, Hashable, Sendable {
     public var rootSnapshot: SnapshotNode
     public var cloudInitISOPath: String?
     public var diskAllocation: DiskAllocationSummary?
+    public var diskCloneStrategy: DiskCloneStrategyUsed
 
     public init(
         vmRecord: VMInstanceRecord,
         rootSnapshot: SnapshotNode,
         cloudInitISOPath: String?,
-        diskAllocation: DiskAllocationSummary?
+        diskAllocation: DiskAllocationSummary?,
+        diskCloneStrategy: DiskCloneStrategyUsed = .apfsClonefile
     ) {
         self.vmRecord = vmRecord
         self.rootSnapshot = rootSnapshot
         self.cloudInitISOPath = cloudInitISOPath
         self.diskAllocation = diskAllocation
+        self.diskCloneStrategy = diskCloneStrategy
     }
 }
 
@@ -69,7 +73,7 @@ public actor AgentVMFleetCoordinator {
     public nonisolated let portForwardManager: HostPortForwardManager
     public nonisolated let imageCatalog: BaseImageRegistryCatalog
 
-    public let diskEngine = APFSCoWDiskEngine()
+    public let diskEngine: APFSCoWDiskEngine
     public let isoBuilder = ISO9660CloudInitBuilder()
     public let partitionInspector = PartitionAndContainerInspector()
     public let forensicsAnalyzer = DiskEntropyAndForensicsAnalyzer()
@@ -100,7 +104,9 @@ public actor AgentVMFleetCoordinator {
     public init(
         bundleURL: URL,
         executionBackend: HypervisorExecutionBackend = .strictHardwareVZ,
-        imageCacheDirectoryURL: URL? = nil
+        imageCacheDirectoryURL: URL? = nil,
+        curatedImageEntries: [BaseImageCatalogEntry]? = nil,
+        diskEngine: APFSCoWDiskEngine = APFSCoWDiskEngine()
     ) throws {
         let createdStore = try AgentVMProjectStore(bundleURL: bundleURL, createIfMissing: true)
         self.store = createdStore
@@ -117,7 +123,12 @@ public actor AgentVMFleetCoordinator {
         self.pluginEngine = AgentVMPluginEngine(loadBuiltIns: true)
         self.portForwardManager = HostPortForwardManager()
         let cacheDir = (imageCacheDirectoryURL ?? BaseImageRegistryCatalog.defaultCacheDirectoryURL()).standardizedFileURL
-        self.imageCatalog = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, createIfMissing: false)
+        self.imageCatalog = try BaseImageRegistryCatalog(
+            cacheDirectoryURL: cacheDir,
+            curatedEntries: curatedImageEntries,
+            createIfMissing: false
+        )
+        self.diskEngine = diskEngine
         self.executionBackend = executionBackend
     }
 
@@ -241,6 +252,7 @@ public actor AgentVMFleetCoordinator {
         let slug = sanitizeFilename(name)
         let rootDiskURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue).raw")
         let nvramURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue).nvram")
+        let machineIDURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue).machineid")
         let isoURL = store.isosDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue)-cidata.iso")
 
         try diskEngine.createSparseRawDisk(at: rootDiskURL, virtualSizeBytes: diskVirtualBytes, overwrite: true)
@@ -256,6 +268,10 @@ public actor AgentVMFleetCoordinator {
             )
         }
 
+        _ = try VZEFIVariableStore(creatingVariableStoreAt: nvramURL)
+        let machineID = VZGenericMachineIdentifier()
+        try machineID.dataRepresentation.write(to: machineIDURL, options: [.atomic])
+
         let existingVMs = try await store.listVMs()
         let resolvedIP = ipv4Address ?? "10.211.55.\(min(240, 10 + existingVMs.count))"
         let mac = MACAddress.deterministicGuestMAC(seed: vmID.rawValue).description
@@ -264,19 +280,18 @@ public actor AgentVMFleetCoordinator {
             instanceID: vmID.rawValue,
             hostname: slug,
             defaultUser: "agent",
-            staticIPv4CIDR: "\(resolvedIP)/24",
-            gatewayIPv4: "10.211.55.1",
-            nameservers: ["10.211.55.1"],
+            staticIPv4CIDR: ipv4Address.map { "\($0)/24" },
+            gatewayIPv4: ipv4Address == nil ? nil : "10.211.55.1",
+            nameservers: ipv4Address == nil ? [] : ["10.211.55.1"],
             injectGuestVsockAgent: true
         )
         let enrichedCloudInit = rawCloudInit.injectGuestVsockAgent
-            ? guestBootstrap.applying(to: rawCloudInit)
+            ? guestBootstrap.applying(to: rawCloudInit, includePythonAptPackage: false)
             : rawCloudInit
 
         _ = try isoBuilder.buildCloudInitISO(
             from: enrichedCloudInit,
-            outputURL: isoURL,
-            guestAgentScript: guestBootstrap.pythonDaemonScript()
+            outputURL: isoURL
         )
 
         let spec = VMSpec(
@@ -313,7 +328,9 @@ public actor AgentVMFleetCoordinator {
                 )
             ],
             portForwards: portForwards,
-            cloudInit: enrichedCloudInit
+            cloudInit: enrichedCloudInit,
+            machineIdentifierPath: machineIDURL.path,
+            cloudInitISOPath: isoURL.path
         )
 
         let issues = spec.validate()
@@ -384,6 +401,249 @@ public actor AgentVMFleetCoordinator {
             rootSnapshot: rootSnapshot,
             cloudInitISOPath: isoURL.path,
             diskAllocation: alloc
+        )
+    }
+
+    // MARK: - Provision New VM from Verified Cached Base Image (M1: clonefile + ftruncate + NAT/DHCP + Persistent Identity)
+
+    public func createVMFromImage(
+        name: String,
+        imageID: String,
+        requestedDiskBytes: UInt64? = nil,
+        agentOwnerTag: String = "coordinator",
+        vcpus: Int = 2,
+        memoryMB: UInt64 = 2048,
+        sharedDirectories: [VirtioFSMountSpec] = [],
+        portForwards: [PortForwardRuleSpec] = [],
+        cloudInitOverride: CloudInitSpec? = nil
+    ) async throws -> FleetCreationSummary {
+        try await rejectDuplicateVMName(name)
+
+        // 1. Strict offline cache & index stat verification (never downloads, never touches network)
+        let cachedImageURL = try await imageCatalog.verifiedCachedImageURL(forID: imageID)
+        guard let imageEntry = await imageCatalog.entry(forID: imageID) else {
+            let allIDs = await imageCatalog.allEntries().map(\.id)
+            throw AgentVMError.baseImageError(imageID: imageID, reason: .unknownImage(availableIDs: allIDs))
+        }
+
+        var cachedStat = Darwin.stat()
+        guard stat(cachedImageURL.path, &cachedStat) == 0,
+              (cachedStat.st_mode & S_IFMT) == S_IFREG else {
+            throw AgentVMError.baseImageError(imageID: imageID, reason: .missingFromCache)
+        }
+        let imageBytes = UInt64(max(0, cachedStat.st_size))
+
+        // 2. Validate --disk-size before creating ANY file in workspace
+        if let requestedDiskBytes, requestedDiskBytes < imageBytes {
+            throw AgentVMError.diskSizeTooSmallForImage(
+                imageID: imageID,
+                requestedBytes: requestedDiskBytes,
+                imageBytes: imageBytes
+            )
+        }
+        let targetDiskBytes = requestedDiskBytes ?? imageBytes
+
+        let vmID = VMID.generate(prefix: "vm")
+        let slug = sanitizeFilename(name)
+        let rootDiskURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue).raw")
+        let nvramURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue).nvram")
+        let machineIDURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue).machineid")
+        let isoURL = store.isosDirectoryURL.appendingPathComponent("\(slug)-\(vmID.rawValue)-cidata.iso")
+        let snapDiskURL = store.snapshotsDirectoryURL.appendingPathComponent("\(vmID.rawValue)-base.raw")
+
+        guard rootDiskURL.standardizedFileURL != cachedImageURL.standardizedFileURL else {
+            throw AgentVMError.diskImageOperationFailed(
+                path: rootDiskURL.path,
+                errnoCode: EINVAL,
+                detail: "Refusing to attach cached base image directly as a VM disk."
+            )
+        }
+
+        let randomMAC = VZMACAddress.randomLocallyAdministered().string
+        let mac = MACAddress(parsing: randomMAC) != nil
+            ? randomMAC
+            : MACAddress.deterministicGuestMAC(seed: vmID.rawValue).description
+
+        let rawCloudInit = cloudInitOverride ?? CloudInitSpec(
+            instanceID: vmID.rawValue,
+            hostname: slug,
+            defaultUser: "agent",
+            passwordHash: nil,
+            sshAuthorizedKeys: [],
+            aptPackages: [],
+            staticIPv4CIDR: nil,
+            gatewayIPv4: nil,
+            nameservers: [],
+            injectGuestVsockAgent: true
+        )
+        let enrichedCloudInit = rawCloudInit.injectGuestVsockAgent
+            ? guestBootstrap.applying(to: rawCloudInit, includePythonAptPackage: false)
+            : rawCloudInit
+
+        let spec = VMSpec(
+            id: vmID,
+            name: name,
+            agentOwnerTag: agentOwnerTag,
+            guestOS: imageEntry.guestOS,
+            bootLoader: .efiBoot(variableStorePath: nvramURL.path, createVariableStoreIfMissing: false),
+            compute: CPUAndMemorySpec(
+                vcpuCount: vcpus,
+                memoryMB: memoryMB,
+                enableBalloonDevice: true,
+                minBalloonMemoryMB: min(512, memoryMB)
+            ),
+            blockDevices: [
+                BlockDeviceSpec(
+                    label: "root",
+                    imagePath: rootDiskURL.path,
+                    virtualSizeBytes: targetDiskBytes,
+                    format: .rawSparse,
+                    readOnly: false,
+                    isBootVolume: true
+                )
+            ],
+            virtioFSMounts: sharedDirectories,
+            networkInterfaces: [
+                NetworkInterfaceSpec(
+                    macAddress: mac,
+                    mode: .systemNAT,
+                    ipv4Address: "dhcp",
+                    subnetCIDR: "",
+                    gatewayIPv4: "",
+                    dnsServers: [],
+                    firewallPolicyID: PolicySetID("pol-strict-agent-allowlist")
+                )
+            ],
+            portForwards: portForwards,
+            cloudInit: enrichedCloudInit,
+            machineIdentifierPath: machineIDURL.path,
+            cloudInitISOPath: isoURL.path,
+            baseImageID: imageEntry.id
+        )
+
+        let preflightIssues = spec.validate()
+        if !preflightIssues.isEmpty {
+            throw AgentVMError.invalidConfiguration(issues: preflightIssues)
+        }
+
+        // 3. Materialize cloned root disk, ftruncate expansion, NVRAM, machine-id, cidata ISO, and base snapshot atomically
+        var committed = false
+        let workspaceArtifacts = [rootDiskURL, nvramURL, machineIDURL, isoURL, snapDiskURL]
+        defer {
+            if !committed {
+                for url in workspaceArtifacts {
+                    _ = Darwin.chmod(url.path, 0o644)
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        }
+
+        let cloneStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+            from: cachedImageURL,
+            to: rootDiskURL,
+            overwrite: true
+        )
+        guard Darwin.chmod(rootDiskURL.path, 0o644) == 0 else {
+            let err = Darwin.errno
+            throw AgentVMError.diskImageOperationFailed(
+                path: rootDiskURL.path,
+                errnoCode: err,
+                detail: "Failed making cloned root disk writable (0644)."
+            )
+        }
+        if targetDiskBytes > imageBytes {
+            try diskEngine.resizeSparseRawDisk(
+                at: rootDiskURL,
+                newSizeBytes: targetDiskBytes,
+                allowShrink: false
+            )
+        }
+
+        try FileManager.default.createDirectory(
+            at: nvramURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        _ = try VZEFIVariableStore(creatingVariableStoreAt: nvramURL)
+
+        let machineID = VZGenericMachineIdentifier()
+        do {
+            try machineID.dataRepresentation.write(to: machineIDURL, options: [.atomic])
+        } catch {
+            throw AgentVMError.diskImageOperationFailed(
+                path: machineIDURL.path,
+                errnoCode: Darwin.errno,
+                detail: "Failed persisting VZGenericMachineIdentifier: \(error.localizedDescription)"
+            )
+        }
+
+        _ = try isoBuilder.buildCloudInitISO(
+            from: enrichedCloudInit,
+            outputURL: isoURL
+        )
+
+        try diskEngine.cloneDiskCoW(from: rootDiskURL, to: snapDiskURL, overwrite: true)
+        let alloc = try diskEngine.scanSparseExtents(at: rootDiskURL)
+
+        let rootSnapshot = SnapshotNode(
+            id: SnapshotID.generate(prefix: "snap"),
+            vmID: vmID,
+            parentSnapshotID: nil,
+            branchName: "main",
+            title: "Golden Base (\(name))",
+            notes: "Cloned from verified base image '\(imageEntry.id)'",
+            kind: .baseGoldenImage,
+            diskClonePath: snapDiskURL.path,
+            virtualDiskBytes: targetDiskBytes,
+            allocatedDiskBytes: alloc.physicalAllocatedBytes,
+            dirtyDeltaBytes: 0,
+            specSnapshot: spec,
+            agentActor: agentOwnerTag,
+            isPinned: true,
+            tags: ["golden", imageEntry.id, imageEntry.guestOS.rawValue]
+        )
+
+        let record = VMInstanceRecord(
+            spec: spec,
+            currentHeadSnapshotID: rootSnapshot.id,
+            telemetry: VMLiveTelemetry(
+                vmID: vmID,
+                state: .stopped,
+                cowDirtyBytes: alloc.uniqueDirtyBytes
+            )
+        )
+
+        let cmd = CompositeWorkspaceCommand(
+            title: "Provision VM '\(name)' from image '\(imageEntry.id)'",
+            commands: [
+                UpsertVMCommand(record: record),
+                RegisterSnapshotCommand(snapshot: rootSnapshot)
+            ]
+        )
+        try await undoRedo.execute(cmd, on: store)
+
+        if try await store.fetchFirewallPolicy(PolicySetID("pol-strict-agent-allowlist")) == nil {
+            try await store.upsertFirewallPolicy(.strictAgentAllowlistPreset())
+            try await store.upsertFirewallPolicy(.airgappedPreset())
+        }
+
+        try await store.appendDiagnostic(DiagnosticEvent(
+            severity: .info,
+            subsystem: "Hypervisor",
+            vmID: vmID,
+            code: "VM_PROVISIONED_FROM_IMAGE",
+            message: "Created \(name) from image '\(imageEntry.id)' (\(vcpus) vCPU, \(memoryMB) MB RAM, disk \(targetDiskBytes) B, clone=\(cloneStrategy.rawValue), system NAT + DHCP)."
+        ))
+
+        let tty = ensureTerminalBuffer(for: vmID)
+        tty.feed("\u{001B}[1;33m[AgentVM]\u{001B}[0m Provisioned blade '\(name)' (\(vmID.rawValue)) from image '\(imageEntry.id)'.\r\n")
+
+        committed = true
+        return FleetCreationSummary(
+            vmRecord: record,
+            rootSnapshot: rootSnapshot,
+            cloudInitISOPath: isoURL.path,
+            diskAllocation: alloc,
+            diskCloneStrategy: cloneStrategy
         )
     }
 
@@ -820,8 +1080,28 @@ public actor AgentVMFleetCoordinator {
             isBootVolume: true,
             parentCoWImagePath: forkSnap.diskClonePath
         )
+        let childNvramURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(childID.rawValue).nvram")
+        if case let .efiBoot(parentNvramPath, _) = parentRecord.spec.bootLoader {
+            if FileManager.default.fileExists(atPath: parentNvramPath) {
+                try diskEngine.cloneDiskCoW(
+                    from: URL(fileURLWithPath: parentNvramPath),
+                    to: childNvramURL,
+                    overwrite: true
+                )
+            } else {
+                _ = try VZEFIVariableStore(creatingVariableStoreAt: childNvramURL)
+            }
+            childSpec.bootLoader = .efiBoot(variableStorePath: childNvramURL.path, createVariableStoreIfMissing: true)
+        }
+        let childMachineIDURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(childID.rawValue).machineid")
+        try VZGenericMachineIdentifier().dataRepresentation.write(to: childMachineIDURL, options: [.atomic])
+        childSpec.machineIdentifierPath = childMachineIDURL.path
         if !childSpec.networkInterfaces.isEmpty {
-            childSpec.networkInterfaces[0].ipv4Address = childIP
+            if childSpec.networkInterfaces[0].mode == .systemNAT {
+                childSpec.networkInterfaces[0].ipv4Address = "dhcp"
+            } else {
+                childSpec.networkInterfaces[0].ipv4Address = childIP
+            }
             childSpec.networkInterfaces[0].macAddress = childMAC
         }
         // Reassign port forwards to avoid host port collision

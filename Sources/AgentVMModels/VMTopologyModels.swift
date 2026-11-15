@@ -303,12 +303,12 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         defaultUser: String = "agent",
         passwordHash: String? = nil,
         sshAuthorizedKeys: [String] = [],
-        aptPackages: [String] = ["git", "curl", "python3", "ca-certificates"],
+        aptPackages: [String] = [],
         writeFiles: [CloudInitWriteFile] = [],
         runCommands: [String] = [],
-        staticIPv4CIDR: String? = "10.211.55.10/24",
-        gatewayIPv4: String? = "10.211.55.1",
-        nameservers: [String] = ["10.211.55.1"],
+        staticIPv4CIDR: String? = nil,
+        gatewayIPv4: String? = nil,
+        nameservers: [String] = [],
         injectGuestVsockAgent: Bool = true,
         timezone: String = "UTC"
     ) {
@@ -368,6 +368,9 @@ public struct VMSpec: Codable, Hashable, Sendable, Identifiable {
     public var portForwards: [PortForwardRuleSpec]
     public var serialAndDisplay: SerialAndDisplaySpec
     public var cloudInit: CloudInitSpec?
+    public var machineIdentifierPath: String?
+    public var cloudInitISOPath: String?
+    public var baseImageID: String?
     public var enableVsockDevice: Bool
     public var parentVMID: VMID?
     public var forkedFromSnapshotID: SnapshotID?
@@ -389,6 +392,9 @@ public struct VMSpec: Codable, Hashable, Sendable, Identifiable {
         portForwards: [PortForwardRuleSpec] = [],
         serialAndDisplay: SerialAndDisplaySpec = SerialAndDisplaySpec(),
         cloudInit: CloudInitSpec? = CloudInitSpec(),
+        machineIdentifierPath: String? = nil,
+        cloudInitISOPath: String? = nil,
+        baseImageID: String? = nil,
         enableVsockDevice: Bool = true,
         parentVMID: VMID? = nil,
         forkedFromSnapshotID: SnapshotID? = nil,
@@ -409,6 +415,9 @@ public struct VMSpec: Codable, Hashable, Sendable, Identifiable {
         self.portForwards = portForwards
         self.serialAndDisplay = serialAndDisplay
         self.cloudInit = cloudInit
+        self.machineIdentifierPath = machineIdentifierPath
+        self.cloudInitISOPath = cloudInitISOPath
+        self.baseImageID = baseImageID
         self.enableVsockDevice = enableVsockDevice
         self.parentVMID = parentVMID
         self.forkedFromSnapshotID = forkedFromSnapshotID

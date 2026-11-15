@@ -1062,13 +1062,14 @@ public final class AgentVMStudioViewModel: ObservableObject {
         var cloudInit = vm.spec.cloudInit ?? CloudInitSpec(
             instanceID: vm.id.rawValue,
             hostname: vm.spec.name,
-            defaultUser: "agent",
-            staticIPv4CIDR: "\(vm.spec.networkInterfaces.first?.ipv4Address ?? "10.211.55.10")/24",
-            gatewayIPv4: "10.211.55.1"
+            defaultUser: "agent"
         )
         cloudInit.hostname = vm.spec.name
-        let guestScript = GuestAgentBootstrapGenerator().pythonDaemonScript()
-        let renderedFiles = isoBuilder.renderNoCloudFiles(from: cloudInit, guestAgentScript: guestScript)
+        let enrichedCloudInit = GuestAgentBootstrapGenerator().applying(
+            to: cloudInit,
+            includePythonAptPackage: false
+        )
+        let renderedFiles = isoBuilder.renderNoCloudFiles(from: enrichedCloudInit)
 
         // Locate or materialize cidata ISO in store.isosDirectoryURL
         let slug = vm.spec.name.lowercased().replacingOccurrences(of: " ", with: "-")
@@ -1076,9 +1077,8 @@ public final class AgentVMStudioViewModel: ObservableObject {
             .appendingPathComponent("\(slug)-\(vm.id.rawValue)-cidata.iso")
         if !FileManager.default.fileExists(atPath: candidateISO.path) {
             _ = try? isoBuilder.buildCloudInitISO(
-                from: cloudInit,
-                outputURL: candidateISO,
-                guestAgentScript: guestScript
+                from: enrichedCloudInit,
+                outputURL: candidateISO
             )
         }
         let isoReport = try? isoBuilder.inspectISOImageFile(at: candidateISO)
@@ -1739,11 +1739,13 @@ public final class AgentVMStudioViewModel: ObservableObject {
             let slug = updatedVM.spec.name.lowercased().replacingOccurrences(of: " ", with: "-")
             let isoURL = coordinator.store.isosDirectoryURL
                 .appendingPathComponent("\(slug)-\(updatedVM.id.rawValue)-cidata.iso")
-            let guestScript = GuestAgentBootstrapGenerator().pythonDaemonScript()
+            let enrichedSpec = GuestAgentBootstrapGenerator().applying(
+                to: specToBuild,
+                includePythonAptPackage: false
+            )
             let header = try isoBuilder.buildCloudInitISO(
-                from: specToBuild,
-                outputURL: isoURL,
-                guestAgentScript: guestScript
+                from: enrichedSpec,
+                outputURL: isoURL
             )
             try await coordinator.undoRedo.execute(
                 UpsertVMCommand(

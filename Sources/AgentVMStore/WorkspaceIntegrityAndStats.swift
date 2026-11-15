@@ -442,6 +442,20 @@ extension AgentVMProjectStore {
                 }
             }
 
+            if let machineIDPath = vm.spec.machineIdentifierPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !machineIDPath.isEmpty {
+                let resolvedMachineIDURL = resolveBundleRelativePath(machineIDPath)
+                if !fm.fileExists(atPath: resolvedMachineIDURL.path) {
+                    issues.append(ValidationIssue(
+                        fieldPath: "vms[\(vm.id.rawValue)].machineIdentifierPath",
+                        code: "MISSING_MACHINE_IDENTIFIER",
+                        severity: .error,
+                        message: "Persisted VZGenericMachineIdentifier file not found at '\(resolvedMachineIDURL.path)'.",
+                        remediation: "Restore or regenerate the VM hardware machine identifier file."
+                    ))
+                }
+            }
+
             for nic in vm.spec.networkInterfaces {
                 if let polID = nic.firewallPolicyID, policyByID[polID] == nil {
                     issues.append(ValidationIssue(

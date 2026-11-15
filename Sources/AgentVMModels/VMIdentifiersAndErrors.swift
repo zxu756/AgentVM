@@ -298,6 +298,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case virtualizationEntitlementMissing
     case noBootableSystem(vmName: String, reason: NoBootableSystemReason)
     case baseImageError(imageID: String, reason: BaseImageErrorReason)
+    case diskSizeTooSmallForImage(imageID: String, requestedBytes: UInt64, imageBytes: UInt64)
     case vmNameAlreadyExists(name: String, existingID: VMID)
     case guestAgentNotConnected(vmName: String, state: String)
     case invalidConfiguration(issues: [ValidationIssue])
@@ -342,6 +343,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             case .sizeMismatch: return "ERR_IMAGE_SIZE_MISMATCH"
             case .checksumMismatch: return "ERR_IMAGE_CHECKSUM_MISMATCH"
             }
+        case .diskSizeTooSmallForImage: return "ERR_DISK_SIZE_TOO_SMALL"
         case .vmNameAlreadyExists: return "ERR_VM_NAME_EXISTS"
         case .guestAgentNotConnected: return "ERR_GUEST_AGENT_UNAVAILABLE"
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
@@ -432,6 +434,10 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
                     ? "基础镜像「\(imageID)」的 SHA-512 校验和不符（期望 \(expectedSHA512)，实际 \(actualSHA512)）。"
                     : "Base image '\(imageID)' SHA-512 checksum mismatch (expected \(expectedSHA512), computed \(actualSHA512))."
             }
+        case let .diskSizeTooSmallForImage(imageID, requestedBytes, imageBytes):
+            return isZh
+                ? "请求的 --disk-size（\(requestedBytes) 字节）小于基础镜像「\(imageID)」的大小（\(imageBytes) 字节），未创建任何文件。"
+                : "Requested --disk-size (\(requestedBytes) bytes) is smaller than base image '\(imageID)' (\(imageBytes) bytes); nothing was created."
         case let .vmNameAlreadyExists(name, existingID):
             return isZh
                 ? "工作区里已经有一台名为「\(name)」的虚拟机（\(existingID.rawValue)），没有创建新的。请换一个名字。"
@@ -556,6 +562,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             default:
                 return "Run 'agentvm image pull \(imageID)' over HTTPS to fetch and verify the image."
             }
+        case let .diskSizeTooSmallForImage(_, _, imageBytes):
+            return "Specify a --disk-size of at least \(ByteMetricsFormatter.formatBytes(imageBytes)) (\(imageBytes) bytes) or omit --disk-size."
         case .vmNameAlreadyExists:
             return "Run 'agentvm ps' to list existing virtual machines."
         case .cowCloneFailed:

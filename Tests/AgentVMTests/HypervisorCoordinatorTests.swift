@@ -849,4 +849,391 @@ struct HypervisorCoordinatorTests {
         #expect(!coordDefault.imageCatalog.cacheDirectoryURL.path.hasPrefix(wsDefault.standardizedFileURL.path))
         #expect(!FileManager.default.fileExists(atPath: wsDefault.appendingPathComponent("ImageCache").path))
     }
+
+    // MARK: - 5. M1 Item 2: Provisioning VM from Verified Cached Image (A27, A29, A32)
+
+    private func makeFakeCuratedImageFixture(
+        in tempDir: URL,
+        imageID: String = "fake-debian-12-arm64",
+        sizeBytes: Int = 4 * 1024 * 1024
+    ) async throws -> (
+        cacheDir: URL,
+        cachedFileURL: URL,
+        entry: BaseImageCatalogEntry,
+        rawBytes: Data,
+        sha512Hex: String
+    ) {
+        let cacheDir = tempDir.appendingPathComponent("SharedCache", isDirectory: true).standardizedFileURL
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+
+        var payload = Data(repeating: 0, count: sizeBytes)
+        let headerBlock = Data((0..<8192).map { UInt8(($0 * 37 + 19) & 0xFF) })
+        let tailBlock = Data((0..<8192).map { UInt8(($0 * 53 + 7) & 0xFF) })
+        payload.replaceSubrange(0..<headerBlock.count, with: headerBlock)
+        payload.replaceSubrange((sizeBytes - tailBlock.count)..<sizeBytes, with: tailBlock)
+
+        let stagingSourceURL = tempDir.appendingPathComponent("staging-\(imageID).raw")
+        try payload.write(to: stagingSourceURL)
+        let sha512 = try BinaryChecksums.sha512HexFile(at: stagingSourceURL)
+
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Fake Debian 12 ARM64 Test Image",
+            distribution: "debian",
+            version: "test-12",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://example.invalid/images/\(imageID).raw",
+            expectedSHA512: sha512,
+            expectedSizeBytes: UInt64(sizeBytes),
+            defaultVirtualSizeBytes: UInt64(sizeBytes),
+            includesPreinstalledToolchains: ["python3.11", "cloud-init"]
+        )
+
+        let seeder = try BaseImageRegistryCatalog(
+            cacheDirectoryURL: cacheDir,
+            curatedEntries: [entry],
+            createIfMissing: true
+        )
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingSourceURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingSourceURL)
+
+        let cachedFileURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedFileURL.path, 0o444) == 0)
+
+        return (cacheDir, cachedFileURL, entry, payload, sha512)
+    }
+
+    private func directoryRegularFileNames(_ dirURL: URL) -> [String] {
+        guard let items = try? FileManager.default.contentsOfDirectory(atPath: dirURL.path) else {
+            return []
+        }
+        return items.filter { !$0.hasPrefix(".") }.sorted()
+    }
+
+    @Test("createVMFromImage rejects missing cache, missing/unverified index, and file size/mtime mismatch without network or leftover files")
+    func imageProvisioningRejectsMissingCacheAndTamperedIndexOrStat() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-img-gate")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let imageID = "fake-debian-12-arm64"
+
+        // 1. Empty cache directory -> ERR_IMAGE_NOT_CACHED + remediation hint mentioning image pull
+        let emptyCacheDir = tempDir.appendingPathComponent("EmptyCache", isDirectory: true)
+        let dummyEntry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Fake Debian 12",
+            distribution: "debian",
+            version: "test",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://example.invalid/debian.raw",
+            expectedSHA512: String(repeating: "a", count: 128),
+            expectedSizeBytes: 4 * 1024 * 1024,
+            defaultVirtualSizeBytes: 4 * 1024 * 1024
+        )
+        let wsMissing = tempDir.appendingPathComponent("Missing.agentvm", isDirectory: true)
+        let coordMissing = try AgentVMFleetCoordinator(
+            bundleURL: wsMissing,
+            imageCacheDirectoryURL: emptyCacheDir,
+            curatedImageEntries: [dummyEntry]
+        )
+        do {
+            _ = try await coordMissing.createVMFromImage(name: "vm-missing", imageID: imageID)
+            Issue.record("Expected createVMFromImage to fail when image is not in cache")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_IMAGE_NOT_CACHED")
+            #expect(err.remediationHint.contains("image pull"))
+        }
+        #expect(directoryRegularFileNames(coordMissing.store.disksDirectoryURL).isEmpty)
+        #expect(directoryRegularFileNames(coordMissing.store.isosDirectoryURL).isEmpty)
+        #expect(directoryRegularFileNames(coordMissing.store.snapshotsDirectoryURL).isEmpty)
+        #expect(try await coordMissing.store.listVMs().isEmpty)
+
+        // 2. Cached .raw file exists on disk, catalog-index.json sets verified = false -> rejected
+        let unverifiedSubdir = tempDir.appendingPathComponent("UnverifiedCase", isDirectory: true)
+        try FileManager.default.createDirectory(at: unverifiedSubdir, withIntermediateDirectories: true)
+        let unverifiedFix = try await makeFakeCuratedImageFixture(in: unverifiedSubdir, imageID: imageID)
+        defer { _ = Darwin.chmod(unverifiedFix.cachedFileURL.path, 0o644) }
+        let indexURL = unverifiedFix.cacheDir.appendingPathComponent("catalog-index.json")
+        let indexText = try String(contentsOf: indexURL, encoding: .utf8)
+        let tamperedUnverified = indexText.replacingOccurrences(of: "\"verified\" : true", with: "\"verified\" : false")
+        try Data(tamperedUnverified.utf8).write(to: indexURL, options: [.atomic])
+
+        let wsUnverified = tempDir.appendingPathComponent("Unverified.agentvm", isDirectory: true)
+        let coordUnverified = try AgentVMFleetCoordinator(
+            bundleURL: wsUnverified,
+            imageCacheDirectoryURL: unverifiedFix.cacheDir,
+            curatedImageEntries: [unverifiedFix.entry]
+        )
+        do {
+            _ = try await coordUnverified.createVMFromImage(name: "vm-unverified", imageID: imageID)
+            Issue.record("Expected createVMFromImage to reject unverified index record")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_IMAGE_NOT_CACHED")
+        }
+        #expect(directoryRegularFileNames(coordUnverified.store.disksDirectoryURL).isEmpty)
+
+        // 3. Cached .raw file mtime altered so it disagrees with catalog-index.json -> rejected
+        let mtimeSubdir = tempDir.appendingPathComponent("MtimeCase", isDirectory: true)
+        try FileManager.default.createDirectory(at: mtimeSubdir, withIntermediateDirectories: true)
+        let mtimeFix = try await makeFakeCuratedImageFixture(in: mtimeSubdir, imageID: imageID)
+        defer { _ = Darwin.chmod(mtimeFix.cachedFileURL.path, 0o644) }
+        _ = Darwin.chmod(mtimeFix.cachedFileURL.path, 0o644)
+        var bumpedTimes = [
+            timeval(tv_sec: 1_700_000_123, tv_usec: 0),
+            timeval(tv_sec: 1_700_000_123, tv_usec: 0)
+        ]
+        #expect(Darwin.utimes(mtimeFix.cachedFileURL.path, &bumpedTimes) == 0)
+        _ = Darwin.chmod(mtimeFix.cachedFileURL.path, 0o444)
+
+        let wsMtime = tempDir.appendingPathComponent("MtimeMismatch.agentvm", isDirectory: true)
+        let coordMtime = try AgentVMFleetCoordinator(
+            bundleURL: wsMtime,
+            imageCacheDirectoryURL: mtimeFix.cacheDir,
+            curatedImageEntries: [mtimeFix.entry]
+        )
+        do {
+            _ = try await coordMtime.createVMFromImage(name: "vm-mtime", imageID: imageID)
+            Issue.record("Expected createVMFromImage to reject cached image with mismatched mtime")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_IMAGE_NOT_CACHED")
+        }
+        #expect(directoryRegularFileNames(coordMtime.store.disksDirectoryURL).isEmpty)
+
+        // 4. Cached .raw file size altered so it disagrees with catalog-index.json -> rejected
+        let sizeSubdir = tempDir.appendingPathComponent("SizeCase", isDirectory: true)
+        try FileManager.default.createDirectory(at: sizeSubdir, withIntermediateDirectories: true)
+        let sizeFix = try await makeFakeCuratedImageFixture(in: sizeSubdir, imageID: imageID)
+        defer { _ = Darwin.chmod(sizeFix.cachedFileURL.path, 0o644) }
+        _ = Darwin.chmod(sizeFix.cachedFileURL.path, 0o644)
+        let fd = Darwin.open(sizeFix.cachedFileURL.path, O_RDWR | O_CLOEXEC)
+        #expect(fd >= 0)
+        #expect(Darwin.ftruncate(fd, off_t(sizeFix.rawBytes.count + 4096)) == 0)
+        _ = Darwin.close(fd)
+        _ = Darwin.chmod(sizeFix.cachedFileURL.path, 0o444)
+
+        let wsSize = tempDir.appendingPathComponent("SizeMismatch.agentvm", isDirectory: true)
+        let coordSize = try AgentVMFleetCoordinator(
+            bundleURL: wsSize,
+            imageCacheDirectoryURL: sizeFix.cacheDir,
+            curatedImageEntries: [sizeFix.entry]
+        )
+        do {
+            _ = try await coordSize.createVMFromImage(name: "vm-size", imageID: imageID)
+            Issue.record("Expected createVMFromImage to reject cached image with mismatched size")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_IMAGE_NOT_CACHED")
+        }
+        #expect(directoryRegularFileNames(coordSize.store.disksDirectoryURL).isEmpty)
+    }
+
+    @Test("createVMFromImage clones root disk, supports --disk-size expansion, rejects smaller sizes leaving zero files, falls back on EXDEV, and never mutates cache")
+    func imageProvisioningClonesResizesPreservesCacheAndRejectsSmallerDiskSize() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-img-clone-resize")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let imageSize = 4 * 1024 * 1024
+        let fix = try await makeFakeCuratedImageFixture(in: tempDir, sizeBytes: imageSize)
+        defer { _ = Darwin.chmod(fix.cachedFileURL.path, 0o644) }
+
+        var cacheStatBefore = Darwin.stat()
+        #expect(stat(fix.cachedFileURL.path, &cacheStatBefore) == 0)
+
+        // 1. Smaller --disk-size than image on a clean workspace must fail and leave ZERO files
+        let wsSmaller = tempDir.appendingPathComponent("TooSmall.agentvm", isDirectory: true)
+        let coordSmaller = try AgentVMFleetCoordinator(
+            bundleURL: wsSmaller,
+            imageCacheDirectoryURL: fix.cacheDir,
+            curatedImageEntries: [fix.entry]
+        )
+        do {
+            _ = try await coordSmaller.createVMFromImage(
+                name: "too-small",
+                imageID: fix.entry.id,
+                requestedDiskBytes: UInt64(2 * 1024 * 1024)
+            )
+            Issue.record("Expected requestedDiskBytes < image size to throw")
+        } catch let err as AgentVMError {
+            #expect(err.errorCode == "ERR_DISK_SIZE_TOO_SMALL")
+        }
+        #expect(directoryRegularFileNames(coordSmaller.store.disksDirectoryURL).isEmpty)
+        #expect(directoryRegularFileNames(coordSmaller.store.isosDirectoryURL).isEmpty)
+        #expect(directoryRegularFileNames(coordSmaller.store.snapshotsDirectoryURL).isEmpty)
+        #expect(try await coordSmaller.store.listVMs().isEmpty)
+        #expect(try await coordSmaller.store.listSnapshots().isEmpty)
+
+        // 2. Default (nil requestedDiskBytes) clones disk with logical size == image size, writable 0644
+        let wsMain = tempDir.appendingPathComponent("MainFleet.agentvm", isDirectory: true)
+        let coordMain = try AgentVMFleetCoordinator(
+            bundleURL: wsMain,
+            imageCacheDirectoryURL: fix.cacheDir,
+            curatedImageEntries: [fix.entry]
+        )
+        let defaultCreated = try await coordMain.createVMFromImage(
+            name: "node-default-size",
+            imageID: fix.entry.id
+        )
+        #expect(defaultCreated.diskCloneStrategy == .apfsClonefile)
+        let rootDiskPath1 = try #require(defaultCreated.vmRecord.spec.blockDevices.first?.imagePath)
+        let rootDiskURL1 = URL(fileURLWithPath: rootDiskPath1).standardizedFileURL
+        #expect(rootDiskURL1 != fix.cachedFileURL)
+
+        var rootStat1 = Darwin.stat()
+        #expect(stat(rootDiskURL1.path, &rootStat1) == 0)
+        #expect(rootStat1.st_size == off_t(imageSize))
+        #expect((rootStat1.st_mode & 0o777) == 0o644)
+        #expect(try Data(contentsOf: rootDiskURL1) == fix.rawBytes)
+
+        // Mutate cloned VM disk and verify cached image file remains bit-for-bit identical
+        let dirtyHandle = try FileHandle(forUpdating: rootDiskURL1)
+        try dirtyHandle.seek(toOffset: 0)
+        try dirtyHandle.write(contentsOf: Data(repeating: 0xAA, count: 4096))
+        try dirtyHandle.close()
+
+        // 3. Expanded --disk-size via ftruncate
+        let expandedBytes = UInt64(12 * 1024 * 1024)
+        let expandedCreated = try await coordMain.createVMFromImage(
+            name: "node-expanded",
+            imageID: fix.entry.id,
+            requestedDiskBytes: expandedBytes
+        )
+        let rootDiskPath2 = try #require(expandedCreated.vmRecord.spec.blockDevices.first?.imagePath)
+        var rootStat2 = Darwin.stat()
+        #expect(stat(rootDiskPath2, &rootStat2) == 0)
+        #expect(UInt64(rootStat2.st_size) == expandedBytes)
+        #expect(expandedCreated.vmRecord.spec.blockDevices.first?.virtualSizeBytes == expandedBytes)
+        let expandedData = try Data(contentsOf: URL(fileURLWithPath: rootDiskPath2))
+        #expect(expandedData.prefix(imageSize) == fix.rawBytes)
+
+        // 4. Cross-volume EXDEV fallback copies full image cleanly
+        let wsCrossVol = tempDir.appendingPathComponent("CrossVol.agentvm", isDirectory: true)
+        let coordCrossVol = try AgentVMFleetCoordinator(
+            bundleURL: wsCrossVol,
+            imageCacheDirectoryURL: fix.cacheDir,
+            curatedImageEntries: [fix.entry],
+            diskEngine: APFSCoWDiskEngine(forceCopyFallbackErrnoForTesting: EXDEV)
+        )
+        let fallbackCreated = try await coordCrossVol.createVMFromImage(
+            name: "node-crossvol",
+            imageID: fix.entry.id
+        )
+        #expect(fallbackCreated.diskCloneStrategy == .fullCopyFallback)
+        let fallbackDiskPath = try #require(fallbackCreated.vmRecord.spec.blockDevices.first?.imagePath)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: fallbackDiskPath)) == fix.rawBytes)
+
+        // Verify cached image file bytes, size, mode, and mtime are 100% untouched after all operations
+        var cacheStatAfter = Darwin.stat()
+        #expect(stat(fix.cachedFileURL.path, &cacheStatAfter) == 0)
+        #expect((cacheStatAfter.st_mode & 0o777) == 0o444)
+        #expect(cacheStatAfter.st_size == cacheStatBefore.st_size)
+        #expect(cacheStatAfter.st_mtimespec.tv_sec == cacheStatBefore.st_mtimespec.tv_sec)
+        #expect(cacheStatAfter.st_mtimespec.tv_nsec == cacheStatBefore.st_mtimespec.tv_nsec)
+        #expect(try Data(contentsOf: fix.cachedFileURL) == fix.rawBytes)
+        #expect(try BinaryChecksums.sha512HexFile(at: fix.cachedFileURL) == fix.sha512Hex)
+    }
+
+    @Test("createVMFromImage configures system NAT, DHCP cloud-init without 10.211.55, lock_passwd: true without SSH keys, port-1025 daemon, and persistent VZGenericMachineIdentifier")
+    func imageProvisioningCloudInitNATAndPersistentMachineIdentifier() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-img-identity")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let fix = try await makeFakeCuratedImageFixture(in: tempDir)
+        defer { _ = Darwin.chmod(fix.cachedFileURL.path, 0o644) }
+
+        let wsURL = tempDir.appendingPathComponent("Identity.agentvm", isDirectory: true)
+        let coordinator = try AgentVMFleetCoordinator(
+            bundleURL: wsURL,
+            imageCacheDirectoryURL: fix.cacheDir,
+            curatedImageEntries: [fix.entry]
+        )
+
+        let vm1 = try await coordinator.createVMFromImage(name: "alpha", imageID: fix.entry.id)
+        let vm2 = try await coordinator.createVMFromImage(name: "beta", imageID: fix.entry.id)
+
+        // Bundle integrity must pass with 0 issues
+        #expect(try await coordinator.store.verifyBundleIntegrity().isEmpty)
+
+        // Check NIC mode == .systemNAT and zero 10.211.55 in VMSpec
+        let nic1 = try #require(vm1.vmRecord.spec.networkInterfaces.first)
+        #expect(nic1.mode == .systemNAT)
+        #expect(!nic1.ipv4Address.contains("10.211.55"))
+        #expect(!nic1.subnetCIDR.contains("10.211.55"))
+        #expect(!nic1.gatewayIPv4.contains("10.211.55"))
+
+        // Inspect generated cidata ISO on disk
+        let isoPath1 = try #require(vm1.cloudInitISOPath)
+        #expect(vm1.vmRecord.spec.cloudInitISOPath == isoPath1)
+        let isoData1 = try Data(contentsOf: URL(fileURLWithPath: isoPath1))
+        let inspectedISO = try ISO9660CloudInitBuilder().inspectISOImage(data: isoData1)
+        #expect(inspectedISO.volumeID == "cidata")
+
+        let userDataText = String(decoding: try #require(inspectedISO.files["user-data"]), as: UTF8.self)
+        let trimmedUserLines = userDataText
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        #expect(trimmedUserLines.contains("lock_passwd: true"))
+        #expect(!trimmedUserLines.contains { $0.hasPrefix("passwd:") })
+        #expect(!userDataText.contains("ssh_authorized_keys"))
+        #expect(!userDataText.contains("package_update"))
+        #expect(userDataText.contains("/usr/local/sbin/agentvm-guestd.py"))
+        #expect(userDataText.contains("agentvm-guestd.service"))
+        #expect(userDataText.contains("--port 1025"))
+        #expect(!userDataText.contains("7100"))
+        #expect(!userDataText.contains("agentvm-guest-agent"))
+
+        let netConfigText = String(decoding: try #require(inspectedISO.files["network-config"]), as: UTF8.self)
+        #expect(netConfigText.contains("dhcp4: true"))
+        #expect(!netConfigText.contains("10.211.55"))
+
+        // Persistent VZGenericMachineIdentifier, MAC, and EFI variable store on disk at creation time
+        let machineIDPath1 = try #require(vm1.vmRecord.spec.machineIdentifierPath)
+        let machineIDPath2 = try #require(vm2.vmRecord.spec.machineIdentifierPath)
+        #expect(machineIDPath1 != machineIDPath2)
+        #expect(FileManager.default.fileExists(atPath: machineIDPath1))
+        #expect(FileManager.default.fileExists(atPath: machineIDPath2))
+
+        let savedMachineIDData1 = try Data(contentsOf: URL(fileURLWithPath: machineIDPath1))
+        let savedMachineIDData2 = try Data(contentsOf: URL(fileURLWithPath: machineIDPath2))
+        #expect(!savedMachineIDData1.isEmpty)
+        #expect(savedMachineIDData1 != savedMachineIDData2)
+        #expect(VZGenericMachineIdentifier(dataRepresentation: savedMachineIDData1) != nil)
+
+        guard case let .efiBoot(nvramPath1, _) = vm1.vmRecord.spec.bootLoader,
+              case let .efiBoot(nvramPath2, _) = vm2.vmRecord.spec.bootLoader else {
+            Issue.record("Expected EFI bootloader on image-created VMs")
+            return
+        }
+        #expect(nvramPath1 != nvramPath2)
+        #expect(FileManager.default.fileExists(atPath: nvramPath1))
+        #expect(FileManager.default.fileExists(atPath: nvramPath2))
+        #expect(vm1.vmRecord.spec.networkInterfaces.first?.macAddress != vm2.vmRecord.spec.networkInterfaces.first?.macAddress)
+
+        // Building VZVirtualMachineConfiguration twice for the same VM reads the exact same machine identifier, NVRAM, MAC, NAT, and cidata ISO
+        let translator = VZConfigurationTranslator()
+        let vzCfgFirst = try translator.buildVZConfiguration(from: vm1.vmRecord.spec, validateConfiguration: false)
+        let vzCfgSecond = try translator.buildVZConfiguration(from: vm1.vmRecord.spec, validateConfiguration: false)
+
+        let platFirst = try #require(vzCfgFirst.platform as? VZGenericPlatformConfiguration)
+        let platSecond = try #require(vzCfgSecond.platform as? VZGenericPlatformConfiguration)
+        #expect(platFirst.machineIdentifier.dataRepresentation == savedMachineIDData1)
+        #expect(platSecond.machineIdentifier.dataRepresentation == savedMachineIDData1)
+
+        let efiFirst = try #require(vzCfgFirst.bootLoader as? VZEFIBootLoader)
+        let efiSecond = try #require(vzCfgSecond.bootLoader as? VZEFIBootLoader)
+        #expect(efiFirst.variableStore?.url.standardizedFileURL == URL(fileURLWithPath: nvramPath1).standardizedFileURL)
+        #expect(efiSecond.variableStore?.url.standardizedFileURL == URL(fileURLWithPath: nvramPath1).standardizedFileURL)
+
+        let vzNetFirst = try #require(vzCfgFirst.networkDevices.first)
+        let vzNetSecond = try #require(vzCfgSecond.networkDevices.first)
+        #expect(vzNetFirst.attachment is VZNATNetworkDeviceAttachment)
+        #expect(vzNetFirst.macAddress.string.lowercased() == nic1.macAddress.lowercased())
+        #expect(vzNetSecond.macAddress.string.lowercased() == nic1.macAddress.lowercased())
+        #expect(vzCfgFirst.storageDevices.count == 2) // root disk + cidata ISO
+
+        let vzCfgOtherVM = try translator.buildVZConfiguration(from: vm2.vmRecord.spec, validateConfiguration: false)
+        let platOther = try #require(vzCfgOtherVM.platform as? VZGenericPlatformConfiguration)
+        #expect(platOther.machineIdentifier.dataRepresentation == savedMachineIDData2)
+        #expect(platOther.machineIdentifier.dataRepresentation != platFirst.machineIdentifier.dataRepresentation)
+    }
 }

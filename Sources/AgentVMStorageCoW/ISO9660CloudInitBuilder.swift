@@ -410,21 +410,20 @@ public struct ISO9660CloudInitBuilder: Sendable {
             }
         }
 
-        // Write files (user-specified + optional AgentVM Vsock guest daemon)
+        // Write files (caller-enriched via GuestAgentBootstrapGenerator on port 1025, or explicit custom script)
         var effectiveFiles = spec.writeFiles
-        if spec.injectGuestVsockAgent {
-            let daemonScript = guestAgentScript ?? Self.defaultGuestVsockAgentPythonScript
+        if spec.injectGuestVsockAgent,
+           let customScript = guestAgentScript,
+           !customScript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !effectiveFiles.contains(where: {
+               $0.guestPath == "/usr/local/sbin/agentvm-guestd.py"
+                   || $0.guestPath == "/usr/local/bin/agentvm-guest-agent"
+           }) {
             effectiveFiles.append(CloudInitWriteFile(
                 guestPath: "/usr/local/bin/agentvm-guest-agent",
                 permissionsOctal: "0755",
                 owner: "root:root",
-                content: daemonScript
-            ))
-            effectiveFiles.append(CloudInitWriteFile(
-                guestPath: "/etc/systemd/system/agentvm-guest-agent.service",
-                permissionsOctal: "0644",
-                owner: "root:root",
-                content: Self.defaultGuestVsockSystemdUnit
+                content: customScript
             ))
         }
 
@@ -443,12 +442,7 @@ public struct ISO9660CloudInitBuilder: Sendable {
         }
 
         // Run commands
-        var effectiveRunCmds = spec.runCommands
-        if spec.injectGuestVsockAgent {
-            effectiveRunCmds.append("modprobe vmw_vsock_virtio_transport || modprobe virtio_vsock || true")
-            effectiveRunCmds.append("systemctl daemon-reload")
-            effectiveRunCmds.append("systemctl enable --now agentvm-guest-agent.service")
-        }
+        let effectiveRunCmds = spec.runCommands
 
         if !effectiveRunCmds.isEmpty {
             lines.append("runcmd:")
@@ -531,47 +525,6 @@ public struct ISO9660CloudInitBuilder: Sendable {
         let escaped = raw.replacingOccurrences(of: "'", with: "''")
         return "'\(escaped)'"
     }
-
-    private static let defaultGuestVsockAgentPythonScript: String = """
-    #!/usr/bin/env python3
-    import os
-    import socket
-    import struct
-    import subprocess
-    import time
-
-    AF_VSOCK = getattr(socket, "AF_VSOCK", 40)
-    VMADDR_CID_ANY = 0xFFFFFFFF
-    AGENTVM_VSOCK_PORT = 7100
-    AVM1_MAGIC = 0x41564D31
-
-    def serve():
-        sock = socket.socket(AF_VSOCK, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((VMADDR_CID_ANY, AGENTVM_VSOCK_PORT))
-        sock.listen(16)
-        while True:
-            conn, _ = sock.accept()
-            conn.close()
-
-    if __name__ == "__main__":
-        serve()
-    """
-
-    private static let defaultGuestVsockSystemdUnit: String = """
-    [Unit]
-    Description=AgentVM VirtioSocket Guest Control & Telemetry Daemon
-    After=network-online.target
-
-    [Service]
-    Type=simple
-    ExecStart=/usr/local/bin/agentvm-guest-agent
-    Restart=always
-    RestartSec=2
-
-    [Install]
-    WantedBy=multi-user.target
-    """
 
     // MARK: - Internal Directory Hierarchy & ISO-9660 Encoding
 

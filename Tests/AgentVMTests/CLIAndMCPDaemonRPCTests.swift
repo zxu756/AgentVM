@@ -583,6 +583,104 @@ struct CLIAndMCPDaemonRPCTests {
             }
         }
     }
+
+    // MARK: - Item 5: Singleton Lock (`daemon.lock`) & Ordered `lock -> unlink -> bind` Startup
+
+    @Test("Item 5: DaemonSingletonLock writes/reads holder metadata under non-blocking flock, and acquireLockAndBind enforces lock -> unlink stale sock -> bind so contenders never delete the winner's socket")
+    func singletonLockMetadataAndLockBeforeUnlinkBindOrder() throws {
+        let tempRoot = try makeMkdtempDirectory(prefix: "avm-lock")
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let wsURL = tempRoot.appendingPathComponent("lockws.agentvm", isDirectory: true)
+        let paths = DaemonWorkspacePaths(workspaceURL: wsURL)
+        try DaemonSocketPrimitives.ensureRunDirectory0700(at: paths.runDirectoryURL)
+
+        // Plant a stale socket from a previously crashed process (bind and close FD without unlinking).
+        do {
+            let stale = try DaemonSocketListener.bindDirect(paths: paths)
+            stale.close(unlinkSocket: false)
+        }
+        var staleStat = Darwin.stat()
+        #expect(stat(paths.directSocketPath, &staleStat) == 0)
+
+        let start1 = Date(timeIntervalSince1970: 1_763_330_000.125)
+        let ver1 = SemanticVersion(major: 1, minor: 3, patch: 0)
+        let exe1 = "/opt/agentvm/bin/AgentVM-winner"
+
+        let firstOutcome = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(
+            workspaceURL: wsURL,
+            pid: Darwin.getpid(),
+            version: ver1,
+            executablePath: exe1,
+            startedAt: start1
+        )
+        let server1: DaemonBoundWorkspaceServer
+        switch firstOutcome {
+        case let .bound(srv):
+            server1 = srv
+        case .alreadyRunning:
+            Issue.record("Expected first acquireLockAndBind to win singleton lock")
+            return
+        }
+        defer { server1.shutdownAndCleanup() }
+
+        // Contender #2 fails non-blocking flock, reads winner's exact metadata, and MUST NOT unlink winner's daemon.sock.
+        let secondOutcome = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(
+            workspaceURL: wsURL,
+            pid: 99_999,
+            version: SemanticVersion(major: 9, minor: 9, patch: 9),
+            executablePath: "/opt/agentvm/bin/AgentVM-loser",
+            startedAt: Date(timeIntervalSince1970: 1_763_339_999)
+        )
+        switch secondOutcome {
+        case .bound:
+            Issue.record("Second contender must not acquire daemon.lock while server1 holds it")
+            return
+        case let .alreadyRunning(holder):
+            let info = try #require(holder)
+            #expect(info.pid == Darwin.getpid())
+            #expect(info.version == ver1)
+            #expect(info.executablePath == exe1)
+            #expect(abs(info.startedAt.timeIntervalSince(start1)) < 0.001)
+        }
+
+        // Winner's socket must still be present on disk and accept a live client connection!
+        var liveSockStat = Darwin.stat()
+        #expect(stat(paths.directSocketPath, &liveSockStat) == 0)
+
+        let acceptedBox = LockedResultBox<Result<DaemonSocketConnection, Error>>()
+        let acceptSem = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            acceptedBox.store(Result { try server1.listener.acceptConnection() })
+            acceptSem.signal()
+        }
+        let client = try DaemonSocketClient.connectDirect(socketPath: paths.directSocketPath)
+        acceptSem.wait()
+        let accepted = try #require(acceptedBox.load()).get()
+        try client.writeLineData(Data(#"{"still":"alive"}"#.utf8))
+        #expect(try accepted.makeLineReader().readLineData() == Data(#"{"still":"alive"}"#.utf8))
+        client.close()
+        accepted.close()
+
+        // Clean shutdown removes socket, clears lock file, and releases flock so a new server can bind.
+        server1.shutdownAndCleanup()
+        #expect(stat(paths.directSocketPath, &liveSockStat) != 0 && Darwin.errno == ENOENT)
+        #expect(DaemonSingletonLock.readHolderInfo(at: paths.lockFileURL) == nil)
+
+        let thirdOutcome = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(
+            workspaceURL: wsURL,
+            pid: Darwin.getpid(),
+            version: ver1,
+            executablePath: "/opt/agentvm/bin/AgentVM-restarted",
+            startedAt: Date(timeIntervalSince1970: 1_763_340_000)
+        )
+        guard case let .bound(server3) = thirdOutcome else {
+            Issue.record("Expected acquireLockAndBind to succeed after server1 shutdownAndCleanup")
+            return
+        }
+        #expect(server3.holderInfo.executablePath == "/opt/agentvm/bin/AgentVM-restarted")
+        server3.shutdownAndCleanup()
+    }
 }
 
 private final class LockedResultBox<T>: @unchecked Sendable {

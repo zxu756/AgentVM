@@ -351,4 +351,132 @@ struct CLIAndMCPDaemonRPCTests {
             try DaemonRPCLineWriter.writeLineData(Data("bad\nline".utf8), toFD: pair[1])
         }
     }
+
+    // MARK: - Item 3: Socket Address Rule, SHA-256 Symlink & sockaddr_un Bounds Check (A43)
+
+    private func makeMkdtempDirectory(prefix: String = "avm-m2-s1") throws -> URL {
+        let baseTemp = try DaemonSocketAddressResolver.darwinUserTempDirectoryURL()
+        let pattern = baseTemp.appendingPathComponent("\(prefix).XXXXXX", isDirectory: true).path
+        var cTemplate = Array(pattern.utf8CString)
+        let createdPtr = cTemplate.withUnsafeMutableBufferPointer { buf in
+            Darwin.mkdtemp(buf.baseAddress)
+        }
+        guard let createdPtr else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(Darwin.errno))
+        }
+        return URL(fileURLWithPath: String(cString: createdPtr), isDirectory: true).standardizedFileURL
+    }
+
+    @Test("Item 3 (A43): makeSockAddrUn enforces 103-byte UTF-8 ceiling before copying, and DaemonSocketAddressResolver computes direct vs DARWIN_USER_TEMP_DIR symlink with conflict protection")
+    func socketAddressResolverAndSockAddrUnLengthGuard() throws {
+        #expect(DaemonUnixSocketAddress.maxPathUTF8Bytes == 103)
+
+        // 1. A43: 103 UTF-8 bytes succeeds; 104 UTF-8 bytes, empty path, and interior NUL fail before copying.
+        let path103 = "/" + String(repeating: "a", count: 102)
+        #expect(path103.utf8.count == 103)
+        let addr103 = try DaemonUnixSocketAddress.makeSockAddrUn(socketPath: path103)
+        #expect(addr103.sun_family == sa_family_t(AF_UNIX))
+
+        let path104 = "/" + String(repeating: "a", count: 103)
+        #expect(path104.utf8.count == 104)
+        #expect(throws: DaemonSocketError.socketPathTooLong(path: path104, utf8ByteCount: 104, maxBytes: 103)) {
+            _ = try DaemonUnixSocketAddress.makeSockAddrUn(socketPath: path104)
+        }
+        #expect(throws: DaemonSocketError.emptySocketPath) {
+            _ = try DaemonUnixSocketAddress.makeSockAddrUn(socketPath: "")
+        }
+        #expect(throws: DaemonSocketError.interiorNullByte(path: "/tmp/a\0b.sock")) {
+            _ = try DaemonUnixSocketAddress.makeSockAddrUn(socketPath: "/tmp/a\0b.sock")
+        }
+
+        // 2. Short path (standardizedFileURL collapses '//' per Fact 26) uses direct mode without creating symlink.
+        let tempRoot = try makeMkdtempDirectory(prefix: "avm-addr")
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let shortWS = URL(fileURLWithPath: "/tmp//avm-short-\(UUID().uuidString.prefix(8)).agentvm", isDirectory: true)
+        let shortPlan = try DaemonSocketAddressResolver.computePlan(for: shortWS)
+        #expect(shortPlan.mode == .direct)
+        #expect(shortPlan.symlinkURL == nil)
+        #expect(!shortPlan.connectSocketPath.contains("//"))
+
+        // 3. Long path (> 103 UTF-8 bytes, including multi-byte UTF-8) uses DARWIN_USER_TEMP_DIR/avm-<sha256-16> -> <ws>/run.
+        let isolatedTempDir = tempRoot.appendingPathComponent("t", isDirectory: true)
+        try FileManager.default.createDirectory(at: isolatedTempDir, withIntermediateDirectories: true)
+
+        let longWS = tempRoot
+            .appendingPathComponent(String(repeating: "long-seg-", count: 8) + "工作区", isDirectory: true)
+            .appendingPathComponent("ws.agentvm", isDirectory: true)
+        try FileManager.default.createDirectory(at: longWS, withIntermediateDirectories: true)
+
+        let realWSPath = DaemonSocketAddressResolver.canonicalRealPath(of: longWS)
+        let expectedHash16 = String(BinaryChecksums.sha256Hex(Data(realWSPath.utf8)).prefix(16))
+
+        let (boundPlan, _) = try DaemonSocketAddressResolver.prepareForBind(
+            workspaceURL: longWS,
+            userTempDirectoryOverride: isolatedTempDir
+        )
+        defer { DaemonSocketAddressResolver.removeSymlinkIfPresent(for: boundPlan) }
+
+        #expect(boundPlan.mode == .tempDirectorySymlink)
+        let symlinkURL = try #require(boundPlan.symlinkURL)
+        #expect(symlinkURL.lastPathComponent == "avm-\(expectedHash16)")
+        #expect(boundPlan.connectSocketPath == symlinkURL.appendingPathComponent("daemon.sock").path)
+        #expect(boundPlan.connectSocketPath.utf8.count <= 103)
+
+        // Client resolves identical address and does not fail when symlink points to <longWS>/run.
+        let (clientPlan, _) = try DaemonSocketAddressResolver.resolveForConnect(
+            workspaceURL: longWS,
+            userTempDirectoryOverride: isolatedTempDir
+        )
+        #expect(clientPlan == boundPlan)
+
+        // Cleanup removes owned symlink; subsequent resolveForConnect does NOT recreate dangling symlink.
+        DaemonSocketAddressResolver.removeSymlinkIfPresent(for: boundPlan)
+        var st = Darwin.stat()
+        #expect(Darwin.lstat(symlinkURL.path, &st) != 0 && Darwin.errno == ENOENT)
+        _ = try DaemonSocketAddressResolver.resolveForConnect(
+            workspaceURL: longWS,
+            userTempDirectoryOverride: isolatedTempDir
+        )
+        #expect(Darwin.lstat(symlinkURL.path, &st) != 0 && Darwin.errno == ENOENT)
+
+        // 4. Existing symlink pointing elsewhere throws error on both bind and connect and is NEVER overwritten.
+        let foreignTarget = tempRoot.appendingPathComponent("foreign-dir/run", isDirectory: true).path
+        #expect(Darwin.symlink(foreignTarget, symlinkURL.path) == 0)
+        defer { _ = Darwin.unlink(symlinkURL.path) }
+
+        do {
+            _ = try DaemonSocketAddressResolver.prepareForBind(
+                workspaceURL: longWS,
+                userTempDirectoryOverride: isolatedTempDir
+            )
+            Issue.record("Expected symlinkTargetMismatch on prepareForBind")
+        } catch let err as DaemonSocketError {
+            guard case .symlinkTargetMismatch = err else {
+                Issue.record("Unexpected DaemonSocketError: \(err)")
+                return
+            }
+        }
+
+        do {
+            _ = try DaemonSocketAddressResolver.resolveForConnect(
+                workspaceURL: longWS,
+                userTempDirectoryOverride: isolatedTempDir
+            )
+            Issue.record("Expected symlinkTargetMismatch on resolveForConnect")
+        } catch let err as DaemonSocketError {
+            guard case .symlinkTargetMismatch = err else {
+                Issue.record("Unexpected DaemonSocketError: \(err)")
+                return
+            }
+        }
+
+        // Verify foreign symlink is untouched even if removeSymlinkIfPresent is called!
+        DaemonSocketAddressResolver.removeSymlinkIfPresent(for: boundPlan)
+        var readBuf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+        let linkLen = Darwin.readlink(symlinkURL.path, &readBuf, Int(PATH_MAX))
+        #expect(linkLen > 0)
+        let preservedTarget = String(decoding: readBuf.prefix(linkLen).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        #expect(preservedTarget == foreignTarget)
+    }
 }

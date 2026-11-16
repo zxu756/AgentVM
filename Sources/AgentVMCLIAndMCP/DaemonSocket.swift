@@ -412,3 +412,405 @@ public enum DaemonSocketAddressResolver {
             .standardizedFileURL
     }
 }
+
+// MARK: - Socket Primitives: 0700 `run/`, 0600 `daemon.sock`, `SO_NOSIGPIPE`, `getpeereid`
+
+public enum DaemonSocketPrimitives {
+    public static func ensureRunDirectory0700(at runDirectoryURL: URL) throws {
+        let stdURL = runDirectoryURL.standardizedFileURL
+        do {
+            try FileManager.default.createDirectory(
+                at: stdURL,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "mkdir",
+                path: stdURL.path,
+                errnoCode: code,
+                detail: error.localizedDescription
+            )
+        }
+        guard Darwin.chmod(stdURL.path, mode_t(0o700)) == 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "chmod(0700)",
+                path: stdURL.path,
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+    }
+
+    public static func configureSocketDescriptor(_ fd: Int32, path: String) throws {
+        let currentFlags = Darwin.fcntl(fd, F_GETFD)
+        if currentFlags >= 0 {
+            _ = Darwin.fcntl(fd, F_SETFD, currentFlags | FD_CLOEXEC)
+        }
+        var one: Int32 = 1
+        let rc = Darwin.setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &one,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+        guard rc == 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "setsockopt(SO_NOSIGPIPE)",
+                path: path,
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+    }
+
+    public static func isNoSigPipeEnabled(_ fd: Int32) throws -> Bool {
+        var val: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        guard Darwin.getsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &val, &len) == 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "getsockopt(SO_NOSIGPIPE)",
+                path: "fd:\(fd)",
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+        return val != 0
+    }
+
+    public static func verifyPeerUID(
+        _ fd: Int32,
+        expectedUID: uid_t = Darwin.getuid(),
+        path: String
+    ) throws -> (uid: uid_t, gid: gid_t) {
+        var peerUID: uid_t = 0
+        var peerGID: gid_t = 0
+        guard Darwin.getpeereid(fd, &peerUID, &peerGID) == 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "getpeereid",
+                path: path,
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+        guard peerUID == expectedUID else {
+            throw DaemonSocketError.unauthorizedPeerUID(expected: expectedUID, actual: peerUID)
+        }
+        return (peerUID, peerGID)
+    }
+}
+
+public final class DaemonSocketConnection: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rawFD: Int32
+    public let peerUID: uid_t
+    public let peerGID: gid_t
+
+    public init(fd: Int32, peerUID: uid_t, peerGID: gid_t) {
+        self.rawFD = fd
+        self.peerUID = peerUID
+        self.peerGID = peerGID
+    }
+
+    deinit {
+        close()
+    }
+
+    public var fd: Int32 {
+        lock.withLock { rawFD }
+    }
+
+    public func makeLineReader(
+        readChunkBytes: Int = DaemonRPCLineFraming.defaultReadChunkBytes,
+        maxLineBytes: Int = DaemonRPCLineFraming.maxLineBytes
+    ) -> DaemonRPCLineReader {
+        DaemonRPCLineReader(
+            fd: fd,
+            readChunkBytes: readChunkBytes,
+            maxLineBytes: maxLineBytes
+        )
+    }
+
+    public func writeLineData(
+        _ lineData: Data,
+        maxLineBytes: Int = DaemonRPCLineFraming.maxLineBytes
+    ) throws {
+        let current = fd
+        guard current >= 0 else {
+            throw DaemonRPCLineFramingError.ioError(
+                errnoCode: EBADF,
+                detail: "Daemon socket connection is already closed."
+            )
+        }
+        try DaemonRPCLineWriter.writeLineData(lineData, toFD: current, maxLineBytes: maxLineBytes)
+    }
+
+    public func close() {
+        let descriptor = lock.withLock { () -> Int32 in
+            let current = rawFD
+            rawFD = -1
+            return current
+        }
+        if descriptor >= 0 {
+            _ = Darwin.close(descriptor)
+        }
+    }
+}
+
+public final class DaemonSocketListener: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rawListenFD: Int32
+    public let address: DaemonResolvedSocketAddress
+    public let runDirectoryURL: URL
+
+    private init(
+        listenFD: Int32,
+        address: DaemonResolvedSocketAddress,
+        runDirectoryURL: URL
+    ) {
+        self.rawListenFD = listenFD
+        self.address = address
+        self.runDirectoryURL = runDirectoryURL
+    }
+
+    deinit {
+        close(unlinkSocket: false, removeSymlink: false)
+    }
+
+    public var listenFD: Int32 {
+        lock.withLock { rawListenFD }
+    }
+
+    public static func bindDirect(
+        paths: DaemonWorkspacePaths,
+        backlog: Int32 = 32
+    ) throws -> DaemonSocketListener {
+        let sockAddr = try DaemonUnixSocketAddress.makeSockAddrUn(socketPath: paths.directSocketPath)
+        let directAddress = DaemonResolvedSocketAddress(
+            mode: .direct,
+            connectSocketPath: paths.directSocketPath,
+            physicalSocketFileURL: paths.directSocketFileURL,
+            symlinkURL: nil,
+            expectedSymlinkTargetPath: nil
+        )
+        return try bindResolved(
+            address: directAddress,
+            sockAddr: sockAddr,
+            runDirectoryURL: paths.runDirectoryURL,
+            backlog: backlog
+        )
+    }
+
+    public static func bindResolved(
+        address: DaemonResolvedSocketAddress,
+        sockAddr: sockaddr_un,
+        runDirectoryURL: URL,
+        backlog: Int32 = 32
+    ) throws -> DaemonSocketListener {
+        try DaemonSocketPrimitives.ensureRunDirectory0700(at: runDirectoryURL)
+
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "socket",
+                path: address.connectSocketPath,
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+
+        do {
+            try DaemonSocketPrimitives.configureSocketDescriptor(fd, path: address.connectSocketPath)
+
+            var mutableAddr = sockAddr
+            let bindRC = withUnsafePointer(to: &mutableAddr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                    Darwin.bind(fd, saPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            guard bindRC == 0 else {
+                let code = Darwin.errno
+                throw DaemonSocketError.syscallFailed(
+                    operation: "bind",
+                    path: address.connectSocketPath,
+                    errnoCode: code,
+                    detail: String(cString: Darwin.strerror(code))
+                )
+            }
+
+            // Tighten socket permissions to 0600 on the physical file BEFORE calling listen().
+            guard Darwin.chmod(address.physicalSocketFileURL.path, mode_t(0o600)) == 0 else {
+                let code = Darwin.errno
+                _ = Darwin.unlink(address.physicalSocketFileURL.path)
+                throw DaemonSocketError.syscallFailed(
+                    operation: "chmod(0600)",
+                    path: address.physicalSocketFileURL.path,
+                    errnoCode: code,
+                    detail: String(cString: Darwin.strerror(code))
+                )
+            }
+
+            guard Darwin.listen(fd, backlog) == 0 else {
+                let code = Darwin.errno
+                _ = Darwin.unlink(address.physicalSocketFileURL.path)
+                throw DaemonSocketError.syscallFailed(
+                    operation: "listen",
+                    path: address.connectSocketPath,
+                    errnoCode: code,
+                    detail: String(cString: Darwin.strerror(code))
+                )
+            }
+        } catch {
+            _ = Darwin.close(fd)
+            throw error
+        }
+
+        return DaemonSocketListener(
+            listenFD: fd,
+            address: address,
+            runDirectoryURL: runDirectoryURL
+        )
+    }
+
+    public func acceptConnection(
+        expectedUID: uid_t = Darwin.getuid()
+    ) throws -> DaemonSocketConnection {
+        let serverFD = listenFD
+        guard serverFD >= 0 else {
+            throw DaemonSocketError.syscallFailed(
+                operation: "accept",
+                path: address.connectSocketPath,
+                errnoCode: EBADF,
+                detail: "Listener socket is closed."
+            )
+        }
+
+        var clientFD: Int32 = -1
+        while true {
+            clientFD = Darwin.accept(serverFD, nil, nil)
+            if clientFD >= 0 {
+                break
+            }
+            let code = Darwin.errno
+            if code == EINTR {
+                continue
+            }
+            throw DaemonSocketError.syscallFailed(
+                operation: "accept",
+                path: address.connectSocketPath,
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+
+        do {
+            try DaemonSocketPrimitives.configureSocketDescriptor(clientFD, path: address.connectSocketPath)
+            let creds = try DaemonSocketPrimitives.verifyPeerUID(
+                clientFD,
+                expectedUID: expectedUID,
+                path: address.connectSocketPath
+            )
+            return DaemonSocketConnection(fd: clientFD, peerUID: creds.uid, peerGID: creds.gid)
+        } catch {
+            _ = Darwin.close(clientFD)
+            throw error
+        }
+    }
+
+    public func close(unlinkSocket: Bool = true, removeSymlink: Bool = false) {
+        let descriptor = lock.withLock { () -> Int32 in
+            let current = rawListenFD
+            rawListenFD = -1
+            return current
+        }
+        guard descriptor >= 0 else { return }
+        _ = Darwin.close(descriptor)
+        if unlinkSocket {
+            _ = Darwin.unlink(address.physicalSocketFileURL.path)
+        }
+        if removeSymlink {
+            DaemonSocketAddressResolver.removeSymlinkIfPresent(for: address)
+        }
+    }
+}
+
+public enum DaemonSocketClient {
+    public static func connectDirect(
+        socketPath: String,
+        expectedUID: uid_t = Darwin.getuid()
+    ) throws -> DaemonSocketConnection {
+        let sockAddr = try DaemonUnixSocketAddress.makeSockAddrUn(socketPath: socketPath)
+        let directAddr = DaemonResolvedSocketAddress(
+            mode: .direct,
+            connectSocketPath: socketPath,
+            physicalSocketFileURL: URL(fileURLWithPath: socketPath, isDirectory: false).standardizedFileURL,
+            symlinkURL: nil,
+            expectedSymlinkTargetPath: nil
+        )
+        return try connectResolved(
+            address: directAddr,
+            sockAddr: sockAddr,
+            expectedUID: expectedUID
+        )
+    }
+
+    public static func connectResolved(
+        address: DaemonResolvedSocketAddress,
+        sockAddr: sockaddr_un,
+        expectedUID: uid_t = Darwin.getuid()
+    ) throws -> DaemonSocketConnection {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "socket",
+                path: address.connectSocketPath,
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+
+        do {
+            try DaemonSocketPrimitives.configureSocketDescriptor(fd, path: address.connectSocketPath)
+
+            var mutableAddr = sockAddr
+            while true {
+                let rc = withUnsafePointer(to: &mutableAddr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                        Darwin.connect(fd, saPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    }
+                }
+                if rc == 0 {
+                    break
+                }
+                let code = Darwin.errno
+                if code == EINTR {
+                    continue
+                }
+                throw DaemonSocketError.syscallFailed(
+                    operation: "connect",
+                    path: address.connectSocketPath,
+                    errnoCode: code,
+                    detail: String(cString: Darwin.strerror(code))
+                )
+            }
+
+            let creds = try DaemonSocketPrimitives.verifyPeerUID(
+                fd,
+                expectedUID: expectedUID,
+                path: address.connectSocketPath
+            )
+            return DaemonSocketConnection(fd: fd, peerUID: creds.uid, peerGID: creds.gid)
+        } catch {
+            _ = Darwin.close(fd)
+            throw error
+        }
+    }
+}

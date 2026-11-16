@@ -479,4 +479,119 @@ struct CLIAndMCPDaemonRPCTests {
         let preservedTarget = String(decoding: readBuf.prefix(linkLen).map { UInt8(bitPattern: $0) }, as: UTF8.self)
         #expect(preservedTarget == foreignTarget)
     }
+
+    // MARK: - Item 4: Listen & Connect Primitives (0700 run/, 0600 socket, SO_NOSIGPIPE, getpeereid)
+
+    @Test("Item 4: DaemonSocketListener enforces 0700 run/ and 0600 socket, sets SO_NOSIGPIPE (returning EPIPE instead of SIGPIPE), and verifies peer UID via getpeereid")
+    func socketListenerAndClientPermissionsNoSigPipeAndPeerUID() throws {
+        let tempRoot = try makeMkdtempDirectory(prefix: "avm-sock")
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let wsURL = tempRoot.appendingPathComponent("s.agentvm", isDirectory: true)
+        let paths = DaemonWorkspacePaths(workspaceURL: wsURL)
+
+        // Pre-create run/ with 0755 to prove listener tightens it to 0700.
+        try FileManager.default.createDirectory(
+            at: paths.runDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
+        _ = Darwin.chmod(paths.runDirectoryURL.path, mode_t(0o755))
+
+        let listener = try DaemonSocketListener.bindDirect(paths: paths)
+        defer { listener.close(unlinkSocket: true) }
+
+        // 1. Verify 0700 on run/ and 0600 S_IFSOCK on daemon.sock.
+        var runStat = Darwin.stat()
+        #expect(stat(paths.runDirectoryURL.path, &runStat) == 0)
+        #expect((runStat.st_mode & 0o777) == 0o700)
+
+        var sockStat = Darwin.stat()
+        #expect(stat(paths.directSocketPath, &sockStat) == 0)
+        #expect((sockStat.st_mode & S_IFMT) == S_IFSOCK)
+        #expect((sockStat.st_mode & 0o777) == 0o600)
+        #expect(try DaemonSocketPrimitives.isNoSigPipeEnabled(listener.listenFD) == true)
+
+        // 2. Connect + accept with matching UID, verify SO_NOSIGPIPE on both ends, and verify writing after peer close returns EPIPE without SIGPIPE.
+        let acceptedBox = LockedResultBox<Result<DaemonSocketConnection, Error>>()
+        let acceptDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            let res = Result { try listener.acceptConnection() }
+            acceptedBox.store(res)
+            acceptDone.signal()
+        }
+
+        let clientConn = try DaemonSocketClient.connectDirect(socketPath: paths.directSocketPath)
+        acceptDone.wait()
+        let serverConn = try #require(acceptedBox.load()).get()
+        defer {
+            clientConn.close()
+            serverConn.close()
+        }
+
+        #expect(serverConn.peerUID == Darwin.getuid())
+        #expect(clientConn.peerUID == Darwin.getuid())
+        #expect(try DaemonSocketPrimitives.isNoSigPipeEnabled(clientConn.fd) == true)
+        #expect(try DaemonSocketPrimitives.isNoSigPipeEnabled(serverConn.fd) == true)
+
+        try clientConn.writeLineData(Data(#"{"ping":1}"#.utf8))
+        #expect(try serverConn.makeLineReader().readLineData() == Data(#"{"ping":1}"#.utf8))
+
+        // Close client and write from server -> SO_NOSIGPIPE converts broken pipe into EPIPE error instead of killing test process.
+        clientConn.close()
+        do {
+            try serverConn.writeLineData(Data(repeating: UInt8(ascii: "p"), count: 1024))
+            Issue.record("Expected EPIPE error writing to closed peer socket")
+        } catch let err as DaemonRPCLineFramingError {
+            guard case let .ioError(errnoCode, _) = err else {
+                Issue.record("Expected ioError, got \(err)")
+                return
+            }
+            #expect(errnoCode == EPIPE || errnoCode == ECONNRESET)
+        }
+
+        // 3. Peer UID mismatch in getpeereid rejects and immediately closes the accepted connection.
+        let wrongUID = Darwin.getuid() &+ 1
+        let rejectedBox = LockedResultBox<Result<DaemonSocketConnection, Error>>()
+        let rejectDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            let res = Result { try listener.acceptConnection(expectedUID: wrongUID) }
+            rejectedBox.store(res)
+            rejectDone.signal()
+        }
+
+        let rejectedClient = try DaemonSocketClient.connectDirect(socketPath: paths.directSocketPath)
+        defer { rejectedClient.close() }
+        rejectDone.wait()
+
+        do {
+            _ = try #require(rejectedBox.load()).get()
+            Issue.record("Expected unauthorizedPeerUID when expectedUID != getuid()")
+        } catch let err as DaemonSocketError {
+            #expect(err == .unauthorizedPeerUID(expected: wrongUID, actual: Darwin.getuid()))
+        }
+
+        // Server closed the rejected fd immediately, so client reads EOF (or ECONNRESET).
+        do {
+            let eof = try rejectedClient.makeLineReader().readLineData()
+            #expect(eof == nil)
+        } catch let err as DaemonRPCLineFramingError {
+            if case let .ioError(code, _) = err {
+                #expect(code == ECONNRESET)
+            } else {
+                Issue.record("Unexpected framing error on rejected peer: \(err)")
+            }
+        }
+    }
+}
+
+private final class LockedResultBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T?
+    func store(_ newValue: T) {
+        lock.withLock { value = newValue }
+    }
+    func load() -> T? {
+        lock.withLock { value }
+    }
 }

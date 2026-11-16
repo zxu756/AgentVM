@@ -1,4 +1,5 @@
 import AgentVMModels
+import Darwin
 import Foundation
 
 // MARK: - Line-Delimited JSON-RPC 2.0 Wire Protocol for AgentVM Workspace Daemon (M2)
@@ -898,5 +899,243 @@ public enum DaemonRPCCodec {
         }
         let resp = try decoder.decode(DaemonRPCResponse<ResultPayload>.self, from: lineData)
         return .response(resp)
+    }
+}
+
+// MARK: - Chunked 64 KiB Line Framing with Bounded Line Length
+
+public enum DaemonRPCLineFraming {
+    /// Default POSIX `read(2)` chunk size (64 KiB) to avoid per-byte syscall overhead on streamed payloads.
+    public static let defaultReadChunkBytes: Int = 64 * 1024
+    /// Maximum UTF-8 / JSON byte length of a single line (excluding trailing `\n`): 8 MiB.
+    /// Accommodates macOS `ARG_MAX` (1 MiB), Base64-encoded `exec.output` chunks, and multi-VM
+    /// `list` / `status` payloads (where each `VMInstanceRecord` embeds cloud-init scripts), while
+    /// bounding per-connection read memory strictly against unterminated streams.
+    public static let maxLineBytes: Int = 8 * 1024 * 1024
+}
+
+public enum DaemonRPCLineFramingError: Error, LocalizedError, Hashable, Sendable {
+    case lineTooLong(limitBytes: Int)
+    case unterminatedLineAtEOF(byteCount: Int)
+    case embeddedNewlineInOutgoingLine
+    case ioError(errnoCode: Int32, detail: String)
+
+    public var errorCode: String {
+        switch self {
+        case .lineTooLong:
+            return "ERR_DAEMON_LINE_TOO_LONG"
+        case .unterminatedLineAtEOF, .embeddedNewlineInOutgoingLine:
+            return "ERR_DAEMON_PROTOCOL"
+        case .ioError:
+            return "ERR_DAEMON_IPC"
+        }
+    }
+
+    public var errorDescription: String? {
+        localizedMessage(in: .en)
+    }
+
+    public func localizedMessage(in language: AppLanguage) -> String {
+        let isZh = (language == .zhHans)
+        switch self {
+        case let .lineTooLong(limitBytes):
+            return isZh
+                ? "守护进程单行 JSON-RPC 消息超过上限（\(limitBytes) 字节）。"
+                : "Daemon JSON-RPC line exceeded maximum length (\(limitBytes) bytes)."
+        case let .unterminatedLineAtEOF(byteCount):
+            return isZh
+                ? "守护进程连接在收到换行符前意外断开（残留 \(byteCount) 字节）。"
+                : "Daemon RPC stream ended before newline delimiter (\(byteCount) trailing bytes)."
+        case .embeddedNewlineInOutgoingLine:
+            return isZh
+                ? "待发送的单行 JSON-RPC 数据中包含换行符。"
+                : "Outgoing single-line JSON-RPC payload contains an embedded newline byte."
+        case let .ioError(errnoCode, detail):
+            return isZh
+                ? "守护进程套接字读写失败（errno=\(errnoCode)）：\(detail)"
+                : "Daemon socket I/O error (errno=\(errnoCode)): \(detail)"
+        }
+    }
+}
+
+public final class DaemonRPCLineReader {
+    public typealias ReadFunction = (Int32, UnsafeMutableRawPointer, Int) -> Int
+
+    public let fd: Int32
+    public let readChunkBytes: Int
+    public let maxLineBytes: Int
+    private let readFunction: ReadFunction
+
+    private var buffer: [UInt8] = []
+    private var cursor: Int = 0
+    private var scratch: [UInt8]
+
+    public init(
+        fd: Int32,
+        readChunkBytes: Int = DaemonRPCLineFraming.defaultReadChunkBytes,
+        maxLineBytes: Int = DaemonRPCLineFraming.maxLineBytes,
+        readFunction: @escaping ReadFunction = { fd, buf, count in Darwin.read(fd, buf, count) }
+    ) {
+        let normalizedChunk = max(1, readChunkBytes)
+        let normalizedMax = max(1, maxLineBytes)
+        self.fd = fd
+        self.readChunkBytes = normalizedChunk
+        self.maxLineBytes = normalizedMax
+        self.readFunction = readFunction
+        self.scratch = [UInt8](repeating: 0, count: normalizedChunk)
+    }
+
+    /// Reads the next `\n`-delimited line (without the `\n` byte), returning `nil` on clean EOF.
+    public func readLineData() throws -> Data? {
+        while true {
+            if let nlIndex = buffer[cursor..<buffer.count].firstIndex(of: 0x0A) {
+                let lineLength = nlIndex - cursor
+                guard lineLength <= maxLineBytes else {
+                    resetBuffer()
+                    throw DaemonRPCLineFramingError.lineTooLong(limitBytes: maxLineBytes)
+                }
+                let lineData = Data(buffer[cursor..<nlIndex])
+                cursor = nlIndex + 1
+                compactBufferIfNeeded()
+                return lineData
+            }
+
+            let unreadCount = buffer.count - cursor
+            if unreadCount > maxLineBytes {
+                resetBuffer()
+                throw DaemonRPCLineFramingError.lineTooLong(limitBytes: maxLineBytes)
+            }
+
+            if cursor > 0 && cursor >= readChunkBytes {
+                buffer.removeFirst(cursor)
+                cursor = 0
+            }
+
+            let bytesRead = try performChunkRead()
+            if bytesRead == 0 {
+                let trailing = buffer.count - cursor
+                if trailing == 0 {
+                    resetBuffer()
+                    return nil
+                }
+                resetBuffer()
+                throw DaemonRPCLineFramingError.unterminatedLineAtEOF(byteCount: trailing)
+            }
+
+            let slice = scratch[0..<bytesRead]
+            if let firstNLOffset = slice.firstIndex(of: 0x0A) {
+                let candidateLineLength = (buffer.count - cursor) + firstNLOffset
+                if candidateLineLength > maxLineBytes {
+                    resetBuffer()
+                    throw DaemonRPCLineFramingError.lineTooLong(limitBytes: maxLineBytes)
+                }
+                buffer.append(contentsOf: slice)
+            } else {
+                let nextUnread = (buffer.count - cursor) + bytesRead
+                if nextUnread > maxLineBytes {
+                    resetBuffer()
+                    throw DaemonRPCLineFramingError.lineTooLong(limitBytes: maxLineBytes)
+                }
+                buffer.append(contentsOf: slice)
+            }
+        }
+    }
+
+    public func readDecodableLine<T: Decodable>(_ type: T.Type) throws -> T? {
+        guard let line = try readLineData() else { return nil }
+        return try DaemonRPCCodec.decodePayloadLine(T.self, from: line)
+    }
+
+    private func performChunkRead() throws -> Int {
+        let chunkCap = readChunkBytes
+        let fn = readFunction
+        let descriptor = fd
+        while true {
+            let n = scratch.withUnsafeMutableBytes { rawBuf -> Int in
+                guard let base = rawBuf.baseAddress else { return 0 }
+                return fn(descriptor, base, chunkCap)
+            }
+            if n >= 0 {
+                return n
+            }
+            let code = Darwin.errno
+            if code == EINTR {
+                continue
+            }
+            throw DaemonRPCLineFramingError.ioError(
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+    }
+
+    private func compactBufferIfNeeded() {
+        if cursor == buffer.count {
+            buffer.removeAll(keepingCapacity: true)
+            cursor = 0
+        } else if cursor >= readChunkBytes && cursor * 2 >= buffer.count {
+            buffer.removeFirst(cursor)
+            cursor = 0
+        }
+    }
+
+    private func resetBuffer() {
+        buffer.removeAll(keepingCapacity: false)
+        cursor = 0
+    }
+}
+
+public enum DaemonRPCLineWriter {
+    public static func writeLineData(
+        _ lineData: Data,
+        toFD fd: Int32,
+        maxLineBytes: Int = DaemonRPCLineFraming.maxLineBytes
+    ) throws {
+        guard !lineData.contains(0x0A) else {
+            throw DaemonRPCLineFramingError.embeddedNewlineInOutgoingLine
+        }
+        guard lineData.count <= maxLineBytes else {
+            throw DaemonRPCLineFramingError.lineTooLong(limitBytes: maxLineBytes)
+        }
+
+        var framed = Data()
+        framed.reserveCapacity(lineData.count + 1)
+        framed.append(lineData)
+        framed.append(0x0A)
+
+        try framed.withUnsafeBytes { rawBuf in
+            guard let base = rawBuf.baseAddress else { return }
+            var offset = 0
+            let total = rawBuf.count
+            while offset < total {
+                let written = Darwin.write(fd, base.advanced(by: offset), total - offset)
+                if written > 0 {
+                    offset += written
+                } else if written < 0 {
+                    let code = Darwin.errno
+                    if code == EINTR {
+                        continue
+                    }
+                    throw DaemonRPCLineFramingError.ioError(
+                        errnoCode: code,
+                        detail: String(cString: Darwin.strerror(code))
+                    )
+                } else {
+                    throw DaemonRPCLineFramingError.ioError(
+                        errnoCode: EPIPE,
+                        detail: "Zero-byte write on daemon socket."
+                    )
+                }
+            }
+        }
+    }
+
+    public static func writeEncodableLine<T: Encodable>(
+        _ value: T,
+        toFD fd: Int32,
+        maxLineBytes: Int = DaemonRPCLineFraming.maxLineBytes
+    ) throws {
+        let encoded = try DaemonRPCCodec.encodePayloadLine(value)
+        try writeLineData(encoded, toFD: fd, maxLineBytes: maxLineBytes)
     }
 }

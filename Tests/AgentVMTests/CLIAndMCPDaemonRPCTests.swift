@@ -209,4 +209,146 @@ struct CLIAndMCPDaemonRPCTests {
         #expect(enErrPayload.errorCode == "ERR_VM_LOCKED")
         #expect(enErrPayload.message.contains("currently in use by process 4321"))
     }
+
+    // MARK: - Item 2: Chunked 64 KiB Line Reader/Writer & Bounded Line Length
+
+    @Test("Item 2: DaemonRPCLineReader reads in 64 KiB chunks (never byte-by-byte), handles coalesced/fragmented lines, and rejects oversized or unterminated lines")
+    func daemonRPCLineReaderChunkedIOAndMaxLineLimit() throws {
+        #expect(DaemonRPCLineFraming.defaultReadChunkBytes == 64 * 1024)
+        #expect(DaemonRPCLineFraming.maxLineBytes == 8 * 1024 * 1024)
+
+        // 1. Live socketpair: 200 KiB line + 2 coalesced follow-up lines -> read syscall count << byte count
+        // and every read requests 64 KiB.
+        var pair: [Int32] = [-1, -1]
+        #expect(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0)
+        defer {
+            if pair[0] >= 0 { _ = Darwin.close(pair[0]) }
+            if pair[1] >= 0 { _ = Darwin.close(pair[1]) }
+        }
+
+        final class SyscallCounter: @unchecked Sendable {
+            let lock = NSLock()
+            var callCount = 0
+            var requestedSizes: [Int] = []
+            func record(requested: Int) {
+                lock.withLock {
+                    callCount += 1
+                    requestedSizes.append(requested)
+                }
+            }
+        }
+        let counter = SyscallCounter()
+
+        let bigPayload = Data(repeating: UInt8(ascii: "x"), count: 200_000)
+        let line2 = Data(#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#.utf8)
+        let line3 = Data(#"{"jsonrpc":"2.0","id":3,"result":{"ok":false}}"#.utf8)
+
+        let writeFD = pair[1]
+        let writerThreadFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            try? DaemonRPCLineWriter.writeLineData(bigPayload, toFD: writeFD)
+            var coalesced = Data()
+            coalesced.append(line2)
+            coalesced.append(0x0A)
+            coalesced.append(line3)
+            coalesced.append(0x0A)
+            coalesced.withUnsafeBytes { raw in
+                if let base = raw.baseAddress {
+                    _ = Darwin.write(writeFD, base, raw.count)
+                }
+            }
+            _ = Darwin.shutdown(writeFD, SHUT_WR)
+            writerThreadFinished.signal()
+        }
+
+        let reader = DaemonRPCLineReader(
+            fd: pair[0],
+            readFunction: { fd, buf, count in
+                counter.record(requested: count)
+                return Darwin.read(fd, buf, count)
+            }
+        )
+
+        let got1 = try #require(try reader.readLineData())
+        let got2 = try #require(try reader.readLineData())
+        let got3 = try #require(try reader.readLineData())
+        let gotEOF = try reader.readLineData()
+        writerThreadFinished.wait()
+
+        #expect(got1 == bigPayload)
+        #expect(got2 == line2)
+        #expect(got3 == line3)
+        #expect(gotEOF == nil)
+        #expect(counter.callCount > 0 && counter.callCount < 50, "Expected chunked reads, got \(counter.callCount) syscalls")
+        #expect(counter.requestedSizes.allSatisfy { $0 == 64 * 1024 })
+
+        // 2. Exact maxLineBytes boundary passes; maxLineBytes + 1 fails immediately without unbounded buffering.
+        let exact4K = Data(repeating: UInt8(ascii: "a"), count: 4096)
+        let over4K = Data(repeating: UInt8(ascii: "b"), count: 4097)
+        var wireBytes = Data()
+        wireBytes.append(exact4K)
+        wireBytes.append(0x0A)
+        wireBytes.append(over4K)
+        wireBytes.append(0x0A)
+
+        var cursor = 0
+        let boundedReader = DaemonRPCLineReader(
+            fd: -1,
+            readChunkBytes: 1024,
+            maxLineBytes: 4096,
+            readFunction: { _, buf, count in
+                let remaining = wireBytes.count - cursor
+                guard remaining > 0 else { return 0 }
+                let n = min(count, remaining)
+                wireBytes.withUnsafeBytes { src in
+                    buf.copyMemory(from: src.baseAddress!.advanced(by: cursor), byteCount: n)
+                }
+                cursor += n
+                return n
+            }
+        )
+        #expect(try boundedReader.readLineData() == exact4K)
+        #expect(throws: DaemonRPCLineFramingError.lineTooLong(limitBytes: 4096)) {
+            _ = try boundedReader.readLineData()
+        }
+
+        // 3. Default 8 MiB limit stops reading an endless newline-free stream right past 8 MiB (does not consume 64 MiB).
+        var fedBytes = 0
+        let defaultLimitReader = DaemonRPCLineReader(
+            fd: -1,
+            readFunction: { _, buf, count in
+                if fedBytes >= 64 * 1024 * 1024 { return 0 }
+                memset(buf, Int32(UInt8(ascii: "z")), count)
+                fedBytes += count
+                return count
+            }
+        )
+        #expect(throws: DaemonRPCLineFramingError.lineTooLong(limitBytes: DaemonRPCLineFraming.maxLineBytes)) {
+            _ = try defaultLimitReader.readLineData()
+        }
+        #expect(
+            fedBytes == DaemonRPCLineFraming.maxLineBytes + DaemonRPCLineFraming.defaultReadChunkBytes,
+            "Reader must abort immediately once unread bytes exceed maxLineBytes (fed \(fedBytes) bytes)"
+        )
+
+        // 4. Unterminated trailing bytes at EOF & writer newline/size guards.
+        var didSendPartial = false
+        let truncatedReader = DaemonRPCLineReader(
+            fd: -1,
+            readFunction: { _, buf, _ in
+                guard !didSendPartial else { return 0 }
+                didSendPartial = true
+                let partial = Array(#"{"jsonrpc":"2.0""#.utf8)
+                buf.copyMemory(from: partial, byteCount: partial.count)
+                return partial.count
+            }
+        )
+        #expect(throws: DaemonRPCLineFramingError.unterminatedLineAtEOF(byteCount: 16)) {
+            _ = try truncatedReader.readLineData()
+        }
+
+        #expect(throws: DaemonRPCLineFramingError.embeddedNewlineInOutgoingLine) {
+            try DaemonRPCLineWriter.writeLineData(Data("bad\nline".utf8), toFD: pair[1])
+        }
+    }
 }

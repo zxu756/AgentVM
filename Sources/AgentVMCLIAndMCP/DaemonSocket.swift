@@ -179,36 +179,59 @@ public enum DaemonSocketAddressResolver {
         return URL(fileURLWithPath: rawPath, isDirectory: true).standardizedFileURL
     }
 
-    /// Resolves symlinks on the deepest existing ancestor via POSIX `realpath(3)` and appends standardized
-    /// remaining components, so pre-creation and post-creation callers compute the exact same real path.
-    public static func canonicalRealPath(of url: URL) -> String {
-        let standardized = url.standardizedFileURL
-        var probeURL = standardized
-        var trailingComponents: [String] = []
+    /// Lexically normalizes `.`, `..`, and duplicate `/` separators without consulting the filesystem
+    /// (avoiding Foundation `URL.standardizedFileURL`'s existence-dependent `/private` stripping).
+    public static func lexicallyNormalizedAbsolutePath(_ rawPath: String) -> String {
+        let expanded: String
+        if rawPath.hasPrefix("/") {
+            expanded = rawPath
+        } else {
+            let cwd = FileManager.default.currentDirectoryPath
+            expanded = cwd.hasSuffix("/") ? (cwd + rawPath) : (cwd + "/" + rawPath)
+        }
 
-        while probeURL.path != "/" && !probeURL.path.isEmpty {
-            if let resolvedC = Darwin.realpath(probeURL.path, nil) {
+        var stack: [Substring] = []
+        for part in expanded.split(separator: "/", omittingEmptySubsequences: true) {
+            if part == "." {
+                continue
+            } else if part == ".." {
+                if !stack.isEmpty {
+                    stack.removeLast()
+                }
+            } else {
+                stack.append(part)
+            }
+        }
+        if stack.isEmpty {
+            return "/"
+        }
+        return "/" + stack.joined(separator: "/")
+    }
+
+    /// Resolves symlinks on the deepest existing ancestor via POSIX `realpath(3)` and appends lexically
+    /// normalized remaining components directly (never re-wrapping in `URL.standardizedFileURL`, which
+    /// strips `/private` only when the target exists on disk).
+    public static func canonicalRealPath(of url: URL) -> String {
+        let normalized = lexicallyNormalizedAbsolutePath(url.path)
+        if normalized == "/" {
+            return "/"
+        }
+        let components = normalized.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        for prefixLen in stride(from: components.count, through: 1, by: -1) {
+            let candidate = "/" + components[0..<prefixLen].joined(separator: "/")
+            if let resolvedC = Darwin.realpath(candidate, nil) {
                 defer { Darwin.free(resolvedC) }
                 let baseBytes = UnsafeBufferPointer(start: resolvedC, count: Int(Darwin.strlen(resolvedC)))
                     .map { UInt8(bitPattern: $0) }
-                var resolvedURL = URL(
-                    fileURLWithPath: String(decoding: baseBytes, as: UTF8.self),
-                    isDirectory: true
-                )
-                for component in trailingComponents.reversed() {
-                    resolvedURL.appendPathComponent(component, isDirectory: false)
+                let resolvedBase = String(decoding: baseBytes, as: UTF8.self)
+                if prefixLen == components.count {
+                    return resolvedBase
                 }
-                return resolvedURL.standardizedFileURL.path
+                let suffix = components[prefixLen..<components.count].joined(separator: "/")
+                return resolvedBase == "/" ? "/\(suffix)" : "\(resolvedBase)/\(suffix)"
             }
-            let last = probeURL.lastPathComponent
-            if last.isEmpty || last == "/" {
-                break
-            }
-            trailingComponents.append(last)
-            probeURL.deleteLastPathComponent()
         }
-
-        return standardized.path
+        return normalized
     }
 
     public static func computePlan(
@@ -232,14 +255,11 @@ public enum DaemonSocketAddressResolver {
         let hashPrefix = String(fullHash.prefix(symlinkHashHexPrefixLength))
         let symlinkName = "avm-\(hashPrefix)"
 
-        let tempDirURL = try (userTempDirectoryOverride?.standardizedFileURL ?? darwinUserTempDirectoryURL())
-        let symlinkURL = tempDirURL
-            .appendingPathComponent(symlinkName, isDirectory: false)
-            .standardizedFileURL
-        let shortSocketPath = symlinkURL
-            .appendingPathComponent("daemon.sock", isDirectory: false)
-            .standardizedFileURL
-            .path
+        let rawTempDirURL = try (userTempDirectoryOverride ?? darwinUserTempDirectoryURL())
+        let tempDirPath = lexicallyNormalizedAbsolutePath(rawTempDirURL.standardizedFileURL.path)
+        let symlinkPath = (tempDirPath == "/") ? "/\(symlinkName)" : "\(tempDirPath)/\(symlinkName)"
+        let symlinkURL = URL(fileURLWithPath: symlinkPath, isDirectory: false)
+        let shortSocketPath = "\(symlinkPath)/daemon.sock"
 
         // Validate that the short symlinked socket path itself fits in sockaddr_un (A43).
         _ = try DaemonUnixSocketAddress.makeSockAddrUn(socketPath: shortSocketPath)
@@ -405,12 +425,10 @@ public enum DaemonSocketAddressResolver {
 
     private static func resolveSymlinkDestinationURL(symlinkPath: String, rawTarget: String) -> URL {
         if rawTarget.hasPrefix("/") {
-            return URL(fileURLWithPath: rawTarget, isDirectory: true).standardizedFileURL
+            return URL(fileURLWithPath: lexicallyNormalizedAbsolutePath(rawTarget), isDirectory: true)
         }
-        return URL(fileURLWithPath: symlinkPath, isDirectory: false)
-            .deletingLastPathComponent()
-            .appendingPathComponent(rawTarget, isDirectory: true)
-            .standardizedFileURL
+        let parentPath = URL(fileURLWithPath: symlinkPath, isDirectory: false).deletingLastPathComponent().path
+        return URL(fileURLWithPath: lexicallyNormalizedAbsolutePath("\(parentPath)/\(rawTarget)"), isDirectory: true)
     }
 }
 
@@ -743,6 +761,22 @@ public final class DaemonSocketListener: @unchecked Sendable {
 }
 
 public enum DaemonSocketClient {
+    public static func connectWorkspace(
+        workspaceURL: URL,
+        expectedUID: uid_t = Darwin.getuid(),
+        userTempDirectoryOverride: URL? = nil
+    ) throws -> DaemonSocketConnection {
+        let (address, sockAddr) = try DaemonSocketAddressResolver.resolveForConnect(
+            workspaceURL: workspaceURL,
+            userTempDirectoryOverride: userTempDirectoryOverride
+        )
+        return try connectResolved(
+            address: address,
+            sockAddr: sockAddr,
+            expectedUID: expectedUID
+        )
+    }
+
     public static func connectDirect(
         socketPath: String,
         expectedUID: uid_t = Darwin.getuid()
@@ -1062,7 +1096,6 @@ public enum DaemonWorkspaceServerBootstrap {
         backlog: Int32 = 32,
         userTempDirectoryOverride: URL? = nil
     ) throws -> DaemonWorkspaceBindOutcome {
-        _ = userTempDirectoryOverride
         let paths = DaemonWorkspacePaths(workspaceURL: workspaceURL)
 
         let lockOutcome = try DaemonSingletonLock.tryAcquire(
@@ -1080,6 +1113,7 @@ public enum DaemonWorkspaceServerBootstrap {
             acquiredLock = lock
         }
 
+        var preparedAddress: DaemonResolvedSocketAddress?
         do {
             if Darwin.unlink(paths.directSocketPath) != 0 {
                 let code = Darwin.errno
@@ -1093,13 +1127,26 @@ public enum DaemonWorkspaceServerBootstrap {
                 }
             }
 
-            let listener = try DaemonSocketListener.bindDirect(paths: paths, backlog: backlog)
+            let (address, sockAddr) = try DaemonSocketAddressResolver.prepareForBind(
+                workspaceURL: paths.workspaceURL,
+                userTempDirectoryOverride: userTempDirectoryOverride
+            )
+            preparedAddress = address
+            let listener = try DaemonSocketListener.bindResolved(
+                address: address,
+                sockAddr: sockAddr,
+                runDirectoryURL: paths.runDirectoryURL,
+                backlog: backlog
+            )
             return .bound(DaemonBoundWorkspaceServer(
                 paths: paths,
                 singletonLock: acquiredLock,
                 listener: listener
             ))
         } catch {
+            if let addr = preparedAddress {
+                DaemonSocketAddressResolver.removeSymlinkIfPresent(for: addr)
+            }
             acquiredLock.release(clearFile: true)
             throw error
         }

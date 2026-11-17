@@ -184,6 +184,38 @@ public struct DaemonRPCStatusParams: Codable, Hashable, Sendable {
     }
 }
 
+public struct DaemonRPCStatusVM: Codable, Hashable, Sendable, Identifiable {
+    public var id: VMID { spec.id }
+    public var spec: VMSpec
+    public var currentHeadSnapshotID: SnapshotID?
+    public var telemetry: VMLiveTelemetry
+    public var lastBootedAt: Date?
+    public var lastErrorDescription: String?
+    public var guestAgentVersion: String?
+
+    public init(
+        record: VMInstanceRecord,
+        guestAgentVersion: String? = nil
+    ) {
+        self.spec = record.spec
+        self.currentHeadSnapshotID = record.currentHeadSnapshotID
+        self.telemetry = record.telemetry
+        self.lastBootedAt = record.lastBootedAt
+        self.lastErrorDescription = record.lastErrorDescription
+        self.guestAgentVersion = guestAgentVersion
+    }
+
+    public var vmRecord: VMInstanceRecord {
+        VMInstanceRecord(
+            spec: spec,
+            currentHeadSnapshotID: currentHeadSnapshotID,
+            telemetry: telemetry,
+            lastBootedAt: lastBootedAt,
+            lastErrorDescription: lastErrorDescription
+        )
+    }
+}
+
 public struct DaemonRPCStatusResult: Codable, Hashable, Sendable {
     public var pid: Int32
     public var startedAt: Date
@@ -192,7 +224,7 @@ public struct DaemonRPCStatusResult: Codable, Hashable, Sendable {
     public var executablePath: String
     public var protocolVersion: Int
     public var semanticVersion: SemanticVersion
-    public var vms: [VMInstanceRecord]
+    public var vms: [DaemonRPCStatusVM]
 
     public init(
         pid: Int32,
@@ -202,7 +234,7 @@ public struct DaemonRPCStatusResult: Codable, Hashable, Sendable {
         executablePath: String,
         protocolVersion: Int = DaemonRPCHello.currentProtocolVersion,
         semanticVersion: SemanticVersion = .current,
-        vms: [VMInstanceRecord] = []
+        vms: [DaemonRPCStatusVM] = []
     ) {
         self.pid = pid
         self.startedAt = startedAt
@@ -212,6 +244,28 @@ public struct DaemonRPCStatusResult: Codable, Hashable, Sendable {
         self.protocolVersion = protocolVersion
         self.semanticVersion = semanticVersion
         self.vms = vms
+    }
+
+    public init(
+        pid: Int32,
+        startedAt: Date,
+        socketPath: String,
+        workspacePath: String,
+        executablePath: String,
+        protocolVersion: Int = DaemonRPCHello.currentProtocolVersion,
+        semanticVersion: SemanticVersion = .current,
+        records: [VMInstanceRecord]
+    ) {
+        self.init(
+            pid: pid,
+            startedAt: startedAt,
+            socketPath: socketPath,
+            workspacePath: workspacePath,
+            executablePath: executablePath,
+            protocolVersion: protocolVersion,
+            semanticVersion: semanticVersion,
+            vms: records.map { DaemonRPCStatusVM(record: $0) }
+        )
     }
 }
 

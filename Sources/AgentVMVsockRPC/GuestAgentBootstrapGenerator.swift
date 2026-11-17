@@ -348,8 +348,8 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         class ProcTelemetryCollector:
             def __init__(self, proc_root: str = "/proc") -> None:
                 self.proc_root = proc_root or "/proc"
-                self._prev_cpu_total = 0
-                self._prev_cpu_idle = 0
+                self._prev_cpu_total = None
+                self._prev_cpu_idle = None
                 self._page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
             def _proc_path(self, *parts: str) -> str:
@@ -359,12 +359,15 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 try:
                     with open(self._proc_path("stat"), "r", encoding="utf-8") as fh:
                         first = fh.readline()
-                    parts = [int(x) for x in first.split()[1:]]
+                    tokens = first.split()
+                    if len(tokens) < 5 or tokens[0] != "cpu":
+                        return None
+                    parts = [int(x) for x in tokens[1:]]
                     idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
                     total = sum(parts)
                     return total, idle
                 except Exception:
-                    return 0, 0
+                    return None
 
             def collect_heartbeat(self) -> dict:
                 uname = os.uname()
@@ -384,9 +387,19 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 except Exception:
                     pass
 
-                # Touch /proc/stat for CPU accounting readiness
-                cur_total, cur_idle = self._sample_cpu_jiffies()
-                self._prev_cpu_total, self._prev_cpu_idle = cur_total, cur_idle
+                cpu_usage_pct = None
+                cpu_sample = self._sample_cpu_jiffies()
+                if cpu_sample is not None:
+                    cur_total, cur_idle = cpu_sample
+                    if self._prev_cpu_total is not None and self._prev_cpu_idle is not None:
+                        delta_total = cur_total - self._prev_cpu_total
+                        delta_idle = cur_idle - self._prev_cpu_idle
+                        if delta_total > 0:
+                            cpu_usage_pct = min(
+                                100.0,
+                                max(0.0, ((delta_total - delta_idle) / float(delta_total)) * 100.0),
+                            )
+                    self._prev_cpu_total, self._prev_cpu_idle = cur_total, cur_idle
 
                 mem_total = 0
                 mem_avail = 0
@@ -410,7 +423,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                     pass
 
                 top_procs = self._collect_top_processes(uptime_secs)
-                return {
+                hb = {
                     "hostname": hostname,
                     "kernelRelease": kernel_release,
                     "uptimeSeconds": uptime_secs,
@@ -424,6 +437,9 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                     "topProcesses": top_procs,
                     "reportedAt": time.time(),
                 }
+                if cpu_usage_pct is not None:
+                    hb["cpuUsagePercent"] = cpu_usage_pct
+                return hb
 
             def _collect_top_processes(self, uptime_secs: float):
                 samples = []
@@ -888,7 +904,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
             def _on_control(self, payload: bytes) -> None:
                 pong = {
                     "kind": "pong",
-                    "agentVersion": "1.0.0",
+                    "agentVersion": "2",
                     "maxWindowBytes": DEFAULT_WINDOW_CREDIT,
                     "timestampUnix": time.time(),
                     "capabilities": ["exec", "pty", "file-sha256", "tcp-forward", "heartbeat", "zlib"],

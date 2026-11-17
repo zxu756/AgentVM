@@ -598,6 +598,8 @@ public final class VsockStreamAccumulator: @unchecked Sendable {
 
 /// Control message exchanged on `.control` (`streamID == 0`).
 public struct VsockControlEnvelope: Codable, Hashable, Sendable {
+    public static let currentAgentVersion: String = "2"
+
     public enum Kind: String, Codable, Hashable, Sendable {
         case hello
         case helloAck
@@ -614,7 +616,7 @@ public struct VsockControlEnvelope: Codable, Hashable, Sendable {
 
     public init(
         kind: Kind,
-        agentVersion: String = "1.0.0",
+        agentVersion: String = Self.currentAgentVersion,
         maxWindowBytes: UInt32 = VsockWireConstants.defaultWindowCredit,
         timestampUnix: Double = Date().timeIntervalSince1970,
         capabilities: [String] = ["exec", "pty", "file-sha256", "tcp-forward", "heartbeat", "zlib"]

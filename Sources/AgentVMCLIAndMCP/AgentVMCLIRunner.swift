@@ -2152,7 +2152,7 @@ public struct AgentVMCLIRunner: Sendable {
         var executablePath: String?
         var protocolVersion: Int?
         var semanticVersion: SemanticVersion?
-        var vms: [VMInstanceRecord]?
+        var vms: [DaemonRPCStatusVM]?
     }
 
     private struct DaemonStopCLIJSON: Codable, Sendable {
@@ -2280,7 +2280,12 @@ public struct AgentVMCLIRunner: Sendable {
                 if status.vms.isEmpty {
                     vmSummary = isZh ? "0 台" : "0"
                 } else {
-                    let names = status.vms.map { "\($0.spec.name) (\($0.id.rawValue))" }.joined(separator: ", ")
+                    let names = status.vms.map { item -> String in
+                        if let ver = item.guestAgentVersion, !ver.isEmpty {
+                            return "\(item.spec.name) (\(item.id.rawValue), guestAgent=\(ver))"
+                        }
+                        return "\(item.spec.name) (\(item.id.rawValue))"
+                    }.joined(separator: ", ")
                     vmSummary = "\(status.vms.count) [\(names)]"
                 }
                 let out: String

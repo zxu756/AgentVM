@@ -522,7 +522,13 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
 
             switch envelope.call {
             case .status:
-                let heldVMs = try await coordinator.daemonHeldVMs()
+                let heldWithVersions = try await coordinator.daemonHeldVMsWithGuestAgentVersions()
+                let statusVMs = heldWithVersions.map { entry in
+                    DaemonRPCStatusVM(
+                        record: entry.record,
+                        guestAgentVersion: entry.guestAgentVersion
+                    )
+                }
                 let payload = DaemonRPCStatusResult(
                     pid: holderInfo.pid,
                     startedAt: holderInfo.startedAt,
@@ -531,7 +537,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                     executablePath: executablePath,
                     protocolVersion: protocolVersion,
                     semanticVersion: semanticVersion,
-                    vms: heldVMs
+                    vms: statusVMs
                 )
                 let resp = DaemonRPCResponse<DaemonRPCStatusResult>.success(id: envelope.id, result: payload)
                 try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))

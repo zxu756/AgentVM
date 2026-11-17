@@ -287,18 +287,21 @@ public actor AgentVMFleetCoordinator {
     public let guestBootstrap = GuestAgentBootstrapGenerator()
 
     public static let defaultVsockReconnectInitialDelayNanoseconds: UInt64 = 350_000_000
+    public static let defaultVsockHandshakeTimeoutNanoseconds: UInt64 = 250_000_000
 
     public nonisolated let isWorkspaceDaemon: Bool
     private let hardwareBackend: any HardwareVMLowLevelBackend
     private let vsockConnectTimeoutNanoseconds: UInt64
     private let vsockRetryIntervalNanoseconds: UInt64
     private let vsockReconnectInitialDelayNanoseconds: UInt64
+    private let vsockHandshakeTimeoutNanoseconds: UInt64
     private let gracefulStopTimeoutNanoseconds: UInt64
 
     private var executionBackend: HypervisorExecutionBackend
     private var vsockSessions: [VMID: VsockMultiplexSession] = [:]
     private var vsockSessionTokens: [VMID: UUID] = [:]
     private var vsockGenerationCounters: [VMID: UInt64] = [:]
+    private var negotiatedGuestAgentVersions: [VMID: String] = [:]
     private var terminalBuffers: [VMID: VT100ScreenBuffer] = [:]
     private var hardwareBoxes: [VMID: any HardwareVMInstanceHandle] = [:]
     private var hardwareBoxTokens: [VMID: UUID] = [:]
@@ -669,6 +672,7 @@ public actor AgentVMFleetCoordinator {
         vsockConnectTimeoutNanoseconds: UInt64 = 180_000_000_000,
         vsockRetryIntervalNanoseconds: UInt64 = 1_000_000_000,
         vsockReconnectInitialDelayNanoseconds: UInt64 = AgentVMFleetCoordinator.defaultVsockReconnectInitialDelayNanoseconds,
+        vsockHandshakeTimeoutNanoseconds: UInt64 = AgentVMFleetCoordinator.defaultVsockHandshakeTimeoutNanoseconds,
         gracefulStopTimeoutNanoseconds: UInt64 = 30_000_000_000
     ) throws {
         let createdStore = try AgentVMProjectStore(bundleURL: bundleURL, createIfMissing: true)
@@ -698,6 +702,7 @@ public actor AgentVMFleetCoordinator {
         self.vsockConnectTimeoutNanoseconds = vsockConnectTimeoutNanoseconds
         self.vsockRetryIntervalNanoseconds = vsockRetryIntervalNanoseconds
         self.vsockReconnectInitialDelayNanoseconds = vsockReconnectInitialDelayNanoseconds
+        self.vsockHandshakeTimeoutNanoseconds = vsockHandshakeTimeoutNanoseconds
         self.gracefulStopTimeoutNanoseconds = gracefulStopTimeoutNanoseconds
     }
 
@@ -864,6 +869,19 @@ public actor AgentVMFleetCoordinator {
         let heldIDs = Set(hardwareBoxes.keys)
         let all = try await store.listVMs()
         return all.filter { heldIDs.contains($0.id) }
+    }
+
+    /// Returns the guest daemon `agentVersion` negotiated over vsock `ping`/`pong` for a running VM, if known.
+    public func negotiatedGuestAgentVersion(for vmID: VMID) -> String? {
+        negotiatedGuestAgentVersions[vmID]
+    }
+
+    /// Returns held VMs paired with their currently negotiated `guestAgentVersion` (if any) for `daemon status`.
+    public func daemonHeldVMsWithGuestAgentVersions() async throws -> [(record: VMInstanceRecord, guestAgentVersion: String?)] {
+        let records = try await daemonHeldVMs()
+        return records.map { rec in
+            (record: rec, guestAgentVersion: negotiatedGuestAgentVersions[rec.id])
+        }
     }
 
     /// Gracefully shuts down all VMs held by this daemon process (`daemon stop` / `SIGTERM` / `SIGINT`).
@@ -1642,6 +1660,11 @@ public actor AgentVMFleetCoordinator {
 
         func rollbackFailedBootAndReleaseLockIfNeeded(vmFD: Int32?) async {
             vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+            vsockSessionTokens.removeValue(forKey: vmID)
+            negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+            if let staleSession = vsockSessions.removeValue(forKey: vmID) {
+                await staleSession.shutdown()
+            }
             hardwareBoxTokens.removeValue(forKey: vmID)
             if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
                 ownedBox.setStopObserver(nil)
@@ -2049,6 +2072,7 @@ public actor AgentVMFleetCoordinator {
         }
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         vsockSessionTokens.removeValue(forKey: vmID)
+        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
         hardwareBoxTokens.removeValue(forKey: vmID)
         await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
@@ -2119,6 +2143,7 @@ public actor AgentVMFleetCoordinator {
         guard hardwareBoxTokens[vmID] == boxToken else { return }
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         vsockSessionTokens.removeValue(forKey: vmID)
+        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
             await session.shutdown()
         }
@@ -2141,6 +2166,7 @@ public actor AgentVMFleetCoordinator {
         hardwareBoxTokens.removeValue(forKey: vmID)
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         vsockSessionTokens.removeValue(forKey: vmID)
+        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
 
         await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
@@ -2211,6 +2237,19 @@ public actor AgentVMFleetCoordinator {
 
     // MARK: - Vsock Disconnect Observation, 300-500ms Grace Window & 1s Reconnect Loop (Fixes A34)
 
+    private func recordNegotiatedGuestAgentVersion(
+        vmID: VMID,
+        boxToken: UUID,
+        sessionToken: UUID,
+        version: String
+    ) {
+        guard hardwareBoxTokens[vmID] == boxToken,
+              vsockSessionTokens[vmID] == sessionToken else {
+            return
+        }
+        negotiatedGuestAgentVersions[vmID] = version
+    }
+
     private func attachManagedVsockSession(
         vmID: VMID,
         boxToken: UUID,
@@ -2220,6 +2259,15 @@ public actor AgentVMFleetCoordinator {
     ) async throws -> VsockMultiplexSession {
         let sessionToken = UUID()
         let session = VsockMultiplexSession(vmID: vmID)
+        await session.setControlPongObserver { [weak self] pong in
+            guard let self else { return }
+            await self.recordNegotiatedGuestAgentVersion(
+                vmID: vmID,
+                boxToken: boxToken,
+                sessionToken: sessionToken,
+                version: pong.agentVersion
+            )
+        }
         do {
             try await session.attachPOSIXFileDescriptor(
                 descriptor.fileDescriptor,
@@ -2241,9 +2289,22 @@ public actor AgentVMFleetCoordinator {
 
         let tty = ensureTerminalBuffer(for: vmID)
         await session.attachTerminalScreenBuffer(tty)
+        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
         vsockSessions[vmID] = session
         vsockSessionTokens[vmID] = sessionToken
         vsockGenerationCounters[vmID] = (vsockGenerationCounters[vmID] ?? 0) &+ 1
+
+        // Perform initial control `ping` handshake on every vsock connection (including Stage 3b reconnects)
+        // to record the peer's `agentVersion` ("2" or legacy "1.0.0") in the daemon (Fixes A46 & A50).
+        let handshakeTimeoutSec = max(0.02, Double(vsockHandshakeTimeoutNanoseconds) / 1_000_000_000.0)
+        if let pong = try? await session.ping(timeoutSeconds: handshakeTimeoutSec) {
+            recordNegotiatedGuestAgentVersion(
+                vmID: vmID,
+                boxToken: boxToken,
+                sessionToken: sessionToken,
+                version: pong.agentVersion
+            )
+        }
 
         for rule in vmSpec.portForwards where rule.enabled {
             _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
@@ -2262,6 +2323,7 @@ public actor AgentVMFleetCoordinator {
             return
         }
         vsockSessionTokens.removeValue(forKey: vmID)
+        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
         if let deadSession = vsockSessions.removeValue(forKey: vmID) {
             await deadSession.shutdown()
         }

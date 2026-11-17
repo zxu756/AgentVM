@@ -314,6 +314,7 @@ public actor VsockMultiplexSession {
 
     private var transportWrite: (@Sendable (Data) async throws -> Void)?
     private var onTransportDisconnect: (@Sendable () async -> Void)?
+    private var onControlPong: (@Sendable (VsockControlEnvelope) async -> Void)?
     private var inboundTransportPumpTask: Task<Void, Never>?
     private var inboundTransportContinuation: AsyncStream<Data>.Continuation?
     private var attachedReadSource: DispatchSourceRead?
@@ -333,6 +334,7 @@ public actor VsockMultiplexSession {
     private var pendingFilePushes: [UInt32: PendingPushContext] = [:]
     private var pendingFilePulls: [UInt32: PendingPullContext] = [:]
     private var pendingHeartbeatWaiters: [VsockRPCPromise<GuestHeartbeatPayload>] = []
+    private var pendingPingWaiters: [UUID: VsockRPCPromise<VsockControlEnvelope>] = [:]
     private var portForwardStreams: [UInt32: ActivePortForwardStream] = [:]
 
     // Interactive PTY state
@@ -342,8 +344,10 @@ public actor VsockMultiplexSession {
     private var attachedScreenBuffer: VT100ScreenBuffer?
     private var ptyOutputSubscribers: [UUID: AsyncStream<Data>.Continuation] = [:]
 
-    // Telemetry & Heartbeat state
+    // Telemetry, Handshake & Heartbeat state
     private var cachedHeartbeat: GuestHeartbeatPayload?
+    private var cachedControlPong: VsockControlEnvelope?
+    private var cachedGuestAgentVersion: String?
     private var framesSentCount: UInt64 = 0
     private var framesReceivedCount: UInt64 = 0
     private var compressedFramesSentCount: UInt64 = 0
@@ -517,6 +521,7 @@ public actor VsockMultiplexSession {
         guard !isShutDown else { return }
         isShutDown = true
         onTransportDisconnect = nil
+        onControlPong = nil
         detachFDSourceIfPresent()
         pairedLoopbackPeer = nil
         simulatedPeerEndpoint = nil
@@ -550,6 +555,11 @@ public actor VsockMultiplexSession {
             waiter.reject(closedError)
         }
         pendingHeartbeatWaiters.removeAll()
+
+        for (_, waiter) in pendingPingWaiters {
+            waiter.reject(closedError)
+        }
+        pendingPingWaiters.removeAll()
 
         for (_, pf) in portForwardStreams {
             pf.handshakePromise?.reject(closedError)
@@ -1063,7 +1073,58 @@ public actor VsockMultiplexSession {
         closeStreamState(streamID: streamID)
     }
 
-    // MARK: Telemetry & Stream Inspection
+    // MARK: Control Handshake, Telemetry & Stream Inspection
+
+    /// Registers an optional observer invoked whenever a `.pong` (or `.helloAck`) control frame arrives from the guest.
+    public func setControlPongObserver(_ observer: (@Sendable (VsockControlEnvelope) async -> Void)?) {
+        self.onControlPong = observer
+    }
+
+    /// Returns the guest daemon's advertised `agentVersion` from the most recent `.pong` handshake, if any.
+    public func guestAgentVersion() -> String? {
+        cachedGuestAgentVersion
+    }
+
+    /// Sends a `.ping` frame on `CHAN_CONTROL` (`streamID == 0`) and awaits the guest daemon's `.pong` reply (Fixes A46 & A50).
+    public func ping(timeoutSeconds: TimeInterval = 5.0) async throws -> VsockControlEnvelope {
+        try ensureActiveTransport()
+        let waiterID = UUID()
+        let promise = VsockRPCPromise<VsockControlEnvelope>()
+        pendingPingWaiters[waiterID] = promise
+
+        let clampedTimeout = max(0.02, min(timeoutSeconds, 60.0))
+        let watchdog = Task { [weak self] in
+            let nanos = UInt64(clampedTimeout * 1_000_000_000.0)
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled, let self else { return }
+            await self.handleControlPingWatchdogTimeout(waiterID: waiterID, timeoutSeconds: clampedTimeout)
+        }
+        defer { watchdog.cancel() }
+
+        do {
+            let pingEnv = VsockControlEnvelope(kind: .ping)
+            let encoded = try VsockWireJSON.encode(pingEnv)
+            try await sendRawControlFrame(
+                channel: .control,
+                flags: [.syn, .endOfMessage],
+                streamID: 0,
+                payload: encoded
+            )
+            return try await promise.wait()
+        } catch {
+            pendingPingWaiters.removeValue(forKey: waiterID)
+            throw error
+        }
+    }
+
+    private func handleControlPingWatchdogTimeout(waiterID: UUID, timeoutSeconds: TimeInterval) {
+        guard let promise = pendingPingWaiters.removeValue(forKey: waiterID) else { return }
+        promise.reject(
+            AgentVMError.vsockProtocolViolation(
+                detail: "Timed out waiting \(String(format: "%.3f", timeoutSeconds))s for guest control pong on VM '\(vmID.rawValue)'."
+            )
+        )
+    }
 
     /// Returns the most recently received `GuestHeartbeatPayload` from the guest daemon, if any.
     public func latestHeartbeat() -> GuestHeartbeatPayload? {
@@ -1447,9 +1508,12 @@ public actor VsockMultiplexSession {
     }
 
     private func handleHostControlFrame(header: VsockFrameHeader, payload: Data) async throws {
-        guard !payload.isEmpty else { return }
-        if let ctrl = try? VsockWireJSON.decode(VsockControlEnvelope.self, from: payload),
-           ctrl.kind == .ping {
+        guard !payload.isEmpty,
+              let ctrl = try? VsockWireJSON.decode(VsockControlEnvelope.self, from: payload) else {
+            return
+        }
+        switch ctrl.kind {
+        case .ping:
             let pong = VsockControlEnvelope(kind: .pong)
             let encoded = try VsockWireJSON.encode(pong)
             try await sendRawControlFrame(
@@ -1458,6 +1522,19 @@ public actor VsockMultiplexSession {
                 streamID: 0,
                 payload: encoded
             )
+        case .pong, .helloAck:
+            cachedControlPong = ctrl
+            cachedGuestAgentVersion = ctrl.agentVersion
+            let waiters = Array(pendingPingWaiters.values)
+            pendingPingWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resolve(ctrl)
+            }
+            if let observer = onControlPong {
+                await observer(ctrl)
+            }
+        case .hello, .shutdown:
+            break
         }
     }
 

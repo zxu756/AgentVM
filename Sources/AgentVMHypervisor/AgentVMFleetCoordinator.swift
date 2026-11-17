@@ -2618,7 +2618,7 @@ public actor AgentVMFleetCoordinator {
             }
             await portForwardManager.stopAllRules(for: vmID)
             await session.shutdown()
-            throw VsockProtocolError.transportClosed("Vsock session disconnected before publish")
+            throw POSIXError(.ECONNRESET)
         }
 
         return (session, sessionToken)

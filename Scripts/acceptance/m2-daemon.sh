@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # AgentVM Milestone M2 Workspace Daemon Acceptance Script.
 #
-# Stage 2 implements non-VM Rows 1-9 against the unsigned `.build/debug/AgentVM` binary
-# (or caller-supplied AGENTVM_BIN). Stages 3a, 4, 3b, 5, and 6 run real-VM Rows 10-34
-# when AGENTVM_REAL_VM=1 and AGENTVM_BIN carries `com.apple.security.virtualization`; rows
-# scheduled for Stages 7-8 (35-39) remain marked "没跑".
+# Covers non-VM Rows 1-9 and 37 unconditionally, and real-VM Rows 10-34 and 36 when
+# AGENTVM_REAL_VM=1 and AGENTVM_BIN carries `com.apple.security.virtualization`.
+# Row 35 (full unit test suite + milestone 0) and Rows 38-39 (source mutations) are
+# executed by Scripts/test.sh / the independent dispatcher and recorded as "没跑" here.
 #
 # Hard invariants:
 #   * Never launches the desktop UI (.app, window, or bare executable without a CLI subcommand).
@@ -310,6 +310,66 @@ if [[ -n "$HOST_DAEMONS_BEFORE" ]]; then
 fi
 
 BASELINE_VZ_PIDS="$(list_host_vz_vm_pids)"
+
+snapshot_real_home_hygiene() {
+    /usr/bin/python3 - "$REAL_HOME" <<'PY'
+import json, os, sys
+
+real_home = sys.argv[1]
+result = {
+    "launch_agents": [],
+    "preferences": [],
+    "app_support": [],
+}
+
+la_dir = os.path.join(real_home, "Library", "LaunchAgents")
+if os.path.isdir(la_dir):
+    items = []
+    for root, dirs, files in os.walk(la_dir):
+        for name in dirs + files:
+            rel = os.path.relpath(os.path.join(root, name), la_dir)
+            items.append(rel)
+    result["launch_agents"] = sorted(set(items))
+
+for key, sub in (("preferences", "Preferences"), ("app_support", "Application Support")):
+    base = os.path.join(real_home, "Library", sub)
+    if os.path.isdir(base):
+        items = []
+        for root, dirs, files in os.walk(base):
+            for name in dirs + files:
+                if "agentvm" in name.lower():
+                    rel = os.path.relpath(os.path.join(root, name), base)
+                    items.append(rel)
+        result[key] = sorted(set(items))
+
+print(json.dumps(result, sort_keys=True))
+PY
+}
+
+snapshot_cache_directory() {
+    /usr/bin/python3 - "$IMAGE_CACHE_DIR" <<'PY'
+import json, os, sys
+
+cache_dir = sys.argv[1]
+if not os.path.exists(cache_dir):
+    print(json.dumps({"exists": False, "files": {}}, sort_keys=True))
+    sys.exit(0)
+
+files = {}
+for root, dirs, filenames in os.walk(cache_dir):
+    dirs.sort()
+    for name in sorted(filenames):
+        full = os.path.join(root, name)
+        rel = os.path.relpath(full, cache_dir)
+        st = os.lstat(full)
+        files[rel] = [int(st.st_ino), int(st.st_size), int(st.st_mtime_ns), int(st.st_mode)]
+
+print(json.dumps({"exists": True, "files": files}, sort_keys=True))
+PY
+}
+
+HOME_HYGIENE_BEFORE="$(snapshot_real_home_hygiene)"
+CACHE_SNAPSHOT_BEFORE="$(snapshot_cache_directory)"
 
 list_extra_vz_pids() {
     local current_pids
@@ -1082,11 +1142,6 @@ if [[ $CAN_RUN_REAL_VM -ne 1 ]]; then
     for row_no in $(seq 10 34); do
         unrun_row "$row_no" "未设置 AGENTVM_REAL_VM=1（真机验收行未执行）"
     done
-    unrun_row 35 "待第 7 段 milestone 2 收尾脚本串联执行"
-    unrun_row 36 "未设置 AGENTVM_REAL_VM=1（m1-real-boot.sh 回归行未执行）"
-    unrun_row 37 "待第 7 段全量跑完收尾检查"
-    unrun_row 38 "调度方独立变异验收行（第 8 段）"
-    unrun_row 39 "调度方独立变异验收行（第 8 段）"
 else
     # --------------------------------------------------------------
     # Row 10: `create t1 --image debian-12-bookworm-arm64`, `up t1`
@@ -2807,18 +2862,124 @@ PY
     else
         fail_row 34 "up_rc=$r34_up_rc, dmesg_rc=$r34_dmesg_rc, clean_dmesg=$r34_clean_dmesg_ok, stop_rc=$r34_stop_rc, vz_gone=$r34_vz_gone, sock_gone=$r34_sock_gone, daemons='$r34_daemons_after'"
     fi
-
-    unrun_row 35 "待第 7 段 milestone 2 收尾脚本串联执行"
-    unrun_row 36 "待第 7 段更新 m1-real-boot.sh 第 17 行后执行"
-    unrun_row 37 "待第 7 段全量跑完收尾检查"
-    unrun_row 38 "调度方独立变异验收行（第 8 段）"
-    unrun_row 39 "调度方独立变异验收行（第 8 段）"
 fi
 
 # ------------------------------------------------------------------
-# Post-Run Cleanup & Host-Wide AgentVM Daemon Leak Gate
+# Row 35: Full unit test suite (`swift test --no-parallel`) + `Scripts/test.sh milestone 0`
+#   Executed by `Scripts/test.sh milestone 2` / dispatcher (not re-run inside m2-daemon.sh).
 # ------------------------------------------------------------------
+unrun_row 35 "由 Scripts/test.sh milestone 2 / 调度方跑全部单元测试（swift test --no-parallel）和 Scripts/test.sh milestone 0"
+
+# ------------------------------------------------------------------
+# Row 36: `AGENTVM_REAL_VM=1 Scripts/acceptance/m1-real-boot.sh`
+#   Expect: 26 passed, 0 failed, 0 unrun (with Row 17 updated for M2 up/halt).
+# ------------------------------------------------------------------
+ROW_START_SEC="$(now_sec)"
+if [[ $CAN_RUN_REAL_VM -ne 1 ]]; then
+    unrun_row 36 "未设置 AGENTVM_REAL_VM=1（m1-real-boot.sh 回归行未执行）"
+else
+    r36_out="$TMP_ROOT/r36-m1-real-boot.out"
+    r36_err="$TMP_ROOT/r36-m1-real-boot.err"
+    set +e
+    /usr/bin/env \
+        HOME="$REAL_HOME" \
+        AGENTVM_REAL_VM=1 \
+        AGENTVM_BIN="$AGENTVM_BIN_RESOLVED" \
+        AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+        "$ROOT_DIR/Scripts/acceptance/m1-real-boot.sh" >"$r36_out" 2>"$r36_err"
+    r36_rc=$?
+    set -e
+
+    r36_summary_ok=0
+    r36_summary_line=""
+    if [[ -f "$r36_out" ]]; then
+        r36_summary_line="$(
+            /usr/bin/python3 - "$r36_out" <<'PY'
+import re, sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+matches = re.findall(r"Summary:\s*(\d+)\s+passed,\s*(\d+)\s+failed,\s*(\d+)\s+unrun[^\n]*", text)
+if not matches:
+    sys.exit(1)
+passed, failed, unrun = matches[-1]
+print(f"{passed}:{failed}:{unrun}")
+if int(passed) == 26 and int(failed) == 0 and int(unrun) == 0:
+    sys.exit(0)
+sys.exit(1)
+PY
+        )" && r36_summary_ok=1 || r36_summary_ok=0
+    fi
+
+    if [[ $r36_rc -eq 0 && $r36_summary_ok -eq 1 ]]; then
+        pass_row 36 "'m1-real-boot.sh' exited 0 with 26 passed, 0 failed, 0 unrun (counts=$r36_summary_line)."
+    else
+        r36_tail="$(tail -n 12 "$r36_out" "$r36_err" 2>/dev/null | tr '\n' ' ' || true)"
+        fail_row 36 "'m1-real-boot.sh' regression check failed (rc=$r36_rc, summary_ok=$r36_summary_ok, counts='$r36_summary_line', tail='$r36_tail')"
+    fi
+fi
+
+# ------------------------------------------------------------------
+# Row 37: Post-Run Cleanup & Hygiene Verification (always runs)
+#   Expect: temp dir removed; 0 leftover daemons & 0 extra VirtualMachine processes;
+#           0 new files in real HOME & isolated HOME Library/LaunchAgents;
+#           0 entries containing `agentvm` in `launchctl list`;
+#           0 new AgentVM files in real HOME Library/Preferences & Library/Application Support;
+#           pre-existing image cache files untouched.
+# ------------------------------------------------------------------
+ROW_START_SEC="$(now_sec)"
+DELETED_TMP_ROOT="$TMP_ROOT"
+DELETED_RAW_TMP_ROOT="$RAW_TMP_ROOT"
+
+# Inspect isolated HOME Library/LaunchAgents BEFORE cleanup deletes $TMP_ROOT.
+stop_tracked_workspaces_and_daemons
+r37_isolated_la_clean=0
+r37_isolated_la_items=""
+r37_isolated_la_items="$(
+    /usr/bin/python3 - "$ISOLATED_HOME" <<'PY'
+import os, sys
+
+iso_home = sys.argv[1]
+la_dir = os.path.join(iso_home, "Library", "LaunchAgents")
+items = []
+if os.path.exists(la_dir):
+    for root, dirs, files in os.walk(la_dir):
+        for name in dirs + files:
+            items.append(os.path.relpath(os.path.join(root, name), la_dir))
+if items:
+    print(",".join(sorted(items)))
+    sys.exit(1)
+sys.exit(0)
+PY
+)" && r37_isolated_la_clean=1 || r37_isolated_la_clean=0
+
 cleanup
+
+r37_tmp_gone=0
+if [[ ! -e "$DELETED_TMP_ROOT" && ! -e "$DELETED_RAW_TMP_ROOT" ]]; then
+    r37_tmp_gone=1
+fi
+
+r37_user_tmp_dir="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+r37_tmp_links_clean=1
+if [[ -n "$r37_user_tmp_dir" ]]; then
+    /usr/bin/python3 - "$r37_user_tmp_dir" "$DELETED_TMP_ROOT" "$DELETED_RAW_TMP_ROOT" <<'PY' || r37_tmp_links_clean=0
+import os, sys
+
+user_tmp = os.path.realpath(sys.argv[1])
+roots = [x.rstrip("/") for x in sys.argv[2:] if x.strip()]
+if os.path.isdir(user_tmp):
+    for name in os.listdir(user_tmp):
+        if not name.startswith("avm-"):
+            continue
+        full = os.path.join(user_tmp, name)
+        if os.path.islink(full):
+            raw_target = os.readlink(full)
+            resolved = os.path.abspath(os.path.join(user_tmp, raw_target))
+            if any(raw_target == r or raw_target.startswith(r + "/") or resolved == r or resolved.startswith(r + "/") for r in roots):
+                sys.exit(1)
+sys.exit(0)
+PY
+fi
 
 HOST_DAEMONS_AFTER="$(list_all_host_agentvm_daemons)"
 HOST_DAEMON_COUNT_AFTER=0
@@ -2837,14 +2998,100 @@ for item in extra:
 PY
 )"
 
+r37_daemons_clean=0
+if [[ "$HOST_DAEMON_COUNT_AFTER" -le "$HOST_DAEMON_COUNT_BEFORE" && -z "$NEW_HOST_DAEMONS" ]]; then
+    r37_daemons_clean=1
+fi
+
+EXTRA_VZ_AFTER="$(list_extra_vz_pids)"
+EXTRA_VZ_COUNT_AFTER="$(count_lines_nonempty "$EXTRA_VZ_AFTER")"
+r37_vz_clean=0
+if [[ "$EXTRA_VZ_COUNT_AFTER" == "0" ]]; then
+    r37_vz_clean=1
+fi
+
+HOME_HYGIENE_AFTER="$(snapshot_real_home_hygiene)"
+r37_real_home_clean=0
+r37_real_home_diff=""
+r37_real_home_diff="$(
+    /usr/bin/python3 - "$HOME_HYGIENE_BEFORE" "$HOME_HYGIENE_AFTER" <<'PY'
+import json, sys
+
+before = json.loads(sys.argv[1])
+after = json.loads(sys.argv[2])
+new_la = sorted(set(after["launch_agents"]) - set(before["launch_agents"]))
+new_prefs = sorted(set(after["preferences"]) - set(before["preferences"]))
+new_appsup = sorted(set(after["app_support"]) - set(before["app_support"]))
+if new_la or new_prefs or new_appsup:
+    print(f"new_launch_agents={new_la} new_prefs={new_prefs} new_app_support={new_appsup}")
+    sys.exit(1)
+sys.exit(0)
+PY
+)" && r37_real_home_clean=1 || r37_real_home_clean=0
+
+r37_launchctl_clean=0
+r37_launchctl_matches=""
+r37_launchctl_matches="$(
+    /usr/bin/python3 - <<'PY'
+import subprocess, sys
+
+proc = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+if proc.returncode != 0:
+    print(f"launchctl_rc={proc.returncode}")
+    sys.exit(1)
+hits = [
+    ln.strip() for ln in proc.stdout.splitlines()
+    if "agentvm" in ln.lower()
+]
+if hits:
+    print("; ".join(hits))
+    sys.exit(1)
+sys.exit(0)
+PY
+)" && r37_launchctl_clean=1 || r37_launchctl_clean=0
+
+CACHE_SNAPSHOT_AFTER="$(snapshot_cache_directory)"
+r37_cache_clean=0
+r37_cache_diff=""
+r37_cache_diff="$(
+    /usr/bin/python3 - "$CACHE_SNAPSHOT_BEFORE" "$CACHE_SNAPSHOT_AFTER" <<'PY'
+import json, sys
+
+before = json.loads(sys.argv[1])
+after = json.loads(sys.argv[2])
+if before["exists"]:
+    if not after["exists"]:
+        print("cache directory disappeared")
+        sys.exit(1)
+    for rel, meta in before["files"].items():
+        if after["files"].get(rel) != meta:
+            print(f"{rel}: before={meta} after={after['files'].get(rel)}")
+            sys.exit(1)
+sys.exit(0)
+PY
+)" && r37_cache_clean=1 || r37_cache_clean=0
+
+if [[ $r37_tmp_gone -eq 1 && $r37_tmp_links_clean -eq 1 \
+    && $r37_daemons_clean -eq 1 && $r37_vz_clean -eq 1 \
+    && $r37_isolated_la_clean -eq 1 && $r37_real_home_clean -eq 1 \
+    && $r37_launchctl_clean -eq 1 && $r37_cache_clean -eq 1 ]]; then
+    pass_row 37 "temp dir & avm-* symlinks removed; 0 leaked daemons or extra VirtualMachine processes; 0 new LaunchAgents in real/isolated HOME; 0 'agentvm' entries in launchctl list; 0 new AgentVM files in Preferences/Application Support; pre-existing image cache files untouched."
+else
+    fail_row 37 "tmp_gone=$r37_tmp_gone, links_clean=$r37_tmp_links_clean, daemons_clean=$r37_daemons_clean (new='$NEW_HOST_DAEMONS'), vz_clean=$r37_vz_clean (extra='${EXTRA_VZ_AFTER//$'\n'/ }'), iso_la_clean=$r37_isolated_la_clean ('$r37_isolated_la_items'), real_home_clean=$r37_real_home_clean ('$r37_real_home_diff'), launchctl_clean=$r37_launchctl_clean ('$r37_launchctl_matches'), cache_clean=$r37_cache_clean ('$r37_cache_diff')"
+fi
+
+# ------------------------------------------------------------------
+# Rows 38-39: Source-code mutation gates (executed by dispatcher in Stage 8)
+# ------------------------------------------------------------------
+unrun_row 38 "由调度方跑变异一（把 exec 临时改成客户端走 runOneShotCommand 后重跑脚本并还原，验证第 11 行失败）"
+unrun_row 39 "由调度方跑变异二（把心跳遥测映射临时改成 guestMemTotalBytes=memoryMB*1048576、cpuUsagePercent=0 后重跑脚本并还原，验证第 18、19 行失败）"
+
 emit_out "Host AgentVM daemon count after cleanup: $HOST_DAEMON_COUNT_AFTER (before: $HOST_DAEMON_COUNT_BEFORE)"
 if [[ "$HOST_DAEMON_COUNT_AFTER" -gt "$HOST_DAEMON_COUNT_BEFORE" || -n "$NEW_HOST_DAEMONS" ]]; then
     emit_err "FAIL: leaked AgentVM daemon process(es) detected after cleanup: $NEW_HOST_DAEMONS"
     FAILED_ROWS=$((FAILED_ROWS + 1))
 fi
 
-EXTRA_VZ_AFTER="$(list_extra_vz_pids)"
-EXTRA_VZ_COUNT_AFTER="$(count_lines_nonempty "$EXTRA_VZ_AFTER")"
 emit_out "Extra VirtualMachine PIDs after cleanup: $EXTRA_VZ_COUNT_AFTER"
 if [[ "$EXTRA_VZ_COUNT_AFTER" != "0" ]]; then
     emit_err "FAIL: leaked VirtualMachine process(es) detected after cleanup: ${EXTRA_VZ_AFTER//$'\n'/ }"

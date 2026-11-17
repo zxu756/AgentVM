@@ -65,13 +65,26 @@ enum AgentVMEntryPoint {
                 signalSources = controller.installPOSIXSignalSources()
             }
 
+            let isStreamingExec = (subcmd == "exec")
             let outcome = await runner.execute(
                 arguments: rawArgs,
                 daemonRunProcessMode: subcmd == "daemon",
                 signalController: signalController,
                 liveStderrHandler: { forwarder.writeProgress($0) },
-                liveStdoutDataHandler: { forwarder.writeStdoutChunk($0) },
-                liveStderrDataHandler: { forwarder.writeStderrChunk($0) }
+                liveStdoutDataHandler: { chunk in
+                    if isStreamingExec {
+                        forwarder.writeUnbufferedStdoutChunk(chunk)
+                    } else {
+                        forwarder.writeStdoutChunk(chunk)
+                    }
+                },
+                liveStderrDataHandler: { chunk in
+                    if isStreamingExec {
+                        forwarder.writeUnbufferedStderrChunk(chunk)
+                    } else {
+                        forwarder.writeStderrChunk(chunk)
+                    }
+                }
             )
             outcome.writeProcessOutput(forwarder: forwarder)
             withExtendedLifetime(signalSources) {}

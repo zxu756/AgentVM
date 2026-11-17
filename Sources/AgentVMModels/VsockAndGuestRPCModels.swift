@@ -85,14 +85,14 @@ public struct GuestExecRequest: Codable, Hashable, Sendable, Identifiable {
         id: UUID = UUID(),
         executable: String,
         arguments: [String] = [],
-        workingDirectory: String = "/workspace",
+        workingDirectory: String = "/",
         environment: [String: String] = [:],
         stdinPayload: Data? = nil,
         allocatePTY: Bool = false,
         ptyColumns: UInt16 = 120,
         ptyRows: UInt16 = 36,
-        runAsUser: String = "agent",
-        timeoutSeconds: TimeInterval = 300
+        runAsUser: String = "root",
+        timeoutSeconds: TimeInterval = 3600
     ) {
         self.id = id
         self.executable = executable

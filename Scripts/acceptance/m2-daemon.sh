@@ -2,10 +2,10 @@
 # AgentVM Milestone M2 Workspace Daemon Acceptance Script.
 #
 # Stage 2 implements non-VM Rows 1-9 against the unsigned `.build/debug/AgentVM` binary
-# (or caller-supplied AGENTVM_BIN). Stage 3a adds real-VM lifecycle and lock Rows 10, 22, 23,
-# 25, 26 (except `exec t1 -- true`), and 29 when AGENTVM_REAL_VM=1 and AGENTVM_BIN carries
-# `com.apple.security.virtualization`; rows that require `exec` via daemon (Stage 4) or later
-# stages remain marked "没跑".
+# (or caller-supplied AGENTVM_BIN). Stage 3a + Stage 4 run real-VM Rows 10-16, 22-27, 29, and 32
+# when AGENTVM_REAL_VM=1 and AGENTVM_BIN carries `com.apple.security.virtualization`; rows
+# scheduled for Stage 3b (28, 30, 31, 33, 34), Stage 5 (17), Stage 6 (18-21), or Stages 7-8 (35-39)
+# remain marked "没跑".
 #
 # Hard invariants:
 #   * Never launches the desktop UI (.app, window, or bare executable without a CLI subcommand).
@@ -1160,22 +1160,293 @@ PY
         fail_row 10 "create_rc=$r10_create_rc, up_rc=$r10_up_rc, up_exited=$r10_up_exited, ps_rc=$r10_ps_rc, t1_ok=$r10_t1_ok, extra_vz_count=$r10_extra_vz_count (pids='${r10_extra_vz//$'\n'/,}'), up_err='$r10_up_err'"
     fi
 
-    # Rows 11-21 require `exec` via daemon (Stage 4) and/or guest agent v2 & telemetry (Stages 5-6).
-    unrun_row 11 "exec 经守护进程是第 4 段"
-    unrun_row 12 "exec 经守护进程是第 4 段"
-    unrun_row 13 "exec 经守护进程是第 4 段"
-    unrun_row 14 "exec 经守护进程是第 4 段"
-    unrun_row 15 "exec 经守护进程是第 4 段"
-    unrun_row 16 "exec 经守护进程是第 4 段"
-    unrun_row 17 "exec 经守护进程是第 4 段（客户机进程组取消是第 5 段）"
-    unrun_row 18 "exec 经守护进程是第 4 段（遥测映射是第 6 段）"
-    unrun_row 19 "exec 经守护进程是第 4 段（CPU 遥测是第 5-6 段）"
-    unrun_row 20 "exec 经守护进程是第 4 段（内存遥测是第 6 段）"
+    # --------------------------------------------------------------
+    # Row 11: Two separate processes sequentially run `exec t1 -- cat /proc/sys/kernel/random/boot_id`
+    #         at least 5s apart, each followed by `exec t1 -- cat /proc/uptime`.
+    #   Expect: all exit 0; both boot_id values match and have UUID format; second uptime > first.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r11-boot1.out" "$TMP_ROOT/r11-boot1.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r11_b1_rc=$LAST_RC
+    run_cli "$TMP_ROOT/r11-up1.out" "$TMP_ROOT/r11-up1.err" --lang en --workspace "$WS" exec t1 -- cat /proc/uptime
+    r11_u1_rc=$LAST_RC
+
+    sleep 5.2
+
+    run_cli "$TMP_ROOT/r11-boot2.out" "$TMP_ROOT/r11-boot2.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r11_b2_rc=$LAST_RC
+    run_cli "$TMP_ROOT/r11-up2.out" "$TMP_ROOT/r11-up2.err" --lang en --workspace "$WS" exec t1 -- cat /proc/uptime
+    r11_u2_rc=$LAST_RC
+
+    R11_BOOT_ID=""
+    r11_ok=0
+    r11_detail=""
+    if [[ $r11_b1_rc -eq 0 && $r11_u1_rc -eq 0 && $r11_b2_rc -eq 0 && $r11_u2_rc -eq 0 ]]; then
+        r11_parsed="$(
+            /usr/bin/python3 - \
+                "$TMP_ROOT/r11-boot1.out" "$TMP_ROOT/r11-boot1.err" \
+                "$TMP_ROOT/r11-up1.out" "$TMP_ROOT/r11-up1.err" \
+                "$TMP_ROOT/r11-boot2.out" "$TMP_ROOT/r11-boot2.err" \
+                "$TMP_ROOT/r11-up2.out" "$TMP_ROOT/r11-up2.err" <<'PY'
+import os, re, sys
+
+b1_out, b1_err, u1_out, u1_err, b2_out, b2_err, u2_out, u2_err = sys.argv[1:9]
+for err_p in (b1_err, u1_err, b2_err, u2_err):
+    if os.path.getsize(err_p) != 0:
+        sys.exit(1)
+
+boot1 = open(b1_out, encoding="utf-8").read().strip()
+boot2 = open(b2_out, encoding="utf-8").read().strip()
+uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+if not boot1 or boot1 != boot2 or not uuid_re.match(boot1):
+    sys.exit(1)
+
+u1_parts = open(u1_out, encoding="utf-8").read().strip().split()
+u2_parts = open(u2_out, encoding="utf-8").read().strip().split()
+if not u1_parts or not u2_parts:
+    sys.exit(1)
+u1 = float(u1_parts[0])
+u2 = float(u2_parts[0])
+if not (u2 > u1):
+    sys.exit(1)
+
+print(boot1)
+print(f"uptime {u1:.2f}s -> {u2:.2f}s")
+PY
+        )" && r11_ok=1 || r11_ok=0
+        if [[ $r11_ok -eq 1 ]]; then
+            R11_BOOT_ID="$(printf '%s\n' "$r11_parsed" | sed -n '1p')"
+            r11_detail="$(printf '%s\n' "$r11_parsed" | sed -n '2p')"
+        fi
+    fi
+
+    if [[ $r11_ok -eq 1 && -n "$R11_BOOT_ID" ]]; then
+        pass_row 11 "two separate exec calls >5s apart returned identical UUID boot_id=$R11_BOOT_ID ($r11_detail)."
+    else
+        fail_row 11 "rcs=[$r11_b1_rc,$r11_u1_rc,$r11_b2_rc,$r11_u2_rc], b1='$(cat "$TMP_ROOT/r11-boot1.out" 2>/dev/null | tr -d '\n')', b2='$(cat "$TMP_ROOT/r11-boot2.out" 2>/dev/null | tr -d '\n')', err='$(cat "$TMP_ROOT/r11-boot1.err" 2>/dev/null | tr '\n' ' ')'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 12: Run `up t1` again while already running
+    #   Expect: exits 0; boot_id unchanged; VirtualMachine process count unchanged.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r12-up.out" "$TMP_ROOT/r12-up.err" --lang en --workspace "$WS" up t1
+    r12_up_rc=$LAST_RC
+    r12_up_elapsed="$LAST_ELAPSED_SEC"
+
+    run_cli "$TMP_ROOT/r12-boot.out" "$TMP_ROOT/r12-boot.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r12_boot_rc=$LAST_RC
+    r12_boot_id="$(tr -d '[:space:]' < "$TMP_ROOT/r12-boot.out" 2>/dev/null || true)"
+    r12_boot_err="$(cat "$TMP_ROOT/r12-boot.err" 2>/dev/null || true)"
+
+    r12_extra_vz="$(list_extra_vz_pids)"
+    r12_extra_vz_count="$(count_lines_nonempty "$r12_extra_vz")"
+
+    if [[ $r12_up_rc -eq 0 && $r12_boot_rc -eq 0 && -z "$r12_boot_err" \
+        && -n "$R11_BOOT_ID" && "$r12_boot_id" == "$R11_BOOT_ID" \
+        && "$r12_extra_vz_count" == "1" && -n "$T1_VZ_PID" && "$r12_extra_vz" == "$T1_VZ_PID" ]]; then
+        pass_row 12 "idempotent 'up t1' (${r12_up_elapsed}s) exited 0; boot_id unchanged ($r12_boot_id); extra VirtualMachine PIDs=1 (pid=$T1_VZ_PID)."
+    else
+        fail_row 12 "up_rc=$r12_up_rc, boot_rc=$r12_boot_rc, boot_id='$r12_boot_id' (expected '$R11_BOOT_ID'), extra_vz='${r12_extra_vz//$'\n'/,}' (expected '$T1_VZ_PID'), boot_err='$r12_boot_err'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 13: Two concurrent background `exec t1 -- sleep 3`
+    #   Expect: both exit 0; total wall-clock from spawning first to both finishing < 5s.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    ensure_cli_subcommand --lang en --workspace "$WS" exec t1 -- sleep 3
+    : >"$TMP_ROOT/r13-1.out"; : >"$TMP_ROOT/r13-1.err"
+    : >"$TMP_ROOT/r13-2.out"; : >"$TMP_ROOT/r13-2.err"
+    r13_t0="$(now_sec)"
+
+    (
+        exec /usr/bin/env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
+            HOME="$ISOLATED_HOME" \
+            CFFIXED_USER_HOME="$ISOLATED_HOME" \
+            AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+            /usr/bin/perl -e 'alarm $ARGV[0]; shift @ARGV; exec @ARGV' \
+            "$CMD_TIMEOUT_SEC" \
+            "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" exec t1 -- sleep 3
+    ) </dev/null >"$TMP_ROOT/r13-1.out" 2>"$TMP_ROOT/r13-1.err" &
+    r13_pid1=$!
+    OWN_CLIENT_PIDS+=("$r13_pid1")
+
+    (
+        exec /usr/bin/env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
+            HOME="$ISOLATED_HOME" \
+            CFFIXED_USER_HOME="$ISOLATED_HOME" \
+            AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+            /usr/bin/perl -e 'alarm $ARGV[0]; shift @ARGV; exec @ARGV' \
+            "$CMD_TIMEOUT_SEC" \
+            "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" exec t1 -- sleep 3
+    ) </dev/null >"$TMP_ROOT/r13-2.out" 2>"$TMP_ROOT/r13-2.err" &
+    r13_pid2=$!
+    OWN_CLIENT_PIDS+=("$r13_pid2")
+
+    r13_rc1=0; wait "$r13_pid1" 2>/dev/null || r13_rc1=$?
+    r13_rc2=0; wait "$r13_pid2" 2>/dev/null || r13_rc2=$?
+    r13_t1="$(now_sec)"
+    r13_elapsed="$(diff_sec "$r13_t0" "$r13_t1")"
+    r13_under_5s="$(/usr/bin/python3 -c 'import sys; print(1 if float(sys.argv[1]) < 5.0 else 0)' "$r13_elapsed")"
+
+    if [[ $r13_rc1 -eq 0 && $r13_rc2 -eq 0 && $r13_under_5s -eq 1 \
+        && ! -s "$TMP_ROOT/r13-1.out" && ! -s "$TMP_ROOT/r13-1.err" \
+        && ! -s "$TMP_ROOT/r13-2.out" && ! -s "$TMP_ROOT/r13-2.err" ]]; then
+        pass_row 13 "two concurrent 'exec t1 -- sleep 3' both exited 0 in ${r13_elapsed}s (<5.0s)."
+    else
+        fail_row 13 "rc1=$r13_rc1, rc2=$r13_rc2, elapsed=${r13_elapsed}s, err1='$(cat "$TMP_ROOT/r13-1.err" 2>/dev/null)', err2='$(cat "$TMP_ROOT/r13-2.err" 2>/dev/null)'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 14: Concurrent `exec t1 -- sh -c 'yes A | head -c 1048576'` and `yes B | head -c 1048576`
+    #   Expect: both exit 0; each stdout is exactly 1048576 bytes containing only its own letter + newline.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    ensure_cli_subcommand --lang en --workspace "$WS" exec t1 -- sh -c 'true'
+    : >"$TMP_ROOT/r14-a.out"; : >"$TMP_ROOT/r14-a.err"
+    : >"$TMP_ROOT/r14-b.out"; : >"$TMP_ROOT/r14-b.err"
+    r14_t0="$(now_sec)"
+
+    (
+        exec /usr/bin/env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
+            HOME="$ISOLATED_HOME" \
+            CFFIXED_USER_HOME="$ISOLATED_HOME" \
+            AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+            /usr/bin/perl -e 'alarm $ARGV[0]; shift @ARGV; exec @ARGV' \
+            "$CMD_TIMEOUT_SEC" \
+            "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" exec t1 -- sh -c 'yes A | head -c 1048576'
+    ) </dev/null >"$TMP_ROOT/r14-a.out" 2>"$TMP_ROOT/r14-a.err" &
+    r14_pida=$!
+    OWN_CLIENT_PIDS+=("$r14_pida")
+
+    (
+        exec /usr/bin/env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
+            HOME="$ISOLATED_HOME" \
+            CFFIXED_USER_HOME="$ISOLATED_HOME" \
+            AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+            /usr/bin/perl -e 'alarm $ARGV[0]; shift @ARGV; exec @ARGV' \
+            "$CMD_TIMEOUT_SEC" \
+            "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" exec t1 -- sh -c 'yes B | head -c 1048576'
+    ) </dev/null >"$TMP_ROOT/r14-b.out" 2>"$TMP_ROOT/r14-b.err" &
+    r14_pidb=$!
+    OWN_CLIENT_PIDS+=("$r14_pidb")
+
+    r14_rca=0; wait "$r14_pida" 2>/dev/null || r14_rca=$?
+    r14_rcb=0; wait "$r14_pidb" 2>/dev/null || r14_rcb=$?
+    r14_t1="$(now_sec)"
+    r14_elapsed="$(diff_sec "$r14_t0" "$r14_t1")"
+
+    r14_streams_ok=0
+    if [[ $r14_rca -eq 0 && $r14_rcb -eq 0 ]]; then
+        /usr/bin/python3 - \
+            "$TMP_ROOT/r14-a.out" "$TMP_ROOT/r14-a.err" \
+            "$TMP_ROOT/r14-b.out" "$TMP_ROOT/r14-b.err" <<'PY' && r14_streams_ok=1 || r14_streams_ok=0
+import os, sys
+
+a_out, a_err, b_out, b_err = sys.argv[1:5]
+if os.path.getsize(a_err) != 0 or os.path.getsize(b_err) != 0:
+    sys.exit(1)
+da = open(a_out, "rb").read()
+db = open(b_out, "rb").read()
+if len(da) != 1048576 or len(db) != 1048576:
+    sys.exit(1)
+if da != (b"A\n" * 524288) or db != (b"B\n" * 524288):
+    sys.exit(1)
+PY
+    fi
+
+    if [[ $r14_streams_ok -eq 1 ]]; then
+        pass_row 14 "concurrent 1 MiB streams A & B both exited 0 in ${r14_elapsed}s (1048576 bytes each, zero interleaving)."
+    else
+        fail_row 14 "rca=$r14_rca, rcb=$r14_rcb, len_a=$(wc -c < "$TMP_ROOT/r14-a.out" | tr -d ' '), len_b=$(wc -c < "$TMP_ROOT/r14-b.out" | tr -d ' '), erra='$(cat "$TMP_ROOT/r14-a.err" 2>/dev/null)', errb='$(cat "$TMP_ROOT/r14-b.err" 2>/dev/null)'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 15: `exec t1 -- sh -c 'head -c 1048576 /dev/urandom > /tmp/r; sha256sum /tmp/r >&2; cat /tmp/r'`
+    #   Expect: stdout is exactly 1048576 bytes and host SHA-256 equals guest SHA-256 printed on stderr.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r15.out" "$TMP_ROOT/r15.err" --lang en --workspace "$WS" \
+        exec t1 -- sh -c 'head -c 1048576 /dev/urandom > /tmp/r; sha256sum /tmp/r >&2; cat /tmp/r'
+    r15_rc=$LAST_RC
+    r15_elapsed="$LAST_ELAPSED_SEC"
+
+    r15_ok=0
+    r15_sha=""
+    if [[ $r15_rc -eq 0 ]]; then
+        r15_sha="$(
+            /usr/bin/python3 - "$TMP_ROOT/r15.out" "$TMP_ROOT/r15.err" <<'PY'
+import hashlib, re, sys
+
+raw = open(sys.argv[1], "rb").read()
+if len(raw) != 1048576:
+    sys.exit(1)
+host_sha = hashlib.sha256(raw).hexdigest().lower()
+
+err_txt = open(sys.argv[2], encoding="utf-8", errors="replace").read().strip()
+m = re.match(r"^([0-9a-fA-F]{64})\s+/tmp/r$", err_txt)
+if not m:
+    sys.exit(1)
+guest_sha = m.group(1).lower()
+if host_sha != guest_sha:
+    sys.exit(1)
+print(host_sha)
+PY
+        )" && r15_ok=1 || r15_ok=0
+    fi
+
+    if [[ $r15_ok -eq 1 && -n "$r15_sha" ]]; then
+        pass_row 15 "1 MiB random binary stream (${r15_elapsed}s) matched guest SHA-256 ($r15_sha)."
+    else
+        fail_row 15 "rc=$r15_rc, out_bytes=$(wc -c < "$TMP_ROOT/r15.out" | tr -d ' '), stderr='$(cat "$TMP_ROOT/r15.err" 2>/dev/null | tr '\n' ' ')'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 16: `exec t1 -- sh -c 'echo out; echo err >&2; exit 7'`; `exec t1 -- sh -c 'kill -9 $$'`
+    #   Expect: first has exact stdout `out\n`, exact stderr `err\n`, exit code 7; second has exit code 137.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r16-1.out" "$TMP_ROOT/r16-1.err" --lang en --workspace "$WS" \
+        exec t1 -- sh -c 'echo out; echo err >&2; exit 7'
+    r16_rc1=$LAST_RC
+
+    run_cli "$TMP_ROOT/r16-2.out" "$TMP_ROOT/r16-2.err" --lang en --workspace "$WS" \
+        exec t1 -- sh -c 'kill -9 $$'
+    r16_rc2=$LAST_RC
+
+    r16_exact=0
+    if [[ $r16_rc1 -eq 7 && $r16_rc2 -eq 137 ]]; then
+        /usr/bin/python3 - \
+            "$TMP_ROOT/r16-1.out" "$TMP_ROOT/r16-1.err" \
+            "$TMP_ROOT/r16-2.out" <<'PY' && r16_exact=1 || r16_exact=0
+import sys
+
+o1 = open(sys.argv[1], "rb").read()
+e1 = open(sys.argv[2], "rb").read()
+o2 = open(sys.argv[3], "rb").read()
+if o1 != b"out\n" or e1 != b"err\n" or o2 != b"":
+    sys.exit(1)
+PY
+    fi
+
+    if [[ $r16_exact -eq 1 ]]; then
+        pass_row 16 "first exec returned exact stdout='out\\n', stderr='err\\n', exit=7; second exec (SIGKILL) returned exit=137."
+    else
+        fail_row 16 "rc1=$r16_rc1 (expected 7), rc2=$r16_rc2 (expected 137), out1='$(cat "$TMP_ROOT/r16-1.out" 2>/dev/null)', err1='$(cat "$TMP_ROOT/r16-1.err" 2>/dev/null)'"
+    fi
+
+    # Row 17 requires guest daemon v2 RST process-group termination (Stage 5); Rows 18-21 require telemetry (Stages 5-6).
+    unrun_row 17 "客户机脚本处理 RST 是第 5 段"
+    unrun_row 18 "遥测映射（guestMemTotalBytes）是第 6 段"
+    unrun_row 19 "客户机 CPU 占用率遥测是第 5-6 段"
+    unrun_row 20 "客户机内存驻留遥测是第 6 段"
     unrun_row 21 "遥测刷新与过期是第 6 段"
 
     # --------------------------------------------------------------
     # Row 22: While daemon holds `t1`, `run t1 -- true`
-    #   Expect: exits 125 with ERR_VM_LOCKED; t1 still running (same VirtualMachine PID).
+    #   Expect: exits 125 with ERR_VM_LOCKED; t1 still running and boot_id unchanged.
     # --------------------------------------------------------------
     ROW_START_SEC="$(now_sec)"
     run_cli "$TMP_ROOT/r22-run.out" "$TMP_ROOT/r22-run.err" --lang en --workspace "$WS" run t1 -- true
@@ -1200,20 +1471,25 @@ if tel.get("state") != "running" or tel.get("guestAgentConnected") is not True:
 PY
     fi
 
+    run_cli "$TMP_ROOT/r22-boot.out" "$TMP_ROOT/r22-boot.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r22_boot_rc=$LAST_RC
+    r22_boot_id="$(tr -d '[:space:]' < "$TMP_ROOT/r22-boot.out" 2>/dev/null || true)"
+
     r22_extra_vz="$(list_extra_vz_pids)"
     r22_extra_vz_count="$(count_lines_nonempty "$r22_extra_vz")"
 
     if [[ $r22_rc -eq 125 && -z "$r22_out" && "$r22_err" == *"ERR_VM_LOCKED"* \
-        && $r22_t1_running -eq 1 && "$r22_extra_vz_count" == "1" \
-        && -n "$T1_VZ_PID" && "$r22_extra_vz" == "$T1_VZ_PID" ]]; then
-        pass_row 22 "'run t1 -- true' exited 125 with ERR_VM_LOCKED; t1 still running on unchanged VirtualMachine pid=$T1_VZ_PID (exec 读 boot_id 待第 4 段)."
+        && $r22_t1_running -eq 1 && $r22_boot_rc -eq 0 \
+        && -n "$R11_BOOT_ID" && "$r22_boot_id" == "$R11_BOOT_ID" \
+        && "$r22_extra_vz_count" == "1" && -n "$T1_VZ_PID" && "$r22_extra_vz" == "$T1_VZ_PID" ]]; then
+        pass_row 22 "'run t1 -- true' exited 125 with ERR_VM_LOCKED; t1 still running on pid=$T1_VZ_PID with unchanged boot_id=$r22_boot_id."
     else
-        fail_row 22 "rc=$r22_rc, out_len=${#r22_out}, t1_running=$r22_t1_running, extra_vz='${r22_extra_vz//$'\n'/,}' (expected '$T1_VZ_PID'), err='$r22_err'"
+        fail_row 22 "rc=$r22_rc, out_len=${#r22_out}, t1_running=$r22_t1_running, boot_rc=$r22_boot_rc, boot_id='$r22_boot_id' (expected '$R11_BOOT_ID'), extra_vz='${r22_extra_vz//$'\n'/,}' (expected '$T1_VZ_PID'), err='$r22_err'"
     fi
 
     # --------------------------------------------------------------
     # Row 23: While `t1` is running, `snapshot t1` and `restore <t1 snapshot>`
-    #   Expect: both exit 1 with ERR_VM_LOCKED mentioning M3; t1 root disk inode unchanged; t1 still running.
+    #   Expect: both exit 1 with ERR_VM_LOCKED mentioning M3; t1 root disk inode unchanged; boot_id unchanged.
     # --------------------------------------------------------------
     ROW_START_SEC="$(now_sec)"
     r23_ino_before=""
@@ -1255,19 +1531,107 @@ if tel.get("state") != "running" or tel.get("guestAgentConnected") is not True:
 PY
     fi
 
+    run_cli "$TMP_ROOT/r23-boot.out" "$TMP_ROOT/r23-boot.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r23_boot_rc=$LAST_RC
+    r23_boot_id="$(tr -d '[:space:]' < "$TMP_ROOT/r23-boot.out" 2>/dev/null || true)"
+
     r23_extra_vz="$(list_extra_vz_pids)"
 
     if [[ $r23_snap_rc -eq 1 && "$r23_snap_err" == *"ERR_VM_LOCKED"* && "$r23_snap_err" == *"M3"* \
         && $r23_restore_rc -eq 1 && "$r23_restore_err" == *"ERR_VM_LOCKED"* && "$r23_restore_err" == *"M3"* \
         && -n "$r23_ino_before" && "$r23_ino_before" == "$r23_ino_after" \
-        && $r23_t1_running -eq 1 && -n "$T1_VZ_PID" && "$r23_extra_vz" == "$T1_VZ_PID" ]]; then
-        pass_row 23 "'snapshot t1' and 'restore $T1_SNAP_ID' both exited 1 with ERR_VM_LOCKED mentioning M3; disk inode unchanged ($r23_ino_after); t1 still running on pid=$T1_VZ_PID (exec 读 boot_id 待第 4 段)."
+        && $r23_t1_running -eq 1 && $r23_boot_rc -eq 0 \
+        && -n "$R11_BOOT_ID" && "$r23_boot_id" == "$R11_BOOT_ID" \
+        && -n "$T1_VZ_PID" && "$r23_extra_vz" == "$T1_VZ_PID" ]]; then
+        pass_row 23 "'snapshot t1' and 'restore $T1_SNAP_ID' both exited 1 with ERR_VM_LOCKED mentioning M3; disk inode unchanged ($r23_ino_after); boot_id unchanged ($r23_boot_id)."
     else
-        fail_row 23 "snap_rc=$r23_snap_rc, restore_rc=$r23_restore_rc, ino='$r23_ino_before'->'$r23_ino_after', t1_running=$r23_t1_running, extra_vz='${r23_extra_vz//$'\n'/,}', snap_err='$r23_snap_err', restore_err='$r23_restore_err'"
+        fail_row 23 "snap_rc=$r23_snap_rc, restore_rc=$r23_restore_rc, ino='$r23_ino_before'->'$r23_ino_after', t1_running=$r23_t1_running, boot_rc=$r23_boot_rc, boot_id='$r23_boot_id' (expected '$R11_BOOT_ID'), extra_vz='${r23_extra_vz//$'\n'/,}'"
     fi
 
-    # Row 24 requires `exec` via daemon (Stage 4) and telemetry expiry (Stage 6).
-    unrun_row 24 "exec 经守护进程是第 4 段"
+    # --------------------------------------------------------------
+    # Row 24: `pause t1`; `exec t1 -- true`; `resume t1`; `exec t1 -- cat /proc/sys/kernel/random/boot_id`
+    #   Expect: `pause` exits 0, `ps --json` is paused, after 15s telemetry is '—';
+    #           `exec` while paused exits 125 (ERR_LIFECYCLE_STATE, hints resume);
+    #           `resume` exits 0; boot_id equals Row 11.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r24-pause.out" "$TMP_ROOT/r24-pause.err" --lang en --workspace "$WS" pause t1
+    r24_pause_rc=$LAST_RC
+
+    run_cli "$TMP_ROOT/r24-ps1.json" "$TMP_ROOT/r24-ps1.err" --lang en --workspace "$WS" ps --json
+    r24_ps1_rc=$LAST_RC
+    r24_paused_ok=0
+    if [[ $r24_ps1_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r24-ps1.json" <<'PY' && r24_paused_ok=1 || r24_paused_ok=0
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1) != 1 or t1[0].get("telemetry", {}).get("state") != "paused":
+    sys.exit(1)
+PY
+    fi
+
+    sleep 15.5
+
+    run_cli "$TMP_ROOT/r24-ps2.json" "$TMP_ROOT/r24-ps2.err" --lang en --workspace "$WS" ps --json
+    r24_ps2_rc=$LAST_RC
+    run_cli "$TMP_ROOT/r24-ps2.txt" "$TMP_ROOT/r24-ps2t.err" --lang en --workspace "$WS" ps
+    r24_ps2t_rc=$LAST_RC
+    r24_tel_dash_ok=0
+    if [[ $r24_ps2_rc -eq 0 && $r24_ps2t_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r24-ps2.json" "$TMP_ROOT/r24-ps2.txt" "$T1_ID" <<'PY' && r24_tel_dash_ok=1 || r24_tel_dash_ok=0
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1) != 1:
+    sys.exit(1)
+tel = t1[0].get("telemetry", {})
+if tel.get("state") != "paused" or tel.get("hasLiveGuestTelemetry") is not False:
+    sys.exit(1)
+
+lines = [ln.rstrip("\r\n") for ln in open(sys.argv[2], encoding="utf-8") if ln.strip()]
+t1_id = sys.argv[3].strip()
+if len(lines) < 2:
+    sys.exit(1)
+header = lines[0]
+state_idx = header.index("STATE")
+cpu_idx = header.index("CPU")
+mem_idx = header.index("MEMORY")
+ip_idx = header.index("IPV4")
+matched = [ln for ln in lines[1:] if (t1_id and ln.startswith(t1_id + " ")) or (" t1 " in ln)]
+if len(matched) != 1:
+    sys.exit(1)
+row = matched[0]
+if row[state_idx:cpu_idx].strip() != "paused" or row[cpu_idx:mem_idx].strip() != "—" or row[mem_idx:ip_idx].strip() != "—":
+    sys.exit(1)
+PY
+    fi
+
+    run_cli "$TMP_ROOT/r24-exec-paused.out" "$TMP_ROOT/r24-exec-paused.err" --lang en --workspace "$WS" exec t1 -- true
+    r24_exec_paused_rc=$LAST_RC
+    r24_exec_paused_out="$(cat "$TMP_ROOT/r24-exec-paused.out")"
+    r24_exec_paused_err="$(cat "$TMP_ROOT/r24-exec-paused.err")"
+
+    run_cli "$TMP_ROOT/r24-resume.out" "$TMP_ROOT/r24-resume.err" --lang en --workspace "$WS" resume t1
+    r24_resume_rc=$LAST_RC
+
+    run_cli "$TMP_ROOT/r24-boot.out" "$TMP_ROOT/r24-boot.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r24_boot_rc=$LAST_RC
+    r24_boot_id="$(tr -d '[:space:]' < "$TMP_ROOT/r24-boot.out" 2>/dev/null || true)"
+
+    if [[ $r24_pause_rc -eq 0 && $r24_paused_ok -eq 1 && $r24_tel_dash_ok -eq 1 \
+        && $r24_exec_paused_rc -eq 125 && -z "$r24_exec_paused_out" \
+        && "$r24_exec_paused_err" == *"ERR_LIFECYCLE_STATE"* \
+        && "$r24_exec_paused_err" == *"paused"* \
+        && "$r24_exec_paused_err" == *"resume"* \
+        && $r24_resume_rc -eq 0 && $r24_boot_rc -eq 0 \
+        && -n "$R11_BOOT_ID" && "$r24_boot_id" == "$R11_BOOT_ID" ]]; then
+        pass_row 24 "'pause t1' exited 0; ps --json=paused & >15s telemetry='—'; 'exec t1 -- true' exited 125 (ERR_LIFECYCLE_STATE + resume hint); 'resume t1' exited 0; boot_id unchanged ($r24_boot_id)."
+    else
+        fail_row 24 "pause=$r24_pause_rc, paused_ok=$r24_paused_ok, tel_dash=$r24_tel_dash_ok, exec_paused=$r24_exec_paused_rc, resume=$r24_resume_rc, boot_rc=$r24_boot_rc, boot_id='$r24_boot_id' (expected '$R11_BOOT_ID'), exec_err='$r24_exec_paused_err'"
+    fi
 
     # --------------------------------------------------------------
     # Row 25: `create t2 --image debian-12-bookworm-arm64`; while daemon is running (t1 running),
@@ -1328,10 +1692,10 @@ PY
     fi
 
     # --------------------------------------------------------------
-    # Row 26 (except `exec t1 -- true`): `halt t1`
+    # Row 26: `halt t1`
     #   Expect: exits 0; within 30s t1's VirtualMachine process exits; `ps --json` is stopped;
-    #           plain `ps` CPU and MEMORY columns are '—'; daemon still running (`daemon status` exits 0).
-    #           (`exec t1 -- true` deferred until Stage 4).
+    #           plain `ps` CPU and MEMORY columns are '—'; `exec t1 -- true` exits 125
+    #           (ERR_LIFECYCLE_STATE, stopped, hints up); daemon still running (`daemon status` exits 0).
     # --------------------------------------------------------------
     ROW_START_SEC="$(now_sec)"
     r26_t0="$(now_sec)"
@@ -1394,21 +1758,70 @@ if state_val != "stopped" or cpu_val != "—" or mem_val != "—":
 PY
     fi
 
+    run_cli "$TMP_ROOT/r26-exec.out" "$TMP_ROOT/r26-exec.err" --lang en --workspace "$WS" exec t1 -- true
+    r26_exec_rc=$LAST_RC
+    r26_exec_out="$(cat "$TMP_ROOT/r26-exec.out")"
+    r26_exec_err="$(cat "$TMP_ROOT/r26-exec.err")"
+
     run_cli "$TMP_ROOT/r26-dstatus.out" "$TMP_ROOT/r26-dstatus.err" --lang en --workspace "$WS" daemon status
     r26_dstatus_rc=$LAST_RC
     r26_daemon_pids="$(find_workspace_daemon_pids "$WS")"
     r26_daemon_count="$(count_lines_nonempty "$r26_daemon_pids")"
 
     if [[ $r26_halt_rc -eq 0 && $r26_vz_gone -eq 1 && $r26_psj_ok -eq 1 \
-        && $r26_pst_ok -eq 1 && $r26_dstatus_rc -eq 0 && "$r26_daemon_count" == "1" ]]; then
-        pass_row 26 "'halt t1' exited 0; t1 VirtualMachine process exited in ${r26_vz_elapsed}s (<30s); ps --json=stopped; plain ps CPU='—' & MEMORY='—'; daemon still alive ('daemon status' exited 0) ['exec t1 -- true' 没跑：exec 经守护进程是第 4 段]."
+        && $r26_pst_ok -eq 1 \
+        && $r26_exec_rc -eq 125 && -z "$r26_exec_out" \
+        && "$r26_exec_err" == *"ERR_LIFECYCLE_STATE"* \
+        && "$r26_exec_err" == *"stopped"* \
+        && "$r26_exec_err" == *"up"* \
+        && $r26_dstatus_rc -eq 0 && "$r26_daemon_count" == "1" ]]; then
+        pass_row 26 "'halt t1' exited 0; t1 VirtualMachine process exited in ${r26_vz_elapsed}s (<30s); ps --json=stopped; plain ps CPU='—' & MEMORY='—'; 'exec t1 -- true' exited 125 (ERR_LIFECYCLE_STATE + up hint); daemon still alive ('daemon status' exited 0)."
     else
-        fail_row 26 "halt_rc=$r26_halt_rc, vz_gone=$r26_vz_gone, psj_ok=$r26_psj_ok, pst_ok=$r26_pst_ok, dstatus_rc=$r26_dstatus_rc, daemon_count=$r26_daemon_count"
+        fail_row 26 "halt_rc=$r26_halt_rc, vz_gone=$r26_vz_gone, psj_ok=$r26_psj_ok, pst_ok=$r26_pst_ok, exec_rc=$r26_exec_rc, exec_err='$r26_exec_err', dstatus_rc=$r26_dstatus_rc, daemon_count=$r26_daemon_count"
     fi
 
-    # Rows 27-28 require `exec` via daemon (Stage 4) and guest stop observation A33 (Stage 3b).
-    unrun_row 27 "exec 经守护进程是第 4 段"
-    unrun_row 28 "exec 经守护进程是第 4 段（停机观察 A33 是第 3b 段）"
+    # --------------------------------------------------------------
+    # Row 27: Boot `t1` again via `up t1` and read `boot_id`
+    #   Expect: exits 0; new boot_id is a valid UUID and differs from Row 11.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r27-up.out" "$TMP_ROOT/r27-up.err" --lang en --workspace "$WS" up t1
+    r27_up_rc=$LAST_RC
+    r27_up_elapsed="$LAST_ELAPSED_SEC"
+
+    r27_extra_vz="$(list_extra_vz_pids)"
+    r27_extra_vz_count="$(count_lines_nonempty "$r27_extra_vz")"
+    if [[ "$r27_extra_vz_count" == "1" ]]; then
+        T1_VZ_PID="$r27_extra_vz"
+    fi
+
+    run_cli "$TMP_ROOT/r27-boot.out" "$TMP_ROOT/r27-boot.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r27_boot_rc=$LAST_RC
+    r27_boot_id=""
+    r27_boot_ok=0
+    if [[ $r27_boot_rc -eq 0 && ! -s "$TMP_ROOT/r27-boot.err" ]]; then
+        r27_boot_id="$(
+            /usr/bin/python3 - "$TMP_ROOT/r27-boot.out" "$R11_BOOT_ID" <<'PY'
+import re, sys
+
+new_id = open(sys.argv[1], encoding="utf-8").read().strip()
+old_id = sys.argv[2].strip()
+uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+if not new_id or not old_id or not uuid_re.match(new_id) or new_id == old_id:
+    sys.exit(1)
+print(new_id)
+PY
+        )" && r27_boot_ok=1 || r27_boot_ok=0
+    fi
+
+    if [[ $r27_up_rc -eq 0 && $r27_boot_ok -eq 1 && "$r27_extra_vz_count" == "1" ]]; then
+        pass_row 27 "'up t1' (${r27_up_elapsed}s) exited 0; new boot_id=$r27_boot_id differs from Row 11 ($R11_BOOT_ID)."
+    else
+        fail_row 27 "up_rc=$r27_up_rc, boot_rc=$r27_boot_rc, boot_ok=$r27_boot_ok, old_boot='$R11_BOOT_ID', new_boot='$(cat "$TMP_ROOT/r27-boot.out" 2>/dev/null | tr -d '\n')', extra_vz_count=$r27_extra_vz_count"
+    fi
+
+    # Row 28 requires guest spontaneous stop observation A33 (Stage 3b).
+    unrun_row 28 "客户机自发停机观察 A33 是第 3b 段"
 
     # --------------------------------------------------------------
     # Row 29: `up t1`, `up t2`
@@ -1454,12 +1867,64 @@ PY
         fail_row 29 "up1_rc=$r29_up1_rc, up2_rc=$r29_up2_rc, extra_vz_count=$r29_extra_vz_count (pids='${r29_extra_vz//$'\n'/,}'), dstatus_rc=$r29_dstatus_rc, status_ok=$r29_status_ok"
     fi
 
-    # Rows 30-34 require `exec` via daemon (Stage 4) and Stage 3b stop observation/reconnection.
-    unrun_row 30 "exec 经守护进程是第 4 段（第 30-31 行断电恢复组在第 3b 段）"
-    unrun_row 31 "exec 经守护进程是第 4 段"
-    unrun_row 32 "exec 经守护进程是第 4 段"
-    unrun_row 33 "exec 经守护进程是第 4 段（VM_STOPPED 停机原因与第 34 行 dmesg 核对在第 3b 段）"
-    unrun_row 34 "exec 经守护进程是第 4 段"
+    # Rows 30-31 require Stage 3b SIGKILL crash/reconcile + dmesg verification.
+    unrun_row 30 "守护进程 SIGKILL 断电恢复组（第 30-31 行）在第 3b 段"
+    unrun_row 31 "守护进程 SIGKILL 后 dmesg recovery complete 核对在第 3b 段"
+
+    # --------------------------------------------------------------
+    # Row 32: Run `exec t1 -- true` 10 times and `exec t1 -- uname -r` 10 times
+    #   Expect: all 20 exit 0; record each individual timing (no upper bound; compare vs M1 ~7s `run`).
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    r32_all_ok=1
+    r32_true_times=()
+    r32_uname_times=()
+    r32_kernel_val=""
+
+    for idx in $(seq 1 10); do
+        run_cli "$TMP_ROOT/r32-true-$idx.out" "$TMP_ROOT/r32-true-$idx.err" --lang en --workspace "$WS" exec t1 -- true
+        r32_true_times+=("${LAST_ELAPSED_SEC}s")
+        if [[ $LAST_RC -ne 0 || -s "$TMP_ROOT/r32-true-$idx.out" || -s "$TMP_ROOT/r32-true-$idx.err" ]]; then
+            r32_all_ok=0
+        fi
+    done
+
+    for idx in $(seq 1 10); do
+        run_cli "$TMP_ROOT/r32-uname-$idx.out" "$TMP_ROOT/r32-uname-$idx.err" --lang en --workspace "$WS" exec t1 -- uname -r
+        r32_uname_times+=("${LAST_ELAPSED_SEC}s")
+        if [[ $LAST_RC -ne 0 || -s "$TMP_ROOT/r32-uname-$idx.err" ]]; then
+            r32_all_ok=0
+        else
+            r32_k="$(
+                /usr/bin/python3 - "$TMP_ROOT/r32-uname-$idx.out" <<'PY'
+import re, sys
+
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+if len(lines) != 1:
+    sys.exit(1)
+val = lines[0].strip()
+if not re.match(r"^6\.1\.\d+-\d+-(cloud-)?arm64$", val):
+    sys.exit(1)
+print(val)
+PY
+            )" || r32_k=""
+            if [[ -z "$r32_k" ]]; then
+                r32_all_ok=0
+            else
+                r32_kernel_val="$r32_k"
+            fi
+        fi
+    done
+
+    if [[ $r32_all_ok -eq 1 ]]; then
+        pass_row 32 "all 20 exec calls exited 0 (kernel=$r32_kernel_val); 'exec t1 -- true' x10=[${r32_true_times[*]}]; 'exec t1 -- uname -r' x10=[${r32_uname_times[*]}]."
+    else
+        fail_row 32 "one or more of the 20 exec calls failed; true_times=[${r32_true_times[*]}], uname_times=[${r32_uname_times[*]}]"
+    fi
+
+    # Rows 33-34 require Stage 3b VM_STOPPED reason + clean shutdown dmesg verification.
+    unrun_row 33 "VM_STOPPED 停机原因与第 33-34 行正常关机 dmesg 核对在第 3b 段"
+    unrun_row 34 "daemon stop 后下次开机 dmesg 无 recovery complete 核对在第 3b 段"
 
     unrun_row 35 "待第 7 段 milestone 2 收尾脚本串联执行"
     unrun_row 36 "待第 7 段更新 m1-real-boot.sh 第 17 行后执行"

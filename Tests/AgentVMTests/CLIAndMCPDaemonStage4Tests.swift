@@ -1,0 +1,717 @@
+import AgentVMCLIAndMCP
+import AgentVMHypervisor
+import AgentVMModels
+import AgentVMPluginHost
+import AgentVMStorageCoW
+import AgentVMStore
+import AgentVMVsockRPC
+import Darwin
+import Foundation
+import Testing
+
+@Suite("M2 Stage 4: Daemon Exec Streaming, Defaults, Cancellation RST, Bounded Ledger/Queue & Plugins", .timeLimit(.minutes(2)))
+struct CLIAndMCPDaemonStage4Tests {
+
+    private func makePrivateTmpDirectory(prefix: String = "avm-s4") throws -> String {
+        var cTemplate = Array("/private/tmp/\(prefix).XXXXXX".utf8CString)
+        let createdPtr = cTemplate.withUnsafeMutableBufferPointer { buf in
+            Darwin.mkdtemp(buf.baseAddress)
+        }
+        guard let createdPtr else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(Darwin.errno))
+        }
+        let raw = String(cString: createdPtr)
+        return DaemonSocketAddressResolver.canonicalRealPath(of: URL(fileURLWithPath: raw, isDirectory: true))
+    }
+
+    private static func sweepDarwinUserTempSymlinks(pointingUnder basePath: String) {
+        guard let darwinTempDir = try? DaemonSocketAddressResolver.darwinUserTempDirectoryURL() else {
+            return
+        }
+        let canonicalBase = DaemonSocketAddressResolver.canonicalRealPath(
+            of: URL(fileURLWithPath: basePath, isDirectory: true)
+        )
+        var prefixes = [canonicalBase]
+        if canonicalBase.hasPrefix("/private/tmp/") {
+            prefixes.append(String(canonicalBase.dropFirst("/private".count)))
+        } else if canonicalBase.hasPrefix("/tmp/") {
+            prefixes.append("/private" + canonicalBase)
+        }
+        let uniquePrefixes = Array(Set(prefixes))
+
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: darwinTempDir.path) else {
+            return
+        }
+        for name in names where name.hasPrefix("avm-") {
+            let linkPath = darwinTempDir.appendingPathComponent(name, isDirectory: false).path
+            var st = Darwin.stat()
+            guard Darwin.lstat(linkPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK else {
+                continue
+            }
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let len = Darwin.readlink(linkPath, &buf, Int(PATH_MAX))
+            guard len > 0 else { continue }
+            let rawTarget = String(decoding: buf.prefix(len).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            let resolvedTarget: String
+            if rawTarget.hasPrefix("/") {
+                resolvedTarget = DaemonSocketAddressResolver.canonicalRealPath(
+                    of: URL(fileURLWithPath: rawTarget, isDirectory: true)
+                )
+            } else {
+                resolvedTarget = DaemonSocketAddressResolver.canonicalRealPath(
+                    of: darwinTempDir.appendingPathComponent(rawTarget, isDirectory: true)
+                )
+            }
+            let matches = uniquePrefixes.contains { prefix in
+                rawTarget == prefix
+                    || rawTarget.hasPrefix(prefix + "/")
+                    || resolvedTarget == prefix
+                    || resolvedTarget.hasPrefix(prefix + "/")
+            }
+            if matches {
+                _ = Darwin.unlink(linkPath)
+            }
+        }
+    }
+
+    private func stageBootableCachedImage(
+        in baseDir: String,
+        imageID: String = "debian-12-bookworm-arm64"
+    ) async throws -> (cacheDir: URL, cachedFileURL: URL, entry: BaseImageCatalogEntry) {
+        let cacheDir = URL(fileURLWithPath: "\(baseDir)/cache", isDirectory: true)
+        let imageBytes = 4 * 1024 * 1024
+        let stagingURL = URL(fileURLWithPath: "\(baseDir)/staging-\(UUID().uuidString).raw")
+        try APFSCoWDiskEngine().createSparseRawDisk(at: stagingURL, virtualSizeBytes: UInt64(imageBytes), overwrite: true)
+        let parts = try PartitionAndContainerInspector().writeProtectiveMBRAndGPT(
+            to: stagingURL,
+            partitions: [(name: "RootExt4", typeGUID: GPTWellKnownTypeGUID.linuxRootARM64.rawValue, sizeBytes: 2 * 1024 * 1024)]
+        )
+        var ext4Super = [UInt8](repeating: 0, count: 256)
+        ext4Super[0x38] = 0x53
+        ext4Super[0x39] = 0xEF
+        ext4Super[0x5C] = 0x04
+        ext4Super[0x60] = 0xC0
+        let fh = try FileHandle(forUpdating: stagingURL)
+        try fh.seek(toOffset: parts[0].firstLBA * 512 + 1024)
+        try fh.write(contentsOf: Data(ext4Super))
+        try fh.close()
+
+        let sha512 = try BinaryChecksums.sha512HexFile(at: stagingURL)
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Test Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian.raw",
+            expectedSHA512: sha512,
+            expectedSizeBytes: UInt64(imageBytes),
+            defaultVirtualSizeBytes: UInt64(imageBytes)
+        )
+        let seeder = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, curatedEntries: [entry], createIfMissing: true)
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedURL.path, 0o444) == 0)
+        return (cacheDir, cachedURL, entry)
+    }
+
+    private func withStartedDaemonServer<T>(
+        workspaceURL: URL,
+        imageCacheDirectoryURL: URL? = nil,
+        curatedImageEntries: [BaseImageCatalogEntry]? = nil,
+        hardwareBackendOverride: (any HardwareVMLowLevelBackend)? = nil,
+        vsockConnectTimeoutNanoseconds: UInt64 = 5_000_000_000,
+        vsockRetryIntervalNanoseconds: UInt64 = 10_000_000,
+        gracefulStopTimeoutNanoseconds: UInt64 = 100_000_000,
+        _ body: (WorkspaceDaemonServer) async throws -> T
+    ) async throws -> T {
+        let outcome = try await WorkspaceDaemonServer.start(
+            workspaceURL: workspaceURL,
+            imageCacheDirectoryURL: imageCacheDirectoryURL,
+            curatedImageEntries: curatedImageEntries,
+            hardwareBackendOverride: hardwareBackendOverride,
+            vsockConnectTimeoutNanoseconds: vsockConnectTimeoutNanoseconds,
+            vsockRetryIntervalNanoseconds: vsockRetryIntervalNanoseconds,
+            gracefulStopTimeoutNanoseconds: gracefulStopTimeoutNanoseconds
+        )
+        guard case let .started(server) = outcome else {
+            Issue.record("Expected WorkspaceDaemonServer.start to acquire singleton lock for \(workspaceURL.path)")
+            throw NSError(domain: "CLIAndMCPDaemonStage4Tests", code: 1)
+        }
+        defer {
+            server.listener.close(unlinkSocket: true, removeSymlink: true)
+            server.singletonLock.release(clearFile: true)
+            server.logManager.close()
+        }
+        do {
+            let result = try await body(server)
+            await server.stopAndCleanup()
+            return result
+        } catch {
+            await server.stopAndCleanup()
+            throw error
+        }
+    }
+
+    // MARK: - Item 1: `exec` via Daemon (Lifecycle State Guard, Defaults A42, Live Byte Streaming & Exit Codes)
+
+    @Test("Item 1: 'exec' via daemon rejects stopped/paused VMs with 125 ERR_LIFECYCLE_STATE without auto-booting, uses root/'/'/3600s defaults (A42), streams raw bytes live, and preserves exit codes")
+    func daemonExecLifecycleStateDefaultsLiveByteStreamingAndExitCodes() async throws {
+        // 0. GuestExecRequest defaults must match `run` (A42: root, /, 3600s).
+        let defaultReq = GuestExecRequest(executable: "uname", arguments: ["-r"])
+        #expect(defaultReq.runAsUser == "root")
+        #expect(defaultReq.workingDirectory == "/")
+        #expect(defaultReq.timeoutSeconds == 3600)
+
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s4-i1")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+
+        let (cacheDir, cachedURL, entry) = try await stageBootableCachedImage(in: realBase)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let wsURL = URL(fileURLWithPath: "\(realBase)/ExecStage4.agentvm", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = [
+            "HOME": isolatedHome,
+            "CFFIXED_USER_HOME": isolatedHome,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+        let forbiddenSpawn = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exit 95"],
+            environment: env
+        )
+
+        #expect(await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "create", "t1", "--image", entry.id],
+            curatedEntriesOverride: [entry],
+            environment: env
+        ).exitCode == 0)
+
+        var stdoutBytesArr: [UInt8] = [0x00, 0xFF, 0xFE, 0x80, 0x41, 0x56, 0x4D, 0x0A]
+        stdoutBytesArr.reserveCapacity(8 + 128 * 1024)
+        for idx in 0..<(128 * 1024) {
+            stdoutBytesArr.append(UInt8((idx * 73 + 19) & 0xFF))
+        }
+        let binaryStdout = Data(stdoutBytesArr)
+        let binaryStderr = Data([0x00, 0x81, 0xFE, 0xFF, 0x45, 0x52, 0x52, 0x0A])
+
+        let mockBackend = Stage4ScriptableGuestBackend { streamID, req, writer in
+            switch req.executable {
+            case "check-defaults":
+                let info = "\(req.runAsUser)|\(req.workingDirectory)|\(Int(req.timeoutSeconds))\n"
+                writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: 1, data: Data(info.utf8))
+                writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+            case "stream-binary":
+                writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: 1, data: Data(binaryStdout.prefix(4096)))
+                writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stderr, seq: 2, data: binaryStderr)
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: 3, data: Data(binaryStdout.dropFirst(4096)))
+                writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+            case "exit-7":
+                writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: 1, data: Data("out\n".utf8))
+                writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stderr, seq: 2, data: Data("err\n".utf8))
+                writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 7)
+            case "sigkill-self":
+                writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 137)
+            default:
+                writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+            }
+        }
+        defer { mockBackend.shutdownAll() }
+
+        try await withStartedDaemonServer(
+            workspaceURL: wsURL,
+            imageCacheDirectoryURL: cacheDir,
+            curatedImageEntries: [entry],
+            hardwareBackendOverride: mockBackend
+        ) { _ in
+            // 1. Stopped VM with live daemon: `exec` returns 125 ERR_LIFECYCLE_STATE, states 'stopped', hints 'up', does NOT auto-boot.
+            let execStoppedEn = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "check-defaults"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(execStoppedEn.exitCode == 125)
+            #expect(execStoppedEn.stdoutData.isEmpty)
+            #expect(execStoppedEn.stderr.contains("ERR_LIFECYCLE_STATE"))
+            #expect(execStoppedEn.stderr.contains("stopped"))
+            #expect(execStoppedEn.stderr.contains("agentvm up t1"))
+            #expect(mockBackend.startCount == 0)
+
+            // 2. Boot `t1`, pause `t1`, then `exec`: returns 125 ERR_LIFECYCLE_STATE, states 'paused', hints 'resume'.
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+            #expect(mockBackend.startCount == 1)
+
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "pause", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+
+            let execPausedEn = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "check-defaults"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(execPausedEn.exitCode == 125)
+            #expect(execPausedEn.stdoutData.isEmpty)
+            #expect(execPausedEn.stderr.contains("ERR_LIFECYCLE_STATE"))
+            #expect(execPausedEn.stderr.contains("paused"))
+            #expect(execPausedEn.stderr.contains("agentvm resume t1"))
+
+            let execPausedZh = await cli.execute(
+                arguments: ["--lang", "zh", "--workspace", wsURL.path, "exec", "t1", "--", "check-defaults"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(execPausedZh.exitCode == 125)
+            #expect(execPausedZh.stderr.contains("ERR_LIFECYCLE_STATE"))
+            #expect(execPausedZh.stderr.contains("paused"))
+            #expect(execPausedZh.stderr.contains("agentvm resume t1"))
+
+            // 3. Resume `t1` and verify `exec` uses root, /, 3600s defaults (A42).
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "resume", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+
+            let defaultsRes = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "check-defaults"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(defaultsRes.exitCode == 0, "defaultsRes stderr: \(defaultsRes.stderr)")
+            #expect(defaultsRes.stdout == "root|/|3600\n")
+            #expect(defaultsRes.stderrData.isEmpty)
+
+            // 4. Verify live byte-by-byte binary streaming on stdout and stderr (first chunk arrives well before 250ms delay completes).
+            let streamTracker = Stage4LiveChunkTracker()
+            let t0Ns = DispatchTime.now().uptimeNanoseconds
+            let streamRes = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "stream-binary"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn,
+                liveStdoutDataHandler: { chunk in
+                    let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - t0Ns) / 1_000_000.0
+                    streamTracker.recordStdout(chunk, elapsedMs: elapsedMs)
+                },
+                liveStderrDataHandler: { chunk in
+                    streamTracker.recordStderr(chunk)
+                }
+            )
+            let totalElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - t0Ns) / 1_000_000.0
+            #expect(streamRes.exitCode == 0)
+            let snap = streamTracker.snapshot()
+            #expect(snap.stdout == binaryStdout)
+            #expect(snap.stderr == binaryStderr)
+            let firstChunkMs = try #require(snap.firstStdoutChunkMs)
+            #expect(firstChunkMs < 200.0 && firstChunkMs < totalElapsedMs, "First stdout chunk (\(firstChunkMs) ms) must arrive live before command completion (\(totalElapsedMs) ms)")
+
+            // 5. Exit codes: guest exit 7, signal 128+9 = 137, and AgentVM failure (missing VM) = 125.
+            let exit7Res = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "exit-7"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(exit7Res.exitCode == 7)
+            #expect(exit7Res.stdoutData == Data("out\n".utf8))
+            #expect(exit7Res.stderrData == Data("err\n".utf8))
+
+            let sigkillRes = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "sigkill-self"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(sigkillRes.exitCode == 137)
+            #expect(sigkillRes.stdoutData.isEmpty)
+            #expect(sigkillRes.stderrData.isEmpty)
+
+            let missingVMRes = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "no-such-vm", "--", "true"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(missingVMRes.exitCode == 125)
+            #expect(missingVMRes.stdoutData.isEmpty)
+            #expect(missingVMRes.stderr.contains("ERR_VM_NOT_FOUND"))
+
+            _ = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+        }
+    }
+}
+
+// MARK: - Stage 4 Test Support: Scriptable AVM1 Guest Peer & Live Stream Tracker
+
+final class Stage4LiveChunkTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stdoutBytes = Data()
+    private var stderrBytes = Data()
+    private var firstStdoutMs: Double?
+
+    func recordStdout(_ chunk: Data, elapsedMs: Double) {
+        guard !chunk.isEmpty else { return }
+        lock.withLock {
+            if firstStdoutMs == nil {
+                firstStdoutMs = elapsedMs
+            }
+            stdoutBytes.append(chunk)
+        }
+    }
+
+    func recordStderr(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.withLock {
+            stderrBytes.append(chunk)
+        }
+    }
+
+    func snapshot() -> (stdout: Data, stderr: Data, firstStdoutChunkMs: Double?) {
+        lock.withLock {
+            (stdoutBytes, stderrBytes, firstStdoutMs)
+        }
+    }
+}
+
+final class Stage4GuestWireWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fd: Int32
+    private let codec = VsockWireCodec()
+    private var seqByStream: [UInt32: UInt32] = [:]
+    private var closed = false
+
+    init(fd: Int32) {
+        self.fd = fd
+    }
+
+    func markClosed() {
+        lock.withLock { closed = true }
+    }
+
+    @discardableResult
+    func sendRawFrame(
+        channel: VsockChannelKind,
+        flags: VsockFrameFlags,
+        streamID: UInt32,
+        windowCredit: UInt32 = VsockWireConstants.defaultWindowCredit,
+        payload: Data,
+        compress: Bool = false
+    ) -> Bool {
+        lock.lock()
+        if closed || fd < 0 {
+            lock.unlock()
+            return false
+        }
+        let seq = (seqByStream[streamID] ?? 0) &+ 1
+        seqByStream[streamID] = seq
+        let targetFD = fd
+        guard let wire = try? codec.encodeFrame(
+            channel: channel,
+            flags: flags,
+            streamID: streamID,
+            sequence: seq,
+            windowCredit: windowCredit,
+            payload: payload,
+            compressIfBeneficial: compress
+        ) else {
+            lock.unlock()
+            return false
+        }
+        let ok = wire.withUnsafeBytes { rawBuf -> Bool in
+            guard let base = rawBuf.baseAddress else { return true }
+            var offset = 0
+            while offset < rawBuf.count {
+                let n = Darwin.write(targetFD, base.advanced(by: offset), rawBuf.count - offset)
+                if n > 0 {
+                    offset += n
+                } else if n < 0 && Darwin.errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
+        lock.unlock()
+        return ok
+    }
+
+    @discardableResult
+    func sendOutputChunk(
+        streamID: UInt32,
+        requestID: UUID,
+        stream: GuestExecStreamKind,
+        seq: UInt32,
+        data: Data,
+        compress: Bool = false
+    ) -> Bool {
+        let chunk = GuestExecOutputChunk(requestID: requestID, stream: stream, sequence: seq, data: data)
+        guard let payload = try? VsockWireJSON.encode(chunk) else { return false }
+        return sendRawFrame(
+            channel: .execProcess,
+            flags: [.ack],
+            streamID: streamID,
+            payload: payload,
+            compress: compress
+        )
+    }
+
+    @discardableResult
+    func sendCompletion(
+        streamID: UInt32,
+        requestID: UUID,
+        exitCode: Int32,
+        durationMs: Int = 2,
+        timedOut: Bool = false
+    ) -> Bool {
+        let done = VsockExecCompletionEnvelope(
+            requestID: requestID,
+            exitCode: exitCode,
+            durationMilliseconds: durationMs,
+            timedOut: timedOut
+        )
+        guard let payload = try? VsockWireJSON.encode(done) else { return false }
+        return sendRawFrame(
+            channel: .execProcess,
+            flags: [.fin, .endOfMessage],
+            streamID: streamID,
+            payload: payload,
+            compress: false
+        )
+    }
+
+    @discardableResult
+    func sendHeartbeat(hostname: String = "s4-guest", uptimeSeconds: Double = 42.0) -> Bool {
+        let hb = GuestHeartbeatPayload(
+            hostname: hostname,
+            kernelRelease: "6.1.0-54-cloud-arm64",
+            uptimeSeconds: uptimeSeconds,
+            loadAvg1: 0.1,
+            loadAvg5: 0.1,
+            loadAvg15: 0.1,
+            memTotalBytes: 2_081_640_448,
+            memAvailableBytes: 1_900_000_000,
+            rootFilesystemUsedBytes: 1_000_000_000,
+            rootFilesystemTotalBytes: 3_221_225_472
+        )
+        guard let payload = try? VsockWireJSON.encode(hb) else { return false }
+        return sendRawFrame(
+            channel: .telemetryHeartbeat,
+            flags: [.ack, .endOfMessage],
+            streamID: 0,
+            payload: payload,
+            compress: true
+        )
+    }
+}
+
+final class Stage4ScriptableGuestBackend: HardwareVMLowLevelBackend, @unchecked Sendable {
+    typealias ExecHandler = @Sendable (UInt32, GuestExecRequest, Stage4GuestWireWriter) async -> Void
+    typealias InboundFrameObserver = @Sendable (VsockFrameHeader, Data, Stage4GuestWireWriter) -> Void
+
+    private let lock = NSLock()
+    private let execHandler: ExecHandler
+    private let frameObserver: InboundFrameObserver?
+    private(set) var startCount = 0
+    private(set) var execCount = 0
+    private var handles: [Stage4ScriptableVMHandle] = []
+
+    init(
+        frameObserver: InboundFrameObserver? = nil,
+        execHandler: @escaping ExecHandler
+    ) {
+        self.frameObserver = frameObserver
+        self.execHandler = execHandler
+    }
+
+    fileprivate func recordExec() {
+        lock.withLock { execCount += 1 }
+    }
+
+    func shutdownAll() {
+        let all = lock.withLock { () -> [Stage4ScriptableVMHandle] in
+            let copy = handles
+            handles.removeAll()
+            return copy
+        }
+        for h in all {
+            h.forceClose()
+        }
+    }
+
+    func startMachine(
+        spec: VMSpec,
+        networkSocketFD: Int32?,
+        consoleLogURL: URL,
+        translator: VZConfigurationTranslator
+    ) async throws -> any HardwareVMInstanceHandle {
+        _ = try translator.buildVZConfiguration(
+            from: spec,
+            networkSocketFD: networkSocketFD,
+            serialLogFileURL: consoleLogURL,
+            validateConfiguration: false
+        )
+        let handle = Stage4ScriptableVMHandle(owner: self, execHandler: execHandler, frameObserver: frameObserver)
+        lock.withLock {
+            startCount += 1
+            handles.append(handle)
+        }
+        return handle
+    }
+}
+
+final class Stage4ScriptableVMHandle: HardwareVMInstanceHandle, @unchecked Sendable {
+    private unowned let owner: Stage4ScriptableGuestBackend
+    private let execHandler: Stage4ScriptableGuestBackend.ExecHandler
+    private let frameObserver: Stage4ScriptableGuestBackend.InboundFrameObserver?
+    private let lock = NSLock()
+    private var hostFD: Int32 = -1
+    private var peerFD: Int32 = -1
+    private var activeWriter: Stage4GuestWireWriter?
+    private var readLoopTask: Task<Void, Never>?
+
+    init(
+        owner: Stage4ScriptableGuestBackend,
+        execHandler: @escaping Stage4ScriptableGuestBackend.ExecHandler,
+        frameObserver: Stage4ScriptableGuestBackend.InboundFrameObserver?
+    ) {
+        self.owner = owner
+        self.execHandler = execHandler
+        self.frameObserver = frameObserver
+    }
+
+    func prematureStopReason() -> String? { nil }
+
+    func connectVsock(port: UInt32) async throws -> HardwareVsockFDDescriptor {
+        forceClose()
+        var fds: [Int32] = [-1, -1]
+        guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(Darwin.errno))
+        }
+        var one: Int32 = 1
+        _ = Darwin.setsockopt(fds[0], SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        _ = Darwin.setsockopt(fds[1], SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+
+        let hFD = fds[0]
+        let pFD = fds[1]
+        let writer = Stage4GuestWireWriter(fd: pFD)
+        let handler = execHandler
+        let observer = frameObserver
+
+        let task = Task.detached { [weak self] in
+            let codec = VsockWireCodec()
+            let acc = VsockStreamAccumulator(codec: codec)
+            var buf = [UInt8](repeating: 0, count: 65_536)
+            var execBuffers: [UInt32: Data] = [:]
+
+            _ = writer.sendHeartbeat()
+
+            while !Task.isCancelled {
+                let n = Darwin.read(pFD, &buf, buf.count)
+                if n == 0 { break }
+                if n < 0 {
+                    if Darwin.errno == EINTR { continue }
+                    break
+                }
+                guard let frames = try? acc.ingest(Data(buf[0..<n])) else { break }
+                for (header, payload) in frames {
+                    observer?(header, payload, writer)
+                    switch header.channel {
+                    case .telemetryHeartbeat:
+                        _ = writer.sendHeartbeat()
+                    case .execProcess:
+                        if header.flags.contains(.rst) {
+                            execBuffers.removeValue(forKey: header.streamID)
+                            continue
+                        }
+                        if !payload.isEmpty {
+                            execBuffers[header.streamID, default: Data()].append(payload)
+                        }
+                        if header.flags.contains(.endOfMessage),
+                           let reqBytes = execBuffers.removeValue(forKey: header.streamID),
+                           let req = try? VsockWireJSON.decode(GuestExecRequest.self, from: reqBytes) {
+                            self?.owner.recordExec()
+                            let sid = header.streamID
+                            Task.detached {
+                                await handler(sid, req, writer)
+                            }
+                        }
+                    default:
+                        break
+                    }
+                }
+            }
+        }
+
+        lock.withLock {
+            hostFD = hFD
+            peerFD = pFD
+            activeWriter = writer
+            readLoopTask = task
+        }
+        return HardwareVsockFDDescriptor(fileDescriptor: hFD, closeWhenSessionEnds: false)
+    }
+
+    func forceClose() {
+        let (h, p, w, t) = lock.withLock { () -> (Int32, Int32, Stage4GuestWireWriter?, Task<Void, Never>?) in
+            let curH = hostFD
+            let curP = peerFD
+            let curW = activeWriter
+            let curT = readLoopTask
+            hostFD = -1
+            peerFD = -1
+            activeWriter = nil
+            readLoopTask = nil
+            return (curH, curP, curW, curT)
+        }
+        w?.markClosed()
+        t?.cancel()
+        if p >= 0 {
+            _ = Darwin.shutdown(p, SHUT_RDWR)
+            _ = Darwin.close(p)
+        }
+        if h >= 0 {
+            _ = Darwin.shutdown(h, SHUT_RDWR)
+            _ = Darwin.close(h)
+        }
+    }
+
+    func closeVsockConnection() async {
+        forceClose()
+    }
+
+    func pause() async throws {}
+    func resume() async throws {}
+    func saveMachineState(to url: URL) async throws {}
+
+    func shutdown(gracefulTimeoutNanoseconds: UInt64) async {
+        forceClose()
+    }
+}

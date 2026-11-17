@@ -154,21 +154,9 @@ public enum DaemonLifecycleErrorFormatter {
         state: VMLifecycleState,
         language: AppLanguage
     ) -> DaemonRPCError {
-        let isZh = (language == .zhHans)
-        let msg: String
-        if state == .paused {
-            msg = isZh
-                ? "虚拟机「\(vmName)」（\(vmID.rawValue)）当前处于「paused」状态（客户机已暂停），无法在客户机中执行命令。请先运行 'agentvm resume \(vmName)' 恢复运行。"
-                : "Cannot perform 'exec' on VM '\(vmName)' (\(vmID.rawValue)) while in state 'paused' (guest is paused). Run 'agentvm resume \(vmName)' first."
-        } else {
-            msg = isZh
-                ? "虚拟机「\(vmName)」（\(vmID.rawValue)）当前处于「\(state.rawValue)」状态（客户机未在运行），无法在客户机中执行命令。请先运行 'agentvm up \(vmName)' 启动虚拟机。"
-                : "Cannot perform 'exec' on VM '\(vmName)' (\(vmID.rawValue)) while in state '\(state.rawValue)' (guest is not running). Run 'agentvm up \(vmName)' first."
-        }
-        return DaemonRPCError(
-            code: DaemonRPCError.applicationErrorCode,
-            errorCode: "ERR_LIFECYCLE_STATE",
-            message: msg
+        DaemonRPCError.from(
+            .execRequiresRunningVM(vmName: vmName, vmID: vmID, currentState: state),
+            language: language
         )
     }
 
@@ -666,14 +654,39 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
         defer { conn.close() }
         do {
             let vmID = try await resolveVMID(params.vm)
-            let rec = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: params.lang)
-            let rpcErr = DaemonLifecycleErrorFormatter.execNotRunningRPCError(
-                vmName: rec.spec.name,
-                vmID: rec.id,
-                state: rec.telemetry.state,
-                language: params.lang
+            let req = GuestExecRequest(
+                executable: params.executable,
+                arguments: params.arguments,
+                workingDirectory: params.workingDirectory,
+                environment: params.environment,
+                runAsUser: params.runAsUser,
+                timeoutSeconds: params.timeoutSeconds
             )
-            let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(id: id, error: rpcErr)
+            let execResult = try await coordinator.executeInRunningDaemonVM(
+                vmID: vmID,
+                request: req,
+                language: params.lang
+            ) { chunk in
+                guard !chunk.data.isEmpty else { return }
+                let outStream: DaemonRPCExecStream
+                switch chunk.stream {
+                case .stdout:
+                    outStream = .stdout
+                case .stderr, .systemNotice:
+                    outStream = .stderr
+                }
+                let notif = DaemonRPCExecOutputParams(stream: outStream, data: chunk.data)
+                if let encoded = try? DaemonRPCCodec.encodeExecOutputLine(notif) {
+                    try? conn.writeLineData(encoded)
+                }
+            }
+            let resp = DaemonRPCResponse<DaemonRPCExecResult>.success(
+                id: id,
+                result: DaemonRPCExecResult(
+                    exitCode: execResult.exitCode,
+                    timedOut: execResult.timedOut
+                )
+            )
             try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
         } catch let err as AgentVMError {
             let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(
@@ -787,6 +800,76 @@ public enum DaemonClient {
             return .connected((daemonHello, payload))
         } catch let framingErr as DaemonRPCLineFramingError {
             if case let .ioError(code, _) = framingErr, code == ECONNRESET || code == EPIPE {
+                return .daemonNotRunning
+            }
+            throw framingErr
+        }
+    }
+
+    public static func performExecCall(
+        workspaceURL: URL,
+        params: DaemonRPCExecParams,
+        enforceVersionMatch: Bool = true,
+        clientHelloOverride: DaemonRPCHello? = nil,
+        userTempDirectoryOverride: URL? = nil,
+        onConnectionEstablished: ((DaemonSocketConnection) -> Void)? = nil,
+        onOutputChunk: ((DaemonRPCExecOutputParams) -> Void)? = nil
+    ) throws -> DaemonClientConnectionResult<(daemonHello: DaemonRPCHello, result: DaemonRPCExecResult)> {
+        let conn: DaemonSocketConnection
+        do {
+            conn = try DaemonSocketClient.connectWorkspace(
+                workspaceURL: workspaceURL,
+                userTempDirectoryOverride: userTempDirectoryOverride
+            )
+        } catch let sockErr as DaemonSocketError {
+            if isDaemonAbsentSocketError(sockErr) {
+                return .daemonNotRunning
+            }
+            throw sockErr
+        }
+        defer { conn.close() }
+        onConnectionEstablished?(conn)
+
+        let clientHello = clientHelloOverride ?? DaemonRPCHello(
+            executablePath: DaemonExecutableLocator.resolveCurrentExecutablePath()
+        )
+        let reader = conn.makeLineReader()
+        var requestDispatched = false
+
+        do {
+            try conn.writeLineData(try DaemonRPCCodec.encodeHelloLine(clientHello))
+            guard let daemonHelloLine = try reader.readLineData() else {
+                return .daemonNotRunning
+            }
+            let daemonHello = try DaemonRPCCodec.decodeHelloLine(daemonHelloLine)
+            if enforceVersionMatch {
+                try clientHello.verifyCompatibility(withDaemon: daemonHello, language: params.lang)
+            }
+
+            let envelope = DaemonRPCRequestEnvelope(id: .int(1), call: .exec(params))
+            try conn.writeLineData(try DaemonRPCCodec.encodeRequestLine(envelope))
+            requestDispatched = true
+
+            while true {
+                guard let frameLine = try reader.readLineData() else {
+                    throw AgentVMError.ipcDaemonUnavailable(
+                        socketPath: DaemonWorkspacePaths(workspaceURL: workspaceURL).directSocketPath,
+                        detail: "Daemon closed connection before sending exec response."
+                    )
+                }
+                let serverFrame = try DaemonRPCCodec.decodeServerFrame(DaemonRPCExecResult.self, from: frameLine)
+                switch serverFrame {
+                case let .execOutput(chunk):
+                    onOutputChunk?(chunk)
+                case let .response(resp):
+                    let payload = try resp.resultOrThrow()
+                    return .connected((daemonHello, payload))
+                }
+            }
+        } catch let framingErr as DaemonRPCLineFramingError {
+            if !requestDispatched,
+               case let .ioError(code, _) = framingErr,
+               code == ECONNRESET || code == EPIPE {
                 return .daemonNotRunning
             }
             throw framingErr

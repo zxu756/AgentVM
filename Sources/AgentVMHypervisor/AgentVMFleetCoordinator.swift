@@ -2342,6 +2342,56 @@ public actor AgentVMFleetCoordinator {
         return execResult
     }
 
+    /// Executes a command inside an already-running VM held by this workspace daemon (`agentvm exec`).
+    /// Never auto-boots a stopped VM and rejects paused VMs with `ERR_LIFECYCLE_STATE` (`execRequiresRunningVM`).
+    public func executeInRunningDaemonVM(
+        vmID: VMID,
+        request: GuestExecRequest,
+        language: AppLanguage = .en,
+        onOutputChunk: (@Sendable (GuestExecOutputChunk) async -> Void)? = nil
+    ) async throws -> GuestExecResult {
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        try rejectIfLockedByAnotherOwnerForLifecycleOrExec(
+            vmID: vmID,
+            vmName: existing.spec.name,
+            operation: "exec"
+        )
+        var record = try await loadVMForOperation(vmID)
+        if !isSimulationBackend,
+           record.telemetry.state == .running,
+           !record.telemetry.simulated,
+           hardwareBoxes[vmID] == nil,
+           !ownsExecutionLock(for: vmID),
+           !VMExecutionLock.isLocked(at: lockFileURL(for: vmID)) {
+            let diag = makeVMRuntimeLostDiagnostic(for: record, language: language)
+            if let reconciled = try await store.reconcileLostRunningVM(vmID: vmID, diagnostic: diag).record {
+                record = reconciled
+            }
+        }
+        guard record.telemetry.state == .running,
+              isSimulationBackend || hardwareBoxes[vmID] != nil else {
+            let effectiveState: VMLifecycleState = (!isSimulationBackend && hardwareBoxes[vmID] == nil && record.telemetry.state == .running)
+                ? .stopped
+                : record.telemetry.state
+            throw AgentVMError.execRequiresRunningVM(
+                vmName: record.spec.name,
+                vmID: record.id,
+                currentState: effectiveState
+            )
+        }
+        guard let session = vsockSessions[vmID] else {
+            throw AgentVMError.guestAgentNotConnected(
+                vmName: record.spec.name,
+                state: record.telemetry.state.rawValue
+            )
+        }
+        let execResult = try await session.executeCommandStreaming(request, onChunk: onOutputChunk)
+        try? await store.appendExecResult(execResult)
+        return execResult
+    }
+
     /// Executes a single guest command in a complete in-process boot -> vsock connect -> exec -> halt lifecycle (`agentvm run`).
     /// Preserves raw `stdoutData` and `stderrData` byte-for-byte without UTF-8 string conversion.
     public func runOneShotCommand(

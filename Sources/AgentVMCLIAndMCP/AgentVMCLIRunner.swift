@@ -22,7 +22,7 @@ public final class CLIStandardStreamForwarder: @unchecked Sendable {
         lock.withLock {
             forwardedStdoutBytes.append(chunkData)
         }
-        stdoutHandle.write(chunkData)
+        try? stdoutHandle.write(contentsOf: chunkData)
     }
 
     public func writeStderrChunk(_ chunkData: Data, to stderrHandle: FileHandle = .standardError) {
@@ -30,7 +30,19 @@ public final class CLIStandardStreamForwarder: @unchecked Sendable {
         lock.withLock {
             forwardedStderrBytes.append(chunkData)
         }
-        stderrHandle.write(chunkData)
+        try? stderrHandle.write(contentsOf: chunkData)
+    }
+
+    /// Writes streamed raw bytes directly to `stdoutHandle` without retaining them in memory (Fixes A36).
+    public func writeUnbufferedStdoutChunk(_ chunkData: Data, to stdoutHandle: FileHandle = .standardOutput) {
+        guard !chunkData.isEmpty else { return }
+        try? stdoutHandle.write(contentsOf: chunkData)
+    }
+
+    /// Writes streamed raw bytes directly to `stderrHandle` without retaining them in memory (Fixes A36).
+    public func writeUnbufferedStderrChunk(_ chunkData: Data, to stderrHandle: FileHandle = .standardError) {
+        guard !chunkData.isEmpty else { return }
+        try? stderrHandle.write(contentsOf: chunkData)
     }
 
     public func writeProgress(_ chunk: String, to stderrHandle: FileHandle = .standardError) {
@@ -93,11 +105,11 @@ public struct CLIExecutionOutcome: Codable, Hashable, Sendable {
     ) {
         let remainingStdout = forwarder?.unforwardedStdoutSuffix(of: stdoutData) ?? stdoutData
         if !remainingStdout.isEmpty {
-            stdoutHandle.write(remainingStdout)
+            try? stdoutHandle.write(contentsOf: remainingStdout)
         }
         let remainingStderr = forwarder?.unforwardedSuffix(of: stderrData) ?? stderrData
         if !remainingStderr.isEmpty {
-            stderrHandle.write(remainingStderr)
+            try? stderrHandle.write(contentsOf: remainingStderr)
         }
     }
 }
@@ -734,7 +746,10 @@ public struct AgentVMCLIRunner: Sendable {
                     coordinator: coordinator,
                     args: rest,
                     isSimulation: isSimulationFlagged,
-                    language: language
+                    language: language,
+                    signalController: signalController,
+                    liveStdoutDataHandler: isSimulationFlagged ? nil : liveStdoutDataHandler,
+                    liveStderrDataHandler: isSimulationFlagged ? nil : liveStderrDataHandler
                 )
             case "pcap":
                 rawOutcome = try await runPCAP(
@@ -843,10 +858,23 @@ public struct AgentVMCLIRunner: Sendable {
                 stdoutData: Data(),
                 stderrData: Data((isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr).utf8)
             )
+        } catch let framingErr as DaemonRPCLineFramingError {
+            let localizedErr = framingErr.localizedMessage(in: language)
+            let rawStderr = streamedProgressStderr.snapshot() + "[\(framingErr.errorCode)] \(localizedErr)\n"
+            let errorExitCode: Int32 = (subcommand == "run" || (subcommand == "exec" && !isSimulationFlagged))
+                ? Self.runInfrastructureErrorExitCode
+                : 1
+            return CLIExecutionOutcome(
+                exitCode: errorExitCode,
+                stdoutData: Data(),
+                stderrData: Data((isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr).utf8)
+            )
         } catch {
             let prefix = isZh ? "错误：" : "Error: "
             let rawStderr = streamedProgressStderr.snapshot() + "\(prefix)\(error.localizedDescription)\n"
-            let errorExitCode: Int32 = (subcommand == "run") ? Self.runInfrastructureErrorExitCode : 1
+            let errorExitCode: Int32 = (subcommand == "run" || (subcommand == "exec" && !isSimulationFlagged))
+                ? Self.runInfrastructureErrorExitCode
+                : 1
             return CLIExecutionOutcome(
                 exitCode: errorExitCode,
                 stdoutData: Data(),
@@ -1290,7 +1318,10 @@ public struct AgentVMCLIRunner: Sendable {
         coordinator: AgentVMFleetCoordinator,
         args: [String],
         isSimulation: Bool,
-        language: AppLanguage
+        language: AppLanguage,
+        signalController: OneShotRunSignalController? = nil,
+        liveStdoutDataHandler: (@Sendable (Data) -> Void)? = nil,
+        liveStderrDataHandler: (@Sendable (Data) -> Void)? = nil
     ) async throws -> CLIExecutionOutcome {
         let isZh = (language == .zhHans)
         guard let vmToken = args.first else {
@@ -1312,25 +1343,48 @@ public struct AgentVMCLIRunner: Sendable {
         let vmID = try await resolveVMID(vmToken, coordinator: coordinator)
 
         if !isSimulation {
+            _ = signalController
             let execParams = DaemonRPCExecParams(
                 vm: vmID.rawValue,
                 executable: exe,
                 arguments: Array(cmdTokens.dropFirst()),
-                workingDirectory: "/",
-                runAsUser: "root",
+                workingDirectory: DaemonRPCExecParams.defaultWorkingDirectory,
+                runAsUser: DaemonRPCExecParams.defaultRunAsUser,
                 environment: [:],
-                timeoutSeconds: 3600,
+                timeoutSeconds: DaemonRPCExecParams.defaultTimeoutSeconds,
                 lang: language
             )
+            let collector = StreamedBinaryOutputCollector()
             do {
-                let rpcOutcome = try DaemonClient.performUnaryCall(
+                let rpcOutcome = try DaemonClient.performExecCall(
                     workspaceURL: coordinator.store.bundleURL,
-                    call: .exec(execParams),
-                    resultType: DaemonRPCExecResult.self
+                    params: execParams,
+                    onOutputChunk: { chunk in
+                        guard !chunk.data.isEmpty else { return }
+                        switch chunk.stream {
+                        case .stdout:
+                            if let liveStdoutDataHandler {
+                                liveStdoutDataHandler(chunk.data)
+                            } else {
+                                collector.appendStdout(chunk.data)
+                            }
+                        case .stderr:
+                            if let liveStderrDataHandler {
+                                liveStderrDataHandler(chunk.data)
+                            } else {
+                                collector.appendStderr(chunk.data)
+                            }
+                        }
+                    }
                 )
                 switch rpcOutcome {
                 case let .connected((_, execRes)):
-                    return CLIExecutionOutcome(exitCode: execRes.exitCode)
+                    let collected = collector.snapshot()
+                    return CLIExecutionOutcome(
+                        exitCode: execRes.exitCode,
+                        stdoutData: collected.stdout,
+                        stderrData: collected.stderr
+                    )
                 case .daemonNotRunning:
                     // A52: strip any state written by `--backend simulation` (and reconcile crashed running state)
                     // BEFORE formatting the `ERR_LIFECYCLE_STATE` message so we never report a fake simulated `running`.

@@ -47,10 +47,12 @@ map_module_to_filters() {
         AgentVMModels|Models)
             echo "ModelsAndBinaryPrimitivesTests"
             echo "BilingualLocalizationTests"
+            echo "CLIAndMCPDaemonStage4Tests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
             echo "CLIAndMCPDaemonStage3aTests"
+            echo "CLIAndMCPDaemonStage4Tests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"
@@ -60,13 +62,16 @@ map_module_to_filters() {
             ;;
         AgentVMVsockRPC|VsockRPC)
             echo "VsockRPCAndTerminalTests"
+            echo "CLIAndMCPDaemonStage4Tests"
             ;;
         AgentVMPluginHost|PluginHost)
             echo "PluginSandboxAndIACTests"
+            echo "CLIAndMCPDaemonStage4Tests"
             ;;
         AgentVMHypervisor|Hypervisor)
             echo "HypervisorCoordinatorTests"
             echo "CLIAndMCPDaemonStage3aTests"
+            echo "CLIAndMCPDaemonStage4Tests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -75,6 +80,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonRPCTests"
             echo "CLIAndMCPDaemonStage2Tests"
             echo "CLIAndMCPDaemonStage3aTests"
+            echo "CLIAndMCPDaemonStage4Tests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -88,6 +94,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonRPCTests"
             echo "CLIAndMCPDaemonStage2Tests"
             echo "CLIAndMCPDaemonStage3aTests"
+            echo "CLIAndMCPDaemonStage4Tests"
             echo "StudioViewsHonestyTests"
             ;;
         *)

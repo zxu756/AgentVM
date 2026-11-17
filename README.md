@@ -2,7 +2,7 @@
 
 # AgentVM `v1.3.0`
 
-> **Current Status (M1 — Real Boot, Real Execution)**: APFS Copy-on-Write (`clonefile(2)`) sparse disk & snapshot lineage management, SQLite WAL workspace persistence, pure-Swift NoCloud `cidata` ISO-9660 generation, and sandboxed `JavaScriptCore` policy evaluation work locally today. Ethernet/IPv4/DNS/TLS frame dissection and `.pcapng` reading/writing exist as a library (`AgentVMNetSwitch`, covered by unit tests); neither the CLI nor the desktop UI can open a capture file yet. `agentvm image pull debian-12-bookworm-arm64` downloads a pinned Debian 12 arm64 cloud image and verifies its SHA-512, and `agentvm run <vm> -- <cmd>` boots a VM created from it on `VZVirtualMachine`, runs the command in the guest over `AF_VSOCK` and shuts the guest down; M1 acceptance checked that the output comes from the real guest. Booting needs a binary carrying the virtualization entitlement, which a plain `swift build` binary lacks. `up`, `exec`, `pause`, `resume` and `halt` still do not operate a real guest (scheduled for M2), and the desktop UI is not wired to real VMs (M4). Guest networking is the system NAT with no egress control; user-space egress firewall enforcement and live VM packet capture are scheduled for M5.
+> **Current Status (M2 — Per-Workspace Daemon & Live Guest Telemetry)**: APFS Copy-on-Write (`clonefile(2)`) sparse disk & offline snapshot lineage management, SQLite WAL workspace persistence, pure-Swift NoCloud `cidata` ISO-9660 generation, and sandboxed `JavaScriptCore` policy evaluation work locally today. Ethernet/IPv4/DNS/TLS frame dissection and `.pcapng` reading/writing exist as a library (`AgentVMNetSwitch`, covered by unit tests); neither the CLI nor the desktop UI can open a capture file yet. `agentvm image pull debian-12-bookworm-arm64` downloads a pinned Debian 12 arm64 cloud image and verifies its SHA-512; `agentvm run <vm> -- <cmd>` runs a one-shot command on `VZVirtualMachine` and shuts the guest down; and in M2 a per-workspace background daemon (`daemon start|status|stop`, `events`) holds running `VZVirtualMachine` instances across separate CLI invocations so `up`, `exec` (concurrent `AF_VSOCK` stdout/stderr/exit-code streaming with `SIGINT`/`SIGTERM` cancellation on newly created VMs; stdin is `/dev/null`), `pause`, `resume`, and `halt` operate real guests and report live guest `/proc` CPU, memory, and uptime heartbeats in `ps`. Booting needs a binary carrying `com.apple.security.virtualization`, which a plain `swift build` binary lacks. Live snapshot/branch/restore on a running VM is refused until M3; the desktop UI and MCP server read state and telemetry from SQLite and refuse to mutate daemon-held VMs until M4; guest networking uses system NAT with no egress enforcement or live packet capture until M5.
 
 [![Version](https://img.shields.io/badge/version-v1.3.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
@@ -10,16 +10,18 @@
 [![Bilingual](https://img.shields.io/badge/UI-中文%20%7C%20EN-2A9D6F)](README.zh-CN.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2A9D6F)](LICENSE)
 
-`AgentVM` is a macOS (Apple Silicon) workspace manager and APFS Copy-on-Write disk & snapshot lineage tool with a CLI, a stdio MCP server and a desktop workbench, written in Swift 6, with live `中文 | EN` bilingual switching across the desktop UI and CLI (`--lang en` / `--lang zh`). A virtual machine can be booted only through `agentvm run`, and the workbench's packet and firewall views have no real traffic to show before M5.
+`AgentVM` is a macOS (Apple Silicon) workspace manager and APFS Copy-on-Write disk & snapshot lineage tool with a CLI, a stdio MCP server and a desktop workbench, written in Swift 6, with live `中文 | EN` bilingual switching across the desktop UI and CLI (`--lang en` / `--lang zh`). Persistent real VMs are held by one background daemon per workspace (`agentvm up` / `exec` / `pause` / `resume` / `halt`), one-shot VMs run via `agentvm run`, and the workbench's packet and firewall views have no real traffic to show before M5.
 
 By default, launching the desktop app or initializing a `.agentvm` workspace starts completely empty (0 VMs, 0 packets, 0 alerts) and never fabricates guest execution or telemetry:
 
 - Creating a VM provisions a sparse GPT disk image and a NoCloud `cidata` ISO-9660 seed image. Without `--image` no guest OS is installed; with `--image debian-12-bookworm-arm64` the root disk is a clone of the cached image.
-- Running `agentvm up <vm>` or `agentvm exec <vm> -- ...` on an unbooted/empty disk exits non-zero with an explicit error instead of silently falling back to a simulator. `agentvm up` also refuses a bootable VM and points to `agentvm run`; `agentvm run` on an empty disk exits 125.
+- Running `agentvm up <vm>` or `agentvm exec <vm> -- ...` on an empty or stopped VM exits non-zero with an explicit error instead of silently falling back to a simulator (without starting a background daemon when `up` preflight fails); `agentvm run` on an empty disk exits 125.
+- One background daemon per workspace (`<workspace>/run/daemon.sock`, started on demand by `up` or `daemon start` via double-fork `setsid`, not `launchd`) holds running VMs. Logging out of macOS or rebooting the host is **not** guaranteed to preserve running VMs; if the daemon exits or is killed, VMs exit and subsequent reads reconcile stale `running` records to `stopped` (`VM_RUNTIME_LOST`).
+- The guest agent script (`agentvm-guestd.py` v2) is written into the guest via `cloud-init` only when a new VM boots for the first time. VMs created before M2 keep the older `1.0.0` guest script: `SIGINT`/`SIGTERM` cancellation of `exec` has no effect on the guest child process on those older VMs, and their heartbeats omit CPU usage so `ps` shows `—` in the CPU column (recreate the VM from `--image debian-12-bookworm-arm64` to pick up the v2 script).
 - Host-side protocol & wire-session simulation is available only when explicitly requested via `--backend simulation` or in UI demonstration mode (`--demo` / **Load Demo**, labeled `[DEMO]`). Every output of a simulation run is marked: text lines are prefixed with `SIMULATED:`, `ps --json` and MCP `agentvm_list_fleet` records carry `"simulated": true`, `export-hcl` gets a `# SIMULATED:` comment line, and exported `.pcapng` and HTML files are marked inside the file.
 - State the simulator leaves in a workspace stays marked for everyone who reads it later: a default `agentvm ps` prints `SIMULATED:running`, `ps --json` shows `"simulated": true` next to `"state": "running"`, and the default backend never acts on it (`up`, `exec`, `pause` discard the simulated state and fail as they would on a VM that never ran).
-- Unmeasured CPU and memory fields are displayed as `—`.
-- A guest started with `agentvm run` uses the system NAT, and nothing controls its egress before M5: `agentvm policy strict|airgap` only selects and saves a preset and enforces nothing on real traffic, and with `airgap` selected `agentvm run` exits 125 because booting without a network is not possible before M5. The user-space switch has no route to the outside network before M5. The Wiretap and Firewall views display `Not connected to live traffic yet (scheduled for M5)`.
+- Unmeasured or stale CPU and memory fields (no heartbeat within 15 seconds, paused, or stopped) are displayed as `—`.
+- A guest started with `agentvm up` or `agentvm run` uses the system NAT, and nothing controls its egress before M5: `agentvm policy strict|airgap` only selects and saves a preset and enforces nothing on real traffic, and with `airgap` selected `agentvm up` exits 1 and `agentvm run` exits 125 because booting without a network is not possible before M5. The user-space switch has no route to the outside network before M5. The Wiretap and Firewall views display `Not connected to live traffic yet (scheduled for M5)`.
 - `agentvm doctor` reports whether the running executable actually carries the `com.apple.security.virtualization` entitlement. A plain `swift build` binary does not, and `doctor` says so instead of printing `PASS`.
 
 ---
@@ -30,9 +32,9 @@ By default, launching the desktop app or initializing a `.agentvm` workspace sta
 |---|---|---|
 | **M0** | Honest baseline: plain `agentvm ps` fix, real `clonefile(2)` probe and real entitlement check in `doctor`, empty default UI, explicit `--backend simulation` with `SIMULATED` markers on every output and on stored state, `[DEMO]` gating, `—` for unmeasured telemetry, preemptive `JavaScriptCore` hook watchdog | **Implemented** |
 | **M1** | `agentvm image pull debian-12-bookworm-arm64` + single-command `agentvm run` booting a real Linux kernel/rootfs on `VZVirtualMachine` with live `AF_VSOCK` stdout/stderr/exit-code streaming | **Implemented** |
-| **M2** | Per-VM background daemon so `up`, `exec`, `pause`, `resume`, and `halt` work across separate CLI invocations, plus guest `/proc` telemetry (moved here from M1) | Planned |
-| **M3** | Measured APFS CoW branching (`branch`) and snapshot restore (`snapshot` / `restore`) against real Linux root filesystems (measured latency and dirty-byte delta to be reported after M3) | Planned |
-| **M4** | Desktop UI wired end-to-end to real running VMs, live serial console, and workspace state | Planned |
+| **M2** | One background daemon per workspace so `up`, `exec`, `pause`, `resume`, `halt`, `daemon`, and `events` work across separate CLI invocations, plus live guest `/proc` CPU, memory, and uptime telemetry | **Implemented** |
+| **M3** | Measured APFS CoW branching (`branch`) and snapshot restore (`snapshot` / `restore`) against real Linux root filesystems, including live running VMs (measured latency and dirty-byte delta to be reported after M3) | Planned |
+| **M4** | Desktop UI and MCP server wired as clients of the workspace daemon, directory sharing, port forwarding, `exec` stdin streaming, and interactive terminal | Planned |
 | **M5** | Live guest NIC attachment to the user-space Layer-2 switch, outbound DNS/TLS SNI policy enforcement, and real guest `.pcapng` capture | Planned (under evaluation) |
 
 ---
@@ -71,11 +73,19 @@ agentvm --lang en --workspace ./demo-check.agentvm plugin
 agentvm --lang en --workspace ./demo-check.agentvm export-hcl
 # -> sandbox_vm "sandbox-a" ... sandbox_vm "sandbox-b"
 
-# 5. Booting or executing on an empty disk fails honestly (non-zero exit code)
+# 5. Booting or executing on an empty/stopped disk fails honestly; halt, daemon status/stop, and events work without spawning a daemon
 agentvm --lang en --workspace ./demo-check.agentvm up sandbox-a
 # -> exits non-zero: [ERR_NO_BOOTABLE_SYSTEM] VM 'sandbox-a' has no bootable guest OS or kernel on its disk...
 agentvm --lang en --workspace ./demo-check.agentvm exec sandbox-a -- uname -a
 # -> exits non-zero: [ERR_LIFECYCLE_STATE] Cannot perform 'exec' on VM 'sandbox-a' (...) while in state 'stopped' (guest is not running). Run 'agentvm up sandbox-a' first.
+agentvm --lang en --workspace ./demo-check.agentvm halt sandbox-a
+# -> VM 'sandbox-a' (...) -> stopped
+agentvm --lang en --workspace ./demo-check.agentvm daemon status
+# -> exits non-zero: Daemon is not running (workspace: ...).
+agentvm --lang en --workspace ./demo-check.agentvm daemon stop
+# -> Daemon is not running; nothing to stop.
+agentvm --lang en --workspace ./demo-check.agentvm events --json
+# -> "code" : "COW_BRANCH_FORKED"
 
 # 6. Explicit host-side simulation requires --backend simulation and prefixes every line with SIMULATED:
 #    (the simulator answers with a fixed hostname, "agent-sandbox", whatever the VM is called)
@@ -92,7 +102,7 @@ agentvm --lang en --workspace ./demo-check.agentvm --backend simulation halt san
 # -> SIMULATED: VM 'sandbox-a' (...) -> stopped
 ```
 
-Unknown options are errors, not ignored: `agentvm ps --bogus` exits with code 2.
+Unknown options are errors, not ignored: `agentvm ps --bogus` exits with code 2. With an entitled binary and a cached Debian 12 image (`agentvm image pull debian-12-bookworm-arm64`), `agentvm create t1 --image debian-12-bookworm-arm64`, `agentvm up t1`, `agentvm exec t1 -- uname -r`, `agentvm halt t1`, `agentvm daemon status`, `agentvm daemon stop`, and `agentvm events --vm t1` manage a real running guest through the workspace daemon (exercised by `AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 2`).
 
 Every command also supports Simplified Chinese output via `--lang zh` (or `AGENTVM_LANG=zh`):
 
@@ -139,6 +149,10 @@ agentvm --lang zh --workspace ./demo-check.agentvm ps
 # cached, signs a copy of the CLI with the virtualization entitlement and boots real guests without opening a window.
 # Without the variable it prints that the real-VM part did not run and exits non-zero.
 AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 1
+
+# Run the M2 workspace daemon acceptance suite (scoped unit tests, M0 & README checks, m2-daemon.sh, and M1 regression).
+# Without AGENTVM_REAL_VM=1, non-VM daemon checks run and real-VM rows are reported unrun (exit code 2).
+AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 2
 ```
 
 ---

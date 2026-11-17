@@ -59,7 +59,7 @@ SKIP_RULES = [
     (re.compile(r"^swift build --product AgentVM$"), "this script already built the product above"),
     (re.compile(r'^alias agentvm="\$\(pwd\)/\.build/debug/AgentVM"$'), "the replay substitutes the built binary for `agentvm`"),
     (re.compile(r"^\./Scripts/test\.sh (scope|milestone) .+$"), "test entry point; running it from here would recurse"),
-    (re.compile(r"^AGENTVM_REAL_VM=1 \./Scripts/test\.sh milestone 1$"), "real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it"),
+    (re.compile(r"^AGENTVM_REAL_VM=1 \./Scripts/test\.sh milestone [12]$"), "real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it"),
     (re.compile(r"^\./Scripts/acceptance/readme-commands\.sh$"), "this script itself"),
     (re.compile(r"^\./Scripts/build-app\.sh$"), "packaging step, builds the release .app bundle"),
     (re.compile(r"^open build/AgentVM\.app$"), "launches the desktop UI; no script may do that"),

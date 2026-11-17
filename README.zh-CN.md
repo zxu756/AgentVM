@@ -2,7 +2,7 @@
 
 # AgentVM `v1.3.0`
 
-> **当前状态（M1 — 真机启动，真实执行）**：APFS 写时复制（`clonefile(2)`）稀疏磁盘与快照血统管理、SQLite WAL 工作区持久化、纯 Swift NoCloud `cidata` ISO-9660 镜像生成以及 `JavaScriptCore` 策略沙盒现已在本地可用。以太网/IPv4/DNS/TLS 报文拆解和 `.pcapng` 读写目前只是库层面的能力（`AgentVMNetSwitch`，有单元测试覆盖）；命令行和桌面界面都还没有打开抓包文件的入口。`agentvm image pull debian-12-bookworm-arm64` 会下载固定版本的 Debian 12 arm64 云镜像并校验 SHA-512，`agentvm run <vm> -- <命令>` 会用 `VZVirtualMachine` 启动由它创建的虚拟机，通过 `AF_VSOCK` 在客户机里执行命令，然后关机；M1 验收确认输出来自真实客户机。启动需要带虚拟化权限的二进制，直接 `swift build` 编出来的没有。`up`、`exec`、`pause`、`resume`、`halt` 仍然不操作真实客户机（排在 M2），桌面界面也还没接真实虚拟机（M4）。客户机网络是系统 NAT，没有出站管控；用户态出站防火墙拦截与实时抓包排在 M5。
+> **当前状态（M2 — 工作区常驻守护进程与客户机实时遥测）**：APFS 写时复制（`clonefile(2)`）稀疏磁盘与离线快照血统管理、SQLite WAL 工作区持久化、纯 Swift NoCloud `cidata` ISO-9660 镜像生成以及 `JavaScriptCore` 策略沙盒现已在本地可用。以太网/IPv4/DNS/TLS 报文拆解和 `.pcapng` 读写目前只是库层面的能力（`AgentVMNetSwitch`，有单元测试覆盖）；命令行和桌面界面都还没有打开抓包文件的入口。`agentvm image pull debian-12-bookworm-arm64` 会下载固定版本的 Debian 12 arm64 云镜像并校验 SHA-512；`agentvm run <vm> -- <命令>` 用 `VZVirtualMachine` 执行一次性命令并关机；M2 新增每个工作区一个后台常驻守护进程（`daemon start|status|stop`、`events`），跨独立命令行进程持有运行中的 `VZVirtualMachine`，使 `up`、`exec`（多路并发 `AF_VSOCK` 输出/退出码回传，新建虚拟机支持 `SIGINT`/`SIGTERM` 取消；标准输入固定为 `/dev/null`）、`pause`、`resume`、`halt` 操作真实客户机，并在 `ps` 中汇报客户机 `/proc` 实时 CPU、内存与运行时长心跳。启动虚拟机需要带 `com.apple.security.virtualization` 权限的二进制，直接 `swift build` 编出来的没有。运行中虚拟机的快照、分叉、回滚在 M3 之前拒绝执行；桌面界面与 MCP 服务通过读库展示状态和遥测，在 M4 之前拒绝改动守护进程持有的机器；客户机网络走系统 NAT，用户态出站防火墙拦截与实时抓包排在 M5。
 
 [![Version](https://img.shields.io/badge/version-v1.3.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
@@ -10,16 +10,18 @@
 [![Bilingual](https://img.shields.io/badge/界面语言-中文%20%7C%20EN-2A9D6F)](README.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2A9D6F)](LICENSE)
 
-`AgentVM` 是面向 macOS（Apple Silicon）的本地工作区管理器和 APFS 写时复制磁盘与快照血统工具，带命令行、stdio MCP 服务和桌面工作台，基于 Swift 6 编写，桌面端与命令行（`--lang zh` / `--lang en`）均支持 `中文 | EN` 双语切换。虚拟机目前只能通过 `agentvm run` 启动；工作台里的抓包与防火墙视图在 M5 之前没有真实流量可看。
+`AgentVM` 是面向 macOS（Apple Silicon）的本地工作区管理器和 APFS 写时复制磁盘与快照血统工具，带命令行、stdio MCP 服务和桌面工作台，基于 Swift 6 编写，桌面端与命令行（`--lang zh` / `--lang en`）均支持 `中文 | EN` 双语切换。常驻真实虚拟机由每个工作区一个后台守护进程持有（`agentvm up` / `exec` / `pause` / `resume` / `halt`），一次性执行仍可走 `agentvm run`；工作台里的抓包与防火墙视图在 M5 之前没有真实流量可看。
 
 默认情况下，启动桌面应用或初始化 `.agentvm` 工作区均显示干净的空状态（0 台虚拟机、0 条数据包、0 条告警），绝不伪造客户机执行结果或遥测数值：
 
 - `create` 会创建一块带 GPT 分区表的空稀疏磁盘与一张 NoCloud `cidata` ISO-9660 配置盘。不带 `--image` 时磁盘内没有客户机操作系统；带 `--image debian-12-bookworm-arm64` 时，根磁盘是缓存镜像的克隆。
-- 对空磁盘执行 `agentvm up <vm>` 或 `agentvm exec <vm> -- ...` 会以非零退出码返回明确错误，不会静默回退到模拟器或把状态标为 `running`。`agentvm up` 对可启动的虚拟机同样拒绝，并提示改用 `agentvm run`；对空磁盘执行 `agentvm run` 退出码为 125。
+- 对空磁盘或未运行的虚拟机执行 `agentvm up <vm>`、`agentvm exec <vm> -- ...` 会以非零退出码返回明确错误，不会静默回退到模拟器或把状态标为 `running`（`up` 预检失败时也不会拉起守护进程）；对空磁盘执行 `agentvm run` 退出码为 125。
+- 每个工作区至多运行一个后台守护进程（`<工作区>/run/daemon.sock`，由 `up` 或 `daemon start` 按需通过双 fork + `setsid` 启动，不注册 `launchd`）。注销 macOS 会话或重启宿主机后**不保证**虚拟机仍在运行；守护进程退出或被强杀后虚拟机会退出，后续读取会把残留的 `running` 对账回 `stopped`（记录 `VM_RUNTIME_LOST`）。
+- 客户机守护脚本（`agentvm-guestd.py` v2）仅在新建虚拟机首次开机时经 `cloud-init` 写入。M2 之前创建的虚拟机仍运行旧版 `1.0.0` 脚本：`SIGINT`/`SIGTERM` 取消 `exec` 对旧脚本启动的客户机子进程无效，且旧心跳不含 CPU 采样，`ps` 的 CPU 列显示 `—`（从 `--image debian-12-bookworm-arm64` 重新创建即可获得 v2 脚本）。
 - 主机侧协议与会话模拟仅在显式传入 `--backend simulation` 时启用，或在桌面端显式传入 `--demo` / 点击「载入演示」（带 `[演示数据]` 标记）时载入。模拟运行的每一种输出都带标记：文本逐行加 `SIMULATED:` 前缀，`ps --json` 和 MCP `agentvm_list_fleet` 的记录里有 `"simulated": true`，`export-hcl` 多一行 `# SIMULATED:` 注释，导出的 `.pcapng` 和 HTML 文件内部也写有标记。
 - 模拟器留在工作区里的状态，之后谁来读都带着标记：默认的 `agentvm ps` 显示 `SIMULATED:运行中`，`ps --json` 在 `"state": "running"` 旁边是 `"simulated": true`；默认后端不会把它当真（`up`、`exec`、`pause` 会丢弃模拟状态，然后像对一台从没运行过的虚拟机那样报错）。
-- 未接入真实客户机 `/proc` 数据源的 CPU 与内存指标统一显示为 `—`。
-- 用 `agentvm run` 启动的客户机走系统 NAT，M5 之前没有任何出站管控：`agentvm policy strict|airgap` 只是选择并保存一个预设，对真实流量不做任何拦截；选了 `airgap` 时 `agentvm run` 退出码为 125，因为 M5 之前做不到断网启动。用户态交换机在 M5 之前没有通往外网的路径。界面上的抓包与防火墙面板均明确显示「尚未接入真实流量（排在 M5）」。
+- 未实测或已过期的 CPU 与内存指标（15 秒内无新心跳、已暂停或已停止）统一显示为 `—`。
+- 用 `agentvm up` 或 `agentvm run` 启动的客户机走系统 NAT，M5 之前没有任何出站管控：`agentvm policy strict|airgap` 只是选择并保存一个预设，对真实流量不做任何拦截；选了 `airgap` 时 `agentvm up` 退出码为 1、`agentvm run` 退出码为 125，因为 M5 之前做不到断网启动。用户态交换机在 M5 之前没有通往外网的路径。界面上的抓包与防火墙面板均明确显示「尚未接入真实流量（排在 M5）」。
 - `agentvm doctor` 会如实报告当前可执行文件有没有 `com.apple.security.virtualization` 权限。直接用 `swift build` 编出来的二进制没有这项权限，`doctor` 会明说，不写「通过」。
 
 ---
@@ -30,9 +32,9 @@
 |---|---|---|
 | **M0** | 诚实基线止血：修复普通模式 `agentvm ps` 崩溃、`doctor` 实测执行 `clonefile(2)` 探测并真实读取虚拟化权限、界面默认空状态、显式 `--backend simulation`（每一种输出和落盘的状态都带 `SIMULATED` 标记）、`[演示数据]` 隔离、未实测遥测显示 `—`、`JavaScriptCore` 插件抢占式超时看门狗 | **已完成** |
 | **M1** | `agentvm image pull debian-12-bookworm-arm64` 与单命令 `agentvm run`：基于 `VZVirtualMachine` 启动真实 Debian 12 Linux 客户机，通过真实 `AF_VSOCK` 回传标准输出/标准错误/退出码 | **已完成** |
-| **M2** | 每台虚拟机独立后台常驻守护进程，使 `up`、`exec`、`pause`、`resume`、`halt` 可跨独立命令行进程协同工作，并加入客户机 `/proc` 遥测（从 M1 挪到这里） | 规划中 |
-| **M3** | 基于真实装有操作系统的虚拟机验证 APFS CoW 分叉（`branch`）与快照恢复（`snapshot` / `restore`），并在完成后公布实测耗时与增量字节数 | 规划中 |
-| **M4** | 桌面界面完整对接真实运行中的虚拟机、串口输出与工作区状态 | 规划中 |
+| **M2** | 每个工作区一个后台常驻守护进程，使 `up`、`exec`、`pause`、`resume`、`halt`、`daemon`、`events` 可跨独立命令行进程协同工作，并接入客户机 `/proc` 实时 CPU、内存与运行时长遥测 | **已完成** |
+| **M3** | 基于真实装有操作系统的虚拟机验证 APFS CoW 分叉（`branch`）与快照恢复（`snapshot` / `restore`，含运行中虚拟机），并在完成后公布实测耗时与增量字节数 | 规划中 |
+| **M4** | 桌面界面与 MCP 服务接入工作区守护进程，支持目录共享、端口转发、`exec` 标准输入透传与交互终端 | 规划中 |
 | **M5** | 真实客户机网卡接入用户态二层交换机、DNS/TLS SNI 出站访问控制与真实流量 `.pcapng` 导出 | 规划中（待 M4 后评估） |
 
 ---
@@ -71,11 +73,19 @@ agentvm --lang zh --workspace ./demo-check.agentvm plugin
 agentvm --lang zh --workspace ./demo-check.agentvm export-hcl
 # -> sandbox_vm "sandbox-a" ... sandbox_vm "sandbox-b"
 
-# 5. 对无操作系统的空磁盘执行 up 或 exec 会诚实返回非零退出码与错误说明
+# 5. 对无操作系统或已停止的磁盘执行 up、exec 诚实报错；halt、daemon status/stop 与 events 无需拉起守护进程即可执行
 agentvm --lang zh --workspace ./demo-check.agentvm up sandbox-a
 # -> 非零退出码：[ERR_NO_BOOTABLE_SYSTEM] 虚拟机「sandbox-a」磁盘上没有可引导的客户机系统（内核或根文件系统缺失）...
 agentvm --lang zh --workspace ./demo-check.agentvm exec sandbox-a -- uname -a
 # -> 非零退出码：[ERR_LIFECYCLE_STATE] 虚拟机「sandbox-a」（...）当前处于「stopped」状态（客户机未在运行），无法在客户机中执行命令。请先运行 'agentvm up sandbox-a' 启动虚拟机。
+agentvm --lang zh --workspace ./demo-check.agentvm halt sandbox-a
+# -> 虚拟机「sandbox-a」（...）-> 已停止
+agentvm --lang zh --workspace ./demo-check.agentvm daemon status
+# -> 非零退出码：守护进程未运行（工作区：...）。
+agentvm --lang zh --workspace ./demo-check.agentvm daemon stop
+# -> 守护进程未运行，无需停止。
+agentvm --lang zh --workspace ./demo-check.agentvm events --json
+# -> "code" : "COW_BRANCH_FORKED"
 
 # 6. 仅当显式指定 --backend simulation 时才运行主机侧模拟，且输出强制带 SIMULATED: 前缀
 #    （不管虚拟机叫什么，模拟器回的主机名都是固定的 "agent-sandbox"）
@@ -92,7 +102,7 @@ agentvm --lang zh --workspace ./demo-check.agentvm --backend simulation halt san
 # -> SIMULATED: 虚拟机「sandbox-a」（...）-> 已停止
 ```
 
-不认识的选项会报错，不会被忽略：`agentvm ps --bogus` 的退出码是 2。
+不认识的选项会报错，不会被忽略：`agentvm ps --bogus` 的退出码是 2。使用带虚拟化权限签名的二进制与缓存的 Debian 12 镜像（`agentvm image pull debian-12-bookworm-arm64`）时，可通过 `agentvm create t1 --image debian-12-bookworm-arm64`、`agentvm up t1`、`agentvm exec t1 -- uname -r`、`agentvm halt t1`、`agentvm daemon status`、`agentvm daemon stop` 与 `agentvm events --vm t1` 经工作区守护进程管理真实运行中的客户机（由 `AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 2` 完整验证）。
 
 所有命令同样支持 `--lang en`（或环境变量 `AGENTVM_LANG=en`）输出英文：
 
@@ -139,6 +149,10 @@ agentvm --lang en --workspace ./demo-check.agentvm ps
 # 给命令行的一份副本签上虚拟化权限，然后不开窗口地启动真实客户机。
 # 不带这个变量时，它会说明真机部分没有跑，并以非零退出码结束。
 AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 1
+
+# 运行 M2 工作区守护进程验收套件（改动模块范围测试、M0 与 README 回放、m2-daemon.sh 及 M1 回归检查）。
+# 不带 AGENTVM_REAL_VM=1 时，非真机守护进程检查照常运行，真机行记为“没跑”并以退出码 2 结束。
+AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 2
 ```
 
 ---

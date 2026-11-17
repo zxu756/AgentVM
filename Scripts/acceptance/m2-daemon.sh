@@ -2,9 +2,9 @@
 # AgentVM Milestone M2 Workspace Daemon Acceptance Script.
 #
 # Stage 2 implements non-VM Rows 1-9 against the unsigned `.build/debug/AgentVM` binary
-# (or caller-supplied AGENTVM_BIN). Stages 3a, 4, and 3b run real-VM Rows 10-16 and 22-34
+# (or caller-supplied AGENTVM_BIN). Stages 3a, 4, 3b, and 5 run real-VM Rows 10-17 and 22-34
 # when AGENTVM_REAL_VM=1 and AGENTVM_BIN carries `com.apple.security.virtualization`; rows
-# scheduled for Stage 5 (17), Stage 6 (18-21), or Stages 7-8 (35-39) remain marked "没跑".
+# scheduled for Stage 6 (18-21) or Stages 7-8 (35-39) remain marked "没跑".
 #
 # Hard invariants:
 #   * Never launches the desktop UI (.app, window, or bare executable without a CLI subcommand).
@@ -1436,8 +1436,150 @@ PY
         fail_row 16 "rc1=$r16_rc1 (expected 7), rc2=$r16_rc2 (expected 137), out1='$(cat "$TMP_ROOT/r16-1.out" 2>/dev/null)', err1='$(cat "$TMP_ROOT/r16-1.err" 2>/dev/null)'"
     fi
 
-    # Row 17 requires guest daemon v2 RST process-group termination (Stage 5); Rows 18-21 require telemetry (Stages 5-6).
-    unrun_row 17 "客户机脚本处理 RST 是第 5 段"
+    # --------------------------------------------------------------
+    # Row 17: `exec t1 -- sh -c 'echo started; sleep 600; echo never'`, send SIGINT after `started`;
+    #         repeat and send SIGTERM.
+    #   Expect: client exits within 5s with exit codes 130 (SIGINT) and 143 (SIGTERM);
+    #           subsequent guest `pgrep` `-f` `'sleep 600'` exits 1; t1 still running and boot_id unchanged.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    ensure_cli_subcommand --lang en --workspace "$WS" exec t1 -- sh -c 'true'
+
+    run_r17_cancel_pass() {
+        local label="$1"
+        local sig_name="$2"
+        local out_f="$TMP_ROOT/r17-$label.out"
+        local err_f="$TMP_ROOT/r17-$label.err"
+        local timeout_f="$TMP_ROOT/r17-$label.timeout"
+        rm -f "$out_f" "$err_f" "$timeout_f"
+        : >"$out_f"
+        : >"$err_f"
+
+        (
+            exec /usr/bin/env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
+                HOME="$ISOLATED_HOME" \
+                CFFIXED_USER_HOME="$ISOLATED_HOME" \
+                AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+                /usr/bin/perl -e '$SIG{INT}="DEFAULT"; $SIG{TERM}="DEFAULT"; exec @ARGV or die "exec failed: $!\n";' \
+                "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" \
+                exec t1 -- sh -c 'echo started; sleep 600; echo never'
+        ) </dev/null >"$out_f" 2>"$err_f" &
+        local c_pid=$!
+        OWN_CLIENT_PIDS+=("$c_pid")
+
+        (
+            sleep "$CMD_TIMEOUT_SEC"
+            if kill -0 "$c_pid" 2>/dev/null; then
+                echo "timed_out" >"$timeout_f"
+                kill -KILL "$c_pid" 2>/dev/null || true
+            fi
+        ) &
+        local wd_pid=$!
+
+        local saw_started=0
+        local wait_ticks=0
+        while (( wait_ticks < 300 )); do
+            if grep -q '^started$' "$out_f" 2>/dev/null; then
+                saw_started=1
+                break
+            fi
+            if ! kill -0 "$c_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.05
+            wait_ticks=$((wait_ticks + 1))
+        done
+
+        local sig_t0 sig_t1 c_rc=0
+        sig_t0="$(now_sec)"
+        if [[ $saw_started -eq 1 ]]; then
+            kill "-$sig_name" "$c_pid" 2>/dev/null || true
+        else
+            kill -TERM "$c_pid" 2>/dev/null || true
+        fi
+        wait "$c_pid" 2>/dev/null || c_rc=$?
+        sig_t1="$(now_sec)"
+
+        kill "$wd_pid" 2>/dev/null || true
+        wait "$wd_pid" 2>/dev/null || true
+
+        local sig_elapsed
+        sig_elapsed="$(diff_sec "$sig_t0" "$sig_t1")"
+        local under_5s
+        under_5s="$(/usr/bin/python3 -c 'import sys; print(1 if float(sys.argv[1]) < 5.0 else 0)' "$sig_elapsed")"
+
+        local out_txt err_txt clean_streams=0
+        out_txt="$(cat "$out_f" 2>/dev/null || true)"
+        err_txt="$(cat "$err_f" 2>/dev/null || true)"
+        if [[ ! -f "$timeout_f" && "$out_txt" != *"never"* && -z "$err_txt" ]]; then
+            clean_streams=1
+        fi
+
+        local guest_probe_bin="pgrep"
+        local guest_probe_flag="-f"
+        run_cli "$TMP_ROOT/r17-probe-$label.out" "$TMP_ROOT/r17-probe-$label.err" \
+            --lang en --workspace "$WS" exec t1 -- "$guest_probe_bin" "$guest_probe_flag" "sleep 600"
+        local probe_rc=$LAST_RC
+
+        R17_PASS_STARTED="$saw_started"
+        R17_PASS_RC="$c_rc"
+        R17_PASS_ELAPSED="$sig_elapsed"
+        R17_PASS_UNDER_5S="$under_5s"
+        R17_PASS_CLEAN="$clean_streams"
+        R17_PASS_PROBE_RC="$probe_rc"
+    }
+
+    R17_PASS_STARTED=0; R17_PASS_RC=0; R17_PASS_ELAPSED="0"; R17_PASS_UNDER_5S=0; R17_PASS_CLEAN=0; R17_PASS_PROBE_RC=0
+    run_r17_cancel_pass "sigint" "INT"
+    r17_int_started="$R17_PASS_STARTED"
+    r17_int_rc="$R17_PASS_RC"
+    r17_int_elapsed="$R17_PASS_ELAPSED"
+    r17_int_under_5s="$R17_PASS_UNDER_5S"
+    r17_int_clean="$R17_PASS_CLEAN"
+    r17_int_probe_rc="$R17_PASS_PROBE_RC"
+
+    run_r17_cancel_pass "sigterm" "TERM"
+    r17_term_started="$R17_PASS_STARTED"
+    r17_term_rc="$R17_PASS_RC"
+    r17_term_elapsed="$R17_PASS_ELAPSED"
+    r17_term_under_5s="$R17_PASS_UNDER_5S"
+    r17_term_clean="$R17_PASS_CLEAN"
+    r17_term_probe_rc="$R17_PASS_PROBE_RC"
+
+    run_cli "$TMP_ROOT/r17-ps.json" "$TMP_ROOT/r17-ps.err" --lang en --workspace "$WS" ps --json
+    r17_ps_rc=$LAST_RC
+    r17_t1_running=0
+    if [[ $r17_ps_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r17-ps.json" <<'PY' && r17_t1_running=1 || r17_t1_running=0
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1) != 1:
+    sys.exit(1)
+tel = t1[0].get("telemetry", {})
+if tel.get("state") != "running" or tel.get("guestAgentConnected") is not True:
+    sys.exit(1)
+PY
+    fi
+
+    run_cli "$TMP_ROOT/r17-boot.out" "$TMP_ROOT/r17-boot.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r17_boot_rc=$LAST_RC
+    r17_boot_id="$(tr -d '[:space:]' < "$TMP_ROOT/r17-boot.out" 2>/dev/null || true)"
+    r17_extra_vz="$(list_extra_vz_pids)"
+    r17_extra_vz_count="$(count_lines_nonempty "$r17_extra_vz")"
+
+    if [[ $r17_int_started -eq 1 && $r17_int_rc -eq 130 && $r17_int_under_5s -eq 1 && $r17_int_clean -eq 1 && $r17_int_probe_rc -eq 1 \
+        && $r17_term_started -eq 1 && $r17_term_rc -eq 143 && $r17_term_under_5s -eq 1 && $r17_term_clean -eq 1 && $r17_term_probe_rc -eq 1 \
+        && $r17_t1_running -eq 1 && $r17_boot_rc -eq 0 \
+        && -n "$R11_BOOT_ID" && "$r17_boot_id" == "$R11_BOOT_ID" \
+        && "$r17_extra_vz_count" == "1" && -n "$T1_VZ_PID" && "$r17_extra_vz" == "$T1_VZ_PID" ]]; then
+        pass_row 17 "SIGINT exited 130 in ${r17_int_elapsed}s (<5s, guest sleep 600 probe rc=1); SIGTERM exited 143 in ${r17_term_elapsed}s (<5s, guest sleep 600 probe rc=1); t1 still running on pid=$T1_VZ_PID with unchanged boot_id=$r17_boot_id."
+    else
+        fail_row 17 "int=[started=$r17_int_started,rc=$r17_int_rc,elapsed=${r17_int_elapsed}s,clean=$r17_int_clean,probe_rc=$r17_int_probe_rc], term=[started=$r17_term_started,rc=$r17_term_rc,elapsed=${r17_term_elapsed}s,clean=$r17_term_clean,probe_rc=$r17_term_probe_rc], t1_running=$r17_t1_running, boot_id='$r17_boot_id' (expected '$R11_BOOT_ID')"
+    fi
+
+    # Rows 18-21 require telemetry mapping & expiration (Stage 6).
     unrun_row 18 "遥测映射（guestMemTotalBytes）是第 6 段"
     unrun_row 19 "客户机 CPU 占用率遥测是第 5-6 段"
     unrun_row 20 "客户机内存驻留遥测是第 6 段"

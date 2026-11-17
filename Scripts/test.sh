@@ -64,6 +64,7 @@ map_module_to_filters() {
             echo "VsockRPCAndTerminalTests"
             echo "CLIAndMCPDaemonStage3bTests"
             echo "CLIAndMCPDaemonStage4Tests"
+            echo "CLIAndMCPDaemonStage5Tests"
             ;;
         AgentVMPluginHost|PluginHost)
             echo "PluginSandboxAndIACTests"
@@ -74,6 +75,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage3aTests"
             echo "CLIAndMCPDaemonStage3bTests"
             echo "CLIAndMCPDaemonStage4Tests"
+            echo "CLIAndMCPDaemonStage5Tests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -84,6 +86,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage3aTests"
             echo "CLIAndMCPDaemonStage3bTests"
             echo "CLIAndMCPDaemonStage4Tests"
+            echo "CLIAndMCPDaemonStage5Tests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -99,6 +102,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage3aTests"
             echo "CLIAndMCPDaemonStage3bTests"
             echo "CLIAndMCPDaemonStage4Tests"
+            echo "CLIAndMCPDaemonStage5Tests"
             echo "StudioViewsHonestyTests"
             ;;
         *)

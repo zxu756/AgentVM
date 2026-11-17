@@ -612,11 +612,17 @@ struct CLIAndMCPDaemonStage2Tests {
         // Verify SETSID made the child its own process group / session leader (`pgid == pid`).
         #expect(Darwin.getpgid(childPID) == childPID)
 
-        // Verify daemon.log received child stdout and extraPipe descriptors were NOT inherited.
+        // Close parent's write end of `extraPipe` while child is still alive: immediate EOF (0 bytes) on
+        // `extraPipe[0]` proves `POSIX_SPAWN_CLOEXEC_DEFAULT` prevented the child from inheriting `extraPipe[1]`.
+        _ = Darwin.close(extraPipe[1])
+        extraPipe[1] = -1
+        var eofByte: UInt8 = 0
+        let pipeReadRC = Darwin.read(extraPipe[0], &eofByte, 1)
+        #expect(pipeReadRC == 0)
+
+        // Verify daemon.log received child stdout.
         let ws1Log = try String(contentsOf: ws1Paths.daemonLogFileURL, encoding: .utf8)
         #expect(ws1Log.contains("ready pid=\(childPID)"))
-        #expect(!ws1Log.contains("\(extraPipe[0])"))
-        #expect(!ws1Log.contains("\(extraPipe[1])"))
 
         // Second `daemon start` returns 0 and reports the exact same PID without spawning another daemon.
         let start2 = await cli.execute(
@@ -974,6 +980,38 @@ struct CLIAndMCPDaemonStage2Tests {
         )
         #expect(m1Script.contains("|daemon|") || m1Script.contains("daemon|"))
         #expect(m1Script.contains("|events|") || m1Script.contains("|events)"))
+    }
+
+    // MARK: - Item 6: `Scripts/acceptance/m2-daemon.sh` Structure, Guards & Strict Daemon Discovery
+
+    @Test("Item 6: Scripts/acceptance/m2-daemon.sh exists, is executable, enforces strict 'daemon run --workspace' + comm==AGENTVM_BIN matching without fuzzy pgrep/pkill, and covers Rows 1-9")
+    func m2DaemonAcceptanceScriptStructureGuardsAndStrictDaemonMatching() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let scriptURL = repoRoot.appendingPathComponent("Scripts/acceptance/m2-daemon.sh")
+
+        #expect(FileManager.default.isExecutableFile(atPath: scriptURL.path))
+        let content = try String(contentsOf: scriptURL, encoding: .utf8)
+
+        #expect(content.contains("ISOLATED_HOME"))
+        #expect(content.contains("CFFIXED_USER_HOME"))
+        #expect(content.contains("AGENTVM_BIN"))
+        #expect(content.contains("daemon run --workspace"))
+        #expect(content.contains("comm="))
+        #expect(content.contains("DARWIN_USER_TEMP_DIR"))
+        #expect(content.contains("没跑"))
+
+        // Check executable code lines (non-comment lines) never use fuzzy `pgrep -f 'daemon run'` or `pkill -f`.
+        let codeLines = content
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.hasPrefix("#") }
+            .joined(separator: "\n")
+        #expect(!codeLines.contains("pkill -f"))
+        #expect(!codeLines.contains("pgrep -f 'daemon run'"))
+        #expect(!codeLines.contains("pgrep -f \"daemon run\""))
     }
 }
 

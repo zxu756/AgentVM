@@ -718,7 +718,7 @@ struct VsockRPCAndTerminalTests {
         defer {
             if proc.isRunning {
                 proc.terminate()
-                proc.waitUntilExit()
+                proc.waitForExit()
             }
         }
 
@@ -765,7 +765,7 @@ struct VsockRPCAndTerminalTests {
         #expect(ptySigkillRes.exitCode == 137)
 
         await session.shutdown()
-        proc.waitUntilExit()
+        #expect(proc.waitForExit(), "proc did not exit within 60 seconds")
     }
 
     @Test("Generated Python guest daemon streams stdout chunks live before long-running child exits")
@@ -809,7 +809,7 @@ struct VsockRPCAndTerminalTests {
         defer {
             if proc.isRunning {
                 proc.terminate()
-                proc.waitUntilExit()
+                proc.waitForExit()
             }
         }
 
@@ -859,7 +859,7 @@ struct VsockRPCAndTerminalTests {
         #expect(firstMs < 1_500.0, "Expected 'started' chunk before sleep 3 ended, but arrived at \(firstMs) ms")
 
         await session.shutdown()
-        proc.waitUntilExit()
+        #expect(proc.waitForExit(), "proc did not exit within 60 seconds")
     }
 
     @Test("A48: cloudInitRunCommands places 'sync' immediately before 'systemctl enable --now <unit>' so agentvm-guestd.py is flushed to disk before vsock connects")

@@ -906,7 +906,7 @@ struct CLIAndMCPDaemonStage3aTests {
             try? stdinPipe.fileHandleForWriting.close()
             if childProc.isRunning {
                 childProc.terminate()
-                childProc.waitUntilExit()
+                childProc.waitForExit()
             }
             try? stdoutPipe.fileHandleForReading.close()
             try? stderrPipe.fileHandleForReading.close()
@@ -1055,7 +1055,7 @@ struct CLIAndMCPDaemonStage3aTests {
         let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000_000.0
 
         try? stdinPipe.fileHandleForWriting.close()
-        childProc.waitUntilExit()
+        #expect(childProc.waitForExit(), "childProc did not exit within 60 seconds")
         #expect(childProc.terminationStatus == 0)
 
         #expect(elapsedSeconds >= 29.9, "Expected 30s Hypothesis 12 window, elapsed=\(elapsedSeconds)s")

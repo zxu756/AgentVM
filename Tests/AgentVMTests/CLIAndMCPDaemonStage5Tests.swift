@@ -116,7 +116,7 @@ struct CLIAndMCPDaemonStage5Tests {
         helpProc.standardOutput = helpPipe
         helpProc.standardError = helpErrPipe
         try helpProc.run()
-        helpProc.waitUntilExit()
+        #expect(helpProc.waitForExit(), "helpProc did not exit within 60 seconds")
         let helpOut = String(decoding: helpPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         #expect(helpProc.terminationStatus == 0)
         #expect(helpOut.contains("--proc-root"), "agentvm-guestd.py --help must support --proc-root")
@@ -153,7 +153,7 @@ struct CLIAndMCPDaemonStage5Tests {
         defer {
             if proc.isRunning {
                 proc.terminate()
-                proc.waitUntilExit()
+                proc.waitForExit()
             }
         }
 
@@ -268,7 +268,7 @@ struct CLIAndMCPDaemonStage5Tests {
         #expect(siblingRes.stdoutUTF8 == "sibling-survived\n")
 
         await session.shutdown()
-        proc.waitUntilExit()
+        #expect(proc.waitForExit(), "proc did not exit within 60 seconds")
     }
 
     // MARK: - Item 1 & Item 4b: Exec Timeout Kills Entire Process Group (Including Grandchildren Holding Pipes)
@@ -316,7 +316,7 @@ struct CLIAndMCPDaemonStage5Tests {
         defer {
             if proc.isRunning {
                 proc.terminate()
-                proc.waitUntilExit()
+                proc.waitForExit()
             }
         }
 
@@ -377,7 +377,7 @@ struct CLIAndMCPDaemonStage5Tests {
         #expect(afterRes.stdoutUTF8 == "still-healthy\n")
 
         await session.shutdown()
-        proc.waitUntilExit()
+        #expect(proc.waitForExit(), "proc did not exit within 60 seconds")
     }
 
     // MARK: - Item 1 & Item 4c: Connection Disconnect Kills Entire Process Group (Including Grandchildren)
@@ -425,7 +425,7 @@ struct CLIAndMCPDaemonStage5Tests {
         defer {
             if proc.isRunning {
                 proc.terminate()
-                proc.waitUntilExit()
+                proc.waitForExit()
             }
         }
 
@@ -485,7 +485,7 @@ struct CLIAndMCPDaemonStage5Tests {
         #expect(grandchildDead == true, "Grandchild sleep (\(grandchildPID)) must be killed when vsock disconnects")
         #expect(shellDead == true, "Shell child (\(shellPID)) must be killed when vsock disconnects")
 
-        proc.waitUntilExit()
+        #expect(proc.waitForExit(), "proc did not exit within 60 seconds")
     }
 
     // MARK: - Item 2: Fake `--proc-root` CPU (`cpuUsagePercent`) & Memory (`memTotalBytes`, `memAvailableBytes`)
@@ -559,7 +559,7 @@ struct CLIAndMCPDaemonStage5Tests {
         defer {
             if proc.isRunning {
                 proc.terminate()
-                proc.waitUntilExit()
+                proc.waitForExit()
             }
         }
 
@@ -626,7 +626,7 @@ struct CLIAndMCPDaemonStage5Tests {
 
         _ = Darwin.close(clientFD)
         clientFD = -1
-        proc.waitUntilExit()
+        #expect(proc.waitForExit(), "proc did not exit within 60 seconds")
     }
 
     // MARK: - Item 3: `pong` Version `"2"`, Host `ping` on Every Vsock Connect & Reconnect, `daemon status --json` `guestAgentVersion`, and Legacy `"1.0.0"` Compatibility
@@ -676,7 +676,7 @@ struct CLIAndMCPDaemonStage5Tests {
             defer {
                 if pyProc.isRunning {
                     pyProc.terminate()
-                    pyProc.waitUntilExit()
+                    pyProc.waitForExit()
                 }
             }
 
@@ -692,7 +692,7 @@ struct CLIAndMCPDaemonStage5Tests {
             #expect(pong.agentVersion == "2", "Generated guest daemon pong must advertise agentVersion == \"2\"")
             _ = Darwin.close(cfd)
             cfd = -1
-            pyProc.waitUntilExit()
+            #expect(pyProc.waitForExit(), "pyProc did not exit within 60 seconds")
         }
 
         // Part B: End-to-end daemon vsock handshake over AF_UNIX against:
@@ -745,7 +745,7 @@ struct CLIAndMCPDaemonStage5Tests {
         defer {
             if v2PyProc.isRunning {
                 v2PyProc.terminate()
-                v2PyProc.waitUntilExit()
+                v2PyProc.waitForExit()
             }
         }
         #expect(Self.waitForPipeLine(readyPipe.fileHandleForReading, containing: "LISTENING", timeoutSeconds: 3.0) == true)

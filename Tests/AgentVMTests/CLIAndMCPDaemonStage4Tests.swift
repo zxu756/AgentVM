@@ -491,7 +491,7 @@ struct CLIAndMCPDaemonStage4Tests {
             let streamID2 = try await rstRecorder.waitForExecStreamID(executable: "hang-until-rst-term", timeoutSeconds: 2.0)
             try await Task.sleep(nanoseconds: 40_000_000)
             #expect(Darwin.kill(childProc.processIdentifier, SIGTERM) == 0)
-            childProc.waitUntilExit()
+            #expect(childProc.waitForExit(), "childProc did not exit within 60 seconds")
 
             #expect(childProc.terminationReason == .exit, "Expected graceful exit(143), got terminationReason=\(childProc.terminationReason.rawValue)")
             #expect(childProc.terminationStatus == 143, "Expected SIGTERM exit 143, got \(childProc.terminationStatus)")

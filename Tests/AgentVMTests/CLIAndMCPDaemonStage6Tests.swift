@@ -198,6 +198,10 @@ struct CLIAndMCPDaemonStage6Tests {
 
         let fullData = try JSONSerialization.data(withJSONObject: fullDict)
         let decodedFull = try JSONDecoder().decode(VMLiveTelemetry.self, from: fullData)
+        #expect(decodedFull.guestMemTotalBytes == 2_080_374_784)
+        #expect(decodedFull.guestMemAvailableBytes == 1_543_503_872)
+        #expect(decodedFull.guestAgentVersion == "2")
+        #expect(decodedFull.cpuUsagePercent == 41.25)
         let roundTrippedDict = try #require(
             try JSONSerialization.jsonObject(with: JSONEncoder().encode(decodedFull)) as? [String: Any]
         )
@@ -819,6 +823,10 @@ struct CLIAndMCPDaemonStage6Tests {
             #expect(reportedViaStore.telemetry.state == .running)
             #expect(reportedViaStore.telemetry.hasLiveGuestTelemetry == true)
             #expect(reportedViaStore.telemetry.memoryResidentMB == 640)
+            #expect(reportedViaStore.telemetry.guestMemTotalBytes == 2_147_483_648)
+            #expect(reportedViaStore.telemetry.guestMemAvailableBytes == 1_476_395_008)
+            #expect(reportedViaStore.telemetry.guestAgentVersion == "2")
+            #expect(reportedViaStore.telemetry.cpuUsagePercent == 61.0)
             #expect(reportedViaStore.telemetry.uptimeSeconds == 20.0)
             #expect(reportedViaStore.telemetry.sampledAt > dbBeatA.telemetry.sampledAt)
             #expect(reportedViaStore.telemetry.formattedCPUUsage == "61.0%")

@@ -194,6 +194,10 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         MAX_CHUNK_BYTES = 32768
         MAX_FRAME_PAYLOAD_BYTES = 32 * 1024 * 1024
 
+        KILLPG_GRACE_SECONDS = 0.2
+        KILLPG_POST_SIGKILL_WAIT_SECONDS = 0.2
+        KILLPG_POLL_INTERVAL_SECONDS = 0.005
+
         # VsockChannelKind
         CHAN_CONTROL = 0
         CHAN_EXEC_PROCESS = 1
@@ -342,14 +346,18 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         # Linux /proc Telemetry Sampler
         # ---------------------------------------------------------------------------
         class ProcTelemetryCollector:
-            def __init__(self) -> None:
+            def __init__(self, proc_root: str = "/proc") -> None:
+                self.proc_root = proc_root or "/proc"
                 self._prev_cpu_total = 0
                 self._prev_cpu_idle = 0
                 self._page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
+            def _proc_path(self, *parts: str) -> str:
+                return os.path.join(self.proc_root, *parts)
+
             def _sample_cpu_jiffies(self):
                 try:
-                    with open("/proc/stat", "r", encoding="utf-8") as fh:
+                    with open(self._proc_path("stat"), "r", encoding="utf-8") as fh:
                         first = fh.readline()
                     parts = [int(x) for x in first.split()[1:]]
                     idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
@@ -365,7 +373,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
 
                 uptime_secs = 0.0
                 try:
-                    with open("/proc/uptime", "r", encoding="utf-8") as fh:
+                    with open(self._proc_path("uptime"), "r", encoding="utf-8") as fh:
                         uptime_secs = float(fh.read().split()[0])
                 except Exception:
                     pass
@@ -383,7 +391,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 mem_total = 0
                 mem_avail = 0
                 try:
-                    with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                    with open(self._proc_path("meminfo"), "r", encoding="utf-8") as fh:
                         for line in fh:
                             if line.startswith("MemTotal:"):
                                 mem_total = int(line.split()[1]) * 1024
@@ -421,13 +429,14 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 samples = []
                 clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
                 try:
-                    pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
+                    pids = [int(d) for d in os.listdir(self.proc_root) if d.isdigit()]
                 except Exception:
                     return samples
 
                 for pid in pids[:256]:
+                    pid_str = str(pid)
                     try:
-                        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+                        with open(self._proc_path(pid_str, "stat"), "r", encoding="utf-8", errors="replace") as fh:
                             raw_stat = fh.read()
                         rparen = raw_stat.rfind(")")
                         if rparen < 0:
@@ -445,7 +454,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                         cpu_pct = round(min(100.0, ((utime + stime) / float(clk_tck)) / proc_elapsed * 100.0), 2)
 
                         uid = 0
-                        proc_stat_info = os.stat(f"/proc/{pid}")
+                        proc_stat_info = os.stat(self._proc_path(pid_str))
                         uid = proc_stat_info.st_uid
                         try:
                             username = pwd.getpwuid(uid).pw_name
@@ -454,7 +463,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
 
                         cmdline = comm
                         try:
-                            with open(f"/proc/{pid}/cmdline", "rb") as cf:
+                            with open(self._proc_path(pid_str, "cmdline"), "rb") as cf:
                                 raw_cmd = cf.read(256).replace(b"\x00", b" ").strip()
                                 if raw_cmd:
                                     cmdline = raw_cmd.decode("utf-8", errors="replace")
@@ -478,14 +487,180 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 return samples[:8]
 
 
+        def _terminate_pgroup_for_process(proc: subprocess.Popen, grace_sec: float = KILLPG_GRACE_SECONDS) -> None:
+            if proc is None:
+                return
+            pgid = proc.pid
+            if pgid is None or pgid <= 0:
+                return
+
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                try:
+                    proc.poll()
+                except Exception:
+                    pass
+                return
+            except OSError:
+                pass
+
+            deadline = time.monotonic() + max(0.0, grace_sec)
+            while True:
+                try:
+                    proc.poll()
+                except Exception:
+                    pass
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    return
+                except PermissionError:
+                    # On XNU/macOS, killpg(pgid, 0) transiently returns EPERM while dying members
+                    # are in SZOMB/P_WEXIT before launchd/waitpid reaps them; keep polling until ESRCH.
+                    pass
+                except OSError:
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(KILLPG_POLL_INTERVAL_SECONDS)
+
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                try:
+                    proc.poll()
+                except Exception:
+                    pass
+                return
+            except OSError:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+            kill_deadline = time.monotonic() + KILLPG_POST_SIGKILL_WAIT_SECONDS
+            while time.monotonic() < kill_deadline:
+                try:
+                    proc.poll()
+                except Exception:
+                    pass
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    return
+                except PermissionError:
+                    pass
+                except OSError:
+                    return
+                time.sleep(KILLPG_POLL_INTERVAL_SECONDS)
+
+
+        class ExecStreamState:
+            """Tracks a single multiplexed CHAN_EXEC_PROCESS stream and its child process group."""
+
+            def __init__(self, stream_id: int) -> None:
+                self.stream_id = stream_id
+                self.lock = threading.Lock()
+                self.term_lock = threading.Lock()
+                self.proc = None
+                self.cancelled = False
+                self.terminated = False
+                rfd, wfd = os.pipe()
+                for fd in (rfd, wfd):
+                    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                self.wake_rfd = rfd
+                self.wake_wfd = wfd
+
+            def attach_process(self, proc: subprocess.Popen) -> bool:
+                with self.lock:
+                    self.proc = proc
+                    already_cancelled = self.cancelled
+                if already_cancelled:
+                    self.terminate_process_group()
+                    return False
+                return True
+
+            def wake(self) -> None:
+                with self.lock:
+                    wfd = self.wake_wfd
+                if wfd >= 0:
+                    try:
+                        os.write(wfd, b"\x01")
+                    except OSError:
+                        pass
+
+            def drain_wake(self) -> None:
+                with self.lock:
+                    rfd = self.wake_rfd
+                if rfd >= 0:
+                    try:
+                        while os.read(rfd, 64):
+                            pass
+                    except OSError:
+                        pass
+
+            def mark_cancelled(self) -> None:
+                with self.lock:
+                    self.cancelled = True
+                self.wake()
+
+            def is_cancelled(self) -> bool:
+                with self.lock:
+                    return self.cancelled
+
+            def wait_proc(self) -> int:
+                with self.lock:
+                    proc = self.proc
+                if proc is None:
+                    return 0
+                try:
+                    return proc.wait()
+                except Exception:
+                    return 0
+
+            def terminate_process_group(self, grace_sec: float = KILLPG_GRACE_SECONDS) -> None:
+                self.wake()
+                with self.term_lock:
+                    with self.lock:
+                        if self.terminated:
+                            return
+                        proc = self.proc
+                        if proc is None:
+                            return
+                        self.terminated = True
+                    _terminate_pgroup_for_process(proc, grace_sec=grace_sec)
+
+            def close_wake_pipe(self) -> None:
+                with self.lock:
+                    rfd, wfd = self.wake_rfd, self.wake_wfd
+                    self.wake_rfd = -1
+                    self.wake_wfd = -1
+                for fd in (rfd, wfd):
+                    if fd >= 0:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+
+
         # ---------------------------------------------------------------------------
         # Multiplexed Vsock Connection Session Handler
         # ---------------------------------------------------------------------------
         class GuestVsockConnectionSession:
-            def __init__(self, conn: socket.socket, heartbeat_interval: int, default_workspace: str) -> None:
+            def __init__(
+                self,
+                conn: socket.socket,
+                heartbeat_interval: int,
+                default_workspace: str,
+                proc_root: str = "/proc",
+            ) -> None:
                 self.conn = conn
                 self.heartbeat_interval = heartbeat_interval
                 self.default_workspace = default_workspace
+                self.proc_root = proc_root or "/proc"
                 self.write_lock = threading.Lock()
                 self.state_lock = threading.Lock()
                 self.closed = False
@@ -495,10 +670,12 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 self.uncredited_rx = {}
                 self.window_cond = threading.Condition(self.state_lock)
 
+                self.active_execs = {}
+                self.exec_req_buffers = {}
                 self.file_pushes = {}
                 self.tcp_bridges = {}
                 self.pty_sessions = {}
-                self.telemetry = ProcTelemetryCollector()
+                self.telemetry = ProcTelemetryCollector(proc_root=self.proc_root)
 
             def run(self) -> None:
                 hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
@@ -522,6 +699,11 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                     if self.closed:
                         return
                     self.closed = True
+                    exec_states = list(self.active_execs.values())
+                    self.active_execs.clear()
+                    self.exec_req_buffers.clear()
+                    for st in exec_states:
+                        st.mark_cancelled()
                     self.window_cond.notify_all()
                     bridges = list(self.tcp_bridges.values())
                     self.tcp_bridges.clear()
@@ -530,6 +712,11 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                     pushes = list(self.file_pushes.values())
                     self.file_pushes.clear()
 
+                for st in exec_states:
+                    try:
+                        st.terminate_process_group()
+                    except Exception:
+                        pass
                 for sock in bridges:
                     try:
                         sock.close()
@@ -541,7 +728,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                     except Exception:
                         pass
                     try:
-                        proc.terminate()
+                        _terminate_pgroup_for_process(proc)
                     except Exception:
                         pass
                 for push in pushes:
@@ -603,10 +790,9 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 while offset < total and not self.closed:
                     with self.window_cond:
                         while not self.closed and self.peer_window.get(stream_id, DEFAULT_WINDOW_CREDIT) <= 0:
-                            self.window_cond.wait(timeout=2.0)
-                            if self.peer_window.get(stream_id, DEFAULT_WINDOW_CREDIT) <= 0:
-                                # Prevent indefinite stall if window update was coalesced
-                                self.peer_window[stream_id] = MAX_CHUNK_BYTES
+                            self.window_cond.wait(timeout=0.2)
+                        if self.closed:
+                            return
                         avail = self.peer_window.get(stream_id, DEFAULT_WINDOW_CREDIT)
                         take = min(total - offset, MAX_CHUNK_BYTES, max(1, avail))
                         self.peer_window[stream_id] = max(0, avail - take)
@@ -668,12 +854,30 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 elif channel == CHAN_TELEMETRY_HEARTBEAT:
                     self._emit_heartbeat()
                 elif channel == CHAN_EXEC_PROCESS:
-                    if not (flags & FLAG_RST) and payload:
-                        threading.Thread(
-                            target=self._run_exec_request,
-                            args=(stream_id, payload),
-                            daemon=True,
-                        ).start()
+                    if flags & FLAG_RST:
+                        self._cancel_exec_stream(stream_id)
+                    else:
+                        req_bytes = None
+                        exec_state = None
+                        with self.state_lock:
+                            if flags & FLAG_SYN:
+                                self.exec_req_buffers[stream_id] = bytearray()
+                            buf = self.exec_req_buffers.get(stream_id)
+                            if buf is None and payload:
+                                buf = bytearray()
+                                self.exec_req_buffers[stream_id] = buf
+                            if buf is not None and payload:
+                                buf.extend(payload)
+                            if (flags & FLAG_END_OF_MESSAGE) and buf is not None:
+                                req_bytes = bytes(self.exec_req_buffers.pop(stream_id))
+                                exec_state = ExecStreamState(stream_id)
+                                self.active_execs[stream_id] = exec_state
+                        if req_bytes is not None and exec_state is not None:
+                            threading.Thread(
+                                target=self._run_exec_request,
+                                args=(stream_id, req_bytes, exec_state),
+                                daemon=True,
+                            ).start()
                 elif channel == CHAN_FILE_TRANSFER:
                     self._on_file_transfer(stream_id, flags, payload)
                 elif channel == CHAN_TCP_PORT_FORWARD:
@@ -718,206 +922,305 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                 )
 
             # ---- Channel 1: Command Execution (subprocess / pty) ----
-            def _run_exec_request(self, stream_id: int, raw_json: bytes) -> None:
+            def _cancel_exec_stream(self, stream_id: int) -> None:
+                with self.window_cond:
+                    self.exec_req_buffers.pop(stream_id, None)
+                    exec_state = self.active_execs.get(stream_id)
+                    if exec_state is not None:
+                        exec_state.mark_cancelled()
+                    self.window_cond.notify_all()
+                if exec_state is not None:
+                    exec_state.terminate_process_group()
+
+            def _run_exec_request(
+                self,
+                stream_id: int,
+                raw_json: bytes,
+                exec_state: ExecStreamState = None,
+            ) -> None:
+                if exec_state is None:
+                    exec_state = ExecStreamState(stream_id)
+                    with self.state_lock:
+                        self.active_execs[stream_id] = exec_state
+
                 started = time.monotonic()
-                req = json.loads(raw_json.decode("utf-8"))
-                req_id = req["id"]
-                cmd = [req["executable"]] + list(req.get("arguments", []))
-                cwd = req.get("workingDirectory") or self.default_workspace
-                if not os.path.isdir(cwd):
-                    cwd = "/"
-
-                env = os.environ.copy()
-                env.update(req.get("environment") or {})
-                timeout_sec = max(0.1, float(req.get("timeoutSeconds", 300.0)))
-                run_as_user = req.get("runAsUser") or "root"
-                stdin_b64 = req.get("stdinPayload")
-                stdin_bytes = base64.b64decode(stdin_b64) if stdin_b64 else None
-                alloc_pty = bool(req.get("allocatePTY", False))
-
-                def demote_user():
-                    if os.geteuid() == 0 and run_as_user and run_as_user != "root":
-                        try:
-                            pw = pwd.getpwnam(run_as_user)
-                            try:
-                                os.initgroups(run_as_user, pw.pw_gid)
-                            except Exception:
-                                pass
-                            os.setgid(pw.pw_gid)
-                            os.setuid(pw.pw_uid)
-                        except KeyError:
-                            pass
-
-                seq = 0
-                timed_out = False
-                exit_code = 0
-
                 try:
-                    if alloc_pty:
-                        master_fd, slave_fd = pty.openpty()
-                        rows = int(req.get("ptyRows", 36))
-                        cols = int(req.get("ptyColumns", 120))
-                        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-                        proc = subprocess.Popen(
-                            cmd,
-                            stdin=slave_fd,
-                            stdout=slave_fd,
-                            stderr=slave_fd,
-                            cwd=cwd,
-                            env=env,
-                            preexec_fn=demote_user,
-                            close_fds=True,
-                        )
-                        os.close(slave_fd)
-                        if stdin_bytes:
-                            os.write(master_fd, stdin_bytes)
+                    if self.closed or exec_state.is_cancelled():
+                        return
 
-                        deadline = started + timeout_sec
-                        while True:
-                            rem = deadline - time.monotonic()
-                            if rem <= 0:
-                                timed_out = True
-                                proc.kill()
-                                break
-                            rlist, _, _ = select.select([master_fd], [], [], min(0.1, rem))
-                            if rlist:
+                    req = json.loads(raw_json.decode("utf-8"))
+                    req_id = req["id"]
+                    cmd = [req["executable"]] + list(req.get("arguments", []))
+                    cwd = req.get("workingDirectory") or self.default_workspace
+                    if not os.path.isdir(cwd):
+                        cwd = "/"
+
+                    env = os.environ.copy()
+                    env.update(req.get("environment") or {})
+                    timeout_sec = max(0.1, float(req.get("timeoutSeconds", 300.0)))
+                    run_as_user = req.get("runAsUser") or "root"
+                    stdin_b64 = req.get("stdinPayload")
+                    stdin_bytes = base64.b64decode(stdin_b64) if stdin_b64 else None
+                    alloc_pty = bool(req.get("allocatePTY", False))
+
+                    def demote_user():
+                        if os.geteuid() == 0 and run_as_user and run_as_user != "root":
+                            try:
+                                pw = pwd.getpwnam(run_as_user)
                                 try:
-                                    data = os.read(master_fd, 16384)
-                                    if not data:
-                                        break
-                                    seq += 1
-                                    self._emit_exec_chunk(stream_id, req_id, "stdout", seq, data)
+                                    os.initgroups(run_as_user, pw.pw_gid)
+                                except Exception:
+                                    pass
+                                os.setgid(pw.pw_gid)
+                                os.setuid(pw.pw_uid)
+                            except KeyError:
+                                pass
+
+                    preexec = demote_user if (os.geteuid() == 0 and run_as_user and run_as_user != "root") else None
+                    seq = 0
+                    timed_out = False
+                    exit_code = 0
+                    deadline = started + timeout_sec
+
+                    try:
+                        if alloc_pty:
+                            master_fd, slave_fd = pty.openpty()
+                            rows = int(req.get("ptyRows", 36))
+                            cols = int(req.get("ptyColumns", 120))
+                            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                            try:
+                                proc = subprocess.Popen(
+                                    cmd,
+                                    stdin=slave_fd,
+                                    stdout=slave_fd,
+                                    stderr=slave_fd,
+                                    cwd=cwd,
+                                    env=env,
+                                    preexec_fn=preexec,
+                                    start_new_session=True,
+                                    close_fds=True,
+                                )
+                            finally:
+                                try:
+                                    os.close(slave_fd)
                                 except OSError:
+                                    pass
+
+                            if not exec_state.attach_process(proc):
+                                try:
+                                    os.close(master_fd)
+                                except OSError:
+                                    pass
+                                exec_state.wait_proc()
+                                return
+
+                            if stdin_bytes:
+                                try:
+                                    os.write(master_fd, stdin_bytes)
+                                except OSError:
+                                    pass
+
+                            while True:
+                                if self.closed or exec_state.is_cancelled():
+                                    exec_state.terminate_process_group()
                                     break
-                            elif proc.poll() is not None:
-                                break
-                        os.close(master_fd)
-                        rc = proc.wait()
-                        exit_code = 124 if timed_out else (128 - rc if rc < 0 else rc)
-                    else:
-                        proc = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            cwd=cwd,
-                            env=env,
-                            preexec_fn=demote_user,
-                        )
-                        out_fd = proc.stdout.fileno()
-                        err_fd = proc.stderr.fileno()
-                        read_fds = {out_fd: ("stdout", proc.stdout), err_fd: ("stderr", proc.stderr)}
-                        stdin_view = memoryview(stdin_bytes) if stdin_bytes else None
-                        stdin_offset = 0
-                        stdin_fd = None
-                        if proc.stdin is not None:
-                            if stdin_view is not None and len(stdin_view) > 0:
-                                stdin_fd = proc.stdin.fileno()
-                                fl = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
-                                fcntl.fcntl(stdin_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-                            else:
-                                proc.stdin.close()
-
-                        deadline = started + timeout_sec
-                        while read_fds or stdin_fd is not None:
-                            if self.closed:
-                                try:
-                                    proc.kill()
-                                except Exception:
-                                    pass
-                                break
-                            rem = deadline - time.monotonic()
-                            if rem <= 0:
-                                timed_out = True
-                                try:
-                                    proc.kill()
-                                except Exception:
-                                    pass
-                                break
-                            w_candidates = [stdin_fd] if stdin_fd is not None else []
-                            rlist, wlist, _ = select.select(
-                                list(read_fds.keys()), w_candidates, [], min(0.1, rem)
+                                rem = deadline - time.monotonic()
+                                if rem <= 0:
+                                    timed_out = True
+                                    exec_state.terminate_process_group()
+                                    break
+                                watch_fds = [master_fd]
+                                if exec_state.wake_rfd >= 0:
+                                    watch_fds.append(exec_state.wake_rfd)
+                                rlist, _, _ = select.select(watch_fds, [], [], min(0.1, rem))
+                                if exec_state.wake_rfd in rlist:
+                                    exec_state.drain_wake()
+                                if master_fd in rlist:
+                                    try:
+                                        data = os.read(master_fd, 16384)
+                                        if not data:
+                                            break
+                                        seq += 1
+                                        if not self._emit_exec_chunk(
+                                            stream_id, req_id, "stdout", seq, data, exec_state, deadline
+                                        ):
+                                            if deadline - time.monotonic() <= 0 and not self.closed and not exec_state.is_cancelled():
+                                                timed_out = True
+                                            exec_state.terminate_process_group()
+                                            break
+                                    except OSError:
+                                        break
+                                elif proc.poll() is not None:
+                                    break
+                            try:
+                                os.close(master_fd)
+                            except OSError:
+                                pass
+                            rc = exec_state.wait_proc()
+                            exit_code = 124 if timed_out else (128 - rc if rc < 0 else rc)
+                        else:
+                            proc = subprocess.Popen(
+                                cmd,
+                                stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                cwd=cwd,
+                                env=env,
+                                preexec_fn=preexec,
+                                start_new_session=True,
                             )
-                            if wlist and stdin_fd is not None and stdin_view is not None:
-                                try:
-                                    written = os.write(stdin_fd, stdin_view[stdin_offset : stdin_offset + MAX_CHUNK_BYTES])
-                                    stdin_offset += written
-                                    if stdin_offset >= len(stdin_view):
-                                        proc.stdin.close()
-                                        stdin_fd = None
-                                except BlockingIOError:
-                                    pass
-                                except OSError:
-                                    try:
-                                        proc.stdin.close()
-                                    except Exception:
-                                        pass
-                                    stdin_fd = None
-                            for rfd in rlist:
-                                entry = read_fds.get(rfd)
-                                if entry is None:
-                                    continue
-                                stream_label, pipe_obj = entry
-                                try:
-                                    chunk = os.read(rfd, MAX_CHUNK_BYTES)
-                                except OSError:
-                                    chunk = b""
-                                if not chunk:
-                                    read_fds.pop(rfd, None)
-                                    try:
-                                        pipe_obj.close()
-                                    except Exception:
-                                        pass
+                            if not exec_state.attach_process(proc):
+                                for pipe_obj in (proc.stdin, proc.stdout, proc.stderr):
+                                    if pipe_obj is not None:
+                                        try:
+                                            pipe_obj.close()
+                                        except Exception:
+                                            pass
+                                exec_state.wait_proc()
+                                return
+
+                            out_fd = proc.stdout.fileno()
+                            err_fd = proc.stderr.fileno()
+                            read_fds = {out_fd: ("stdout", proc.stdout), err_fd: ("stderr", proc.stderr)}
+                            stdin_view = memoryview(stdin_bytes) if stdin_bytes else None
+                            stdin_offset = 0
+                            stdin_fd = None
+                            if proc.stdin is not None:
+                                if stdin_view is not None and len(stdin_view) > 0:
+                                    stdin_fd = proc.stdin.fileno()
+                                    fl = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+                                    fcntl.fcntl(stdin_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
                                 else:
-                                    seq += 1
-                                    self._emit_exec_chunk(stream_id, req_id, stream_label, seq, chunk)
+                                    proc.stdin.close()
 
-                        if stdin_fd is not None and proc.stdin is not None:
-                            try:
-                                proc.stdin.close()
-                            except Exception:
-                                pass
-                        for _, (stream_label, pipe_obj) in list(read_fds.items()):
-                            try:
-                                rem_bytes = pipe_obj.read()
-                            except Exception:
-                                rem_bytes = b""
-                            if rem_bytes and not self.closed:
-                                for off in range(0, len(rem_bytes), MAX_CHUNK_BYTES):
-                                    seq += 1
-                                    self._emit_exec_chunk(
-                                        stream_id, req_id, stream_label, seq, rem_bytes[off : off + MAX_CHUNK_BYTES]
-                                    )
-                            try:
-                                pipe_obj.close()
-                            except Exception:
-                                pass
-                        rc = proc.wait()
-                        exit_code = 124 if timed_out else (128 - rc if rc < 0 else rc)
-                except FileNotFoundError as fnf:
-                    seq += 1
-                    self._emit_exec_chunk(stream_id, req_id, "stderr", seq, f"{fnf}\n".encode("utf-8"))
-                    exit_code = 127
-                except Exception as exc:
-                    seq += 1
-                    self._emit_exec_chunk(stream_id, req_id, "stderr", seq, f"{exc}\n".encode("utf-8"))
-                    exit_code = 1
+                            while read_fds or stdin_fd is not None:
+                                if self.closed or exec_state.is_cancelled():
+                                    exec_state.terminate_process_group()
+                                    break
+                                rem = deadline - time.monotonic()
+                                if rem <= 0:
+                                    timed_out = True
+                                    exec_state.terminate_process_group()
+                                    break
+                                r_candidates = list(read_fds.keys())
+                                if exec_state.wake_rfd >= 0:
+                                    r_candidates.append(exec_state.wake_rfd)
+                                w_candidates = [stdin_fd] if stdin_fd is not None else []
+                                rlist, wlist, _ = select.select(
+                                    r_candidates, w_candidates, [], min(0.1, rem)
+                                )
+                                if exec_state.wake_rfd in rlist:
+                                    exec_state.drain_wake()
+                                    if self.closed or exec_state.is_cancelled():
+                                        exec_state.terminate_process_group()
+                                        break
+                                if wlist and stdin_fd is not None and stdin_view is not None:
+                                    try:
+                                        written = os.write(stdin_fd, stdin_view[stdin_offset : stdin_offset + MAX_CHUNK_BYTES])
+                                        stdin_offset += written
+                                        if stdin_offset >= len(stdin_view):
+                                            proc.stdin.close()
+                                            stdin_fd = None
+                                    except BlockingIOError:
+                                        pass
+                                    except OSError:
+                                        try:
+                                            proc.stdin.close()
+                                        except Exception:
+                                            pass
+                                        stdin_fd = None
+                                aborted_emit = False
+                                for rfd in rlist:
+                                    entry = read_fds.get(rfd)
+                                    if entry is None:
+                                        continue
+                                    stream_label, pipe_obj = entry
+                                    try:
+                                        chunk = os.read(rfd, MAX_CHUNK_BYTES)
+                                    except OSError:
+                                        chunk = b""
+                                    if not chunk:
+                                        read_fds.pop(rfd, None)
+                                        try:
+                                            pipe_obj.close()
+                                        except Exception:
+                                            pass
+                                    else:
+                                        seq += 1
+                                        if not self._emit_exec_chunk(
+                                            stream_id, req_id, stream_label, seq, chunk, exec_state, deadline
+                                        ):
+                                            if deadline - time.monotonic() <= 0 and not self.closed and not exec_state.is_cancelled():
+                                                timed_out = True
+                                            exec_state.terminate_process_group()
+                                            aborted_emit = True
+                                            break
+                                if aborted_emit:
+                                    break
 
-                elapsed_ms = max(1, int((time.monotonic() - started) * 1000.0))
-                done = {
-                    "requestID": req_id,
-                    "exitCode": int(exit_code),
-                    "durationMilliseconds": elapsed_ms,
-                    "timedOut": timed_out,
-                }
-                self.send_frame(
-                    CHAN_EXEC_PROCESS,
-                    FLAG_FIN | FLAG_END_OF_MESSAGE,
-                    stream_id,
-                    json.dumps(done).encode("utf-8"),
-                )
+                            if stdin_fd is not None and proc.stdin is not None:
+                                try:
+                                    proc.stdin.close()
+                                except Exception:
+                                    pass
+                            for _, (_, pipe_obj) in list(read_fds.items()):
+                                try:
+                                    pipe_obj.close()
+                                except Exception:
+                                    pass
+                            rc = exec_state.wait_proc()
+                            exit_code = 124 if timed_out else (128 - rc if rc < 0 else rc)
+                    except FileNotFoundError as fnf:
+                        if not self.closed and not exec_state.is_cancelled():
+                            seq += 1
+                            self._emit_exec_chunk(
+                                stream_id, req_id, "stderr", seq, f"{fnf}\n".encode("utf-8"), exec_state, None
+                            )
+                        exit_code = 127
+                    except Exception as exc:
+                        if not self.closed and not exec_state.is_cancelled():
+                            seq += 1
+                            self._emit_exec_chunk(
+                                stream_id, req_id, "stderr", seq, f"{exc}\n".encode("utf-8"), exec_state, None
+                            )
+                        exit_code = 1
 
-            def _emit_exec_chunk(self, stream_id: int, req_id: str, stream_name: str, seq: int, data: bytes) -> None:
+                    if self.closed or exec_state.is_cancelled():
+                        return
+
+                    elapsed_ms = max(1, int((time.monotonic() - started) * 1000.0))
+                    done = {
+                        "requestID": req_id,
+                        "exitCode": int(exit_code),
+                        "durationMilliseconds": elapsed_ms,
+                        "timedOut": timed_out,
+                    }
+                    self.send_frame(
+                        CHAN_EXEC_PROCESS,
+                        FLAG_FIN | FLAG_END_OF_MESSAGE,
+                        stream_id,
+                        json.dumps(done).encode("utf-8"),
+                    )
+                finally:
+                    with self.state_lock:
+                        if self.active_execs.get(stream_id) is exec_state:
+                            self.active_execs.pop(stream_id, None)
+                        self.peer_window.pop(stream_id, None)
+                        self.uncredited_rx.pop(stream_id, None)
+                    exec_state.close_wake_pipe()
+
+            def _emit_exec_chunk(
+                self,
+                stream_id: int,
+                req_id: str,
+                stream_name: str,
+                seq: int,
+                data: bytes,
+                exec_state: ExecStreamState = None,
+                deadline: float = None,
+            ) -> bool:
+                if self.closed or (exec_state is not None and exec_state.is_cancelled()):
+                    return False
                 chunk_env = {
                     "requestID": req_id,
                     "stream": stream_name,
@@ -925,13 +1228,31 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                     "data": base64.b64encode(data).decode("ascii"),
                     "timestamp": time.time(),
                 }
+                encoded = json.dumps(chunk_env).encode("utf-8")
+                cost = len(encoded)
+                with self.window_cond:
+                    while not self.closed and not (exec_state is not None and exec_state.is_cancelled()):
+                        avail = self.peer_window.get(stream_id, DEFAULT_WINDOW_CREDIT)
+                        if avail > 0:
+                            self.peer_window[stream_id] = max(0, avail - cost)
+                            break
+                        wait_sec = 0.1
+                        if deadline is not None:
+                            rem = deadline - time.monotonic()
+                            if rem <= 0:
+                                return False
+                            wait_sec = min(0.1, rem)
+                        self.window_cond.wait(timeout=wait_sec)
+                    if self.closed or (exec_state is not None and exec_state.is_cancelled()):
+                        return False
                 self.send_frame(
                     CHAN_EXEC_PROCESS,
                     FLAG_ACK,
                     stream_id,
-                    json.dumps(chunk_env).encode("utf-8"),
+                    encoded,
                     compress=True,
                 )
+                return True
 
             # ---- Channel 2: File Transfer with SHA-256 Verification ----
             def _on_file_transfer(self, stream_id: int, flags: int, payload: bytes) -> None:
@@ -1158,8 +1479,8 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                         except OSError:
                             pass
                         try:
-                            proc.terminate()
-                        except OSError:
+                            _terminate_pgroup_for_process(proc)
+                        except Exception:
                             pass
                     return
 
@@ -1257,6 +1578,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
             parser.add_argument("--port", type=int, default=\#(vsockPort), help="AF_VSOCK port (default: \#(vsockPort))")
             parser.add_argument("--heartbeat-interval", type=int, default=\#(heartbeatIntervalSeconds))
             parser.add_argument("--workspace", type=str, default="\#(defaultWorkspacePath)")
+            parser.add_argument("--proc-root", type=str, default="/proc", help="Path to procfs root (default: /proc)")
             parser.add_argument("--tcp-fallback", type=str, default="", help="Optional host:port TCP listener for testing")
             args = parser.parse_args()
 
@@ -1272,6 +1594,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                         conn=conn,
                         heartbeat_interval=args.heartbeat_interval,
                         default_workspace=args.workspace,
+                        proc_root=args.proc_root,
                     )
                     threading.Thread(target=session.run, daemon=True).start()
                 except KeyboardInterrupt:

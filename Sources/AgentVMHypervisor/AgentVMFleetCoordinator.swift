@@ -286,14 +286,19 @@ public actor AgentVMFleetCoordinator {
     public let vzTranslator = VZConfigurationTranslator()
     public let guestBootstrap = GuestAgentBootstrapGenerator()
 
+    public static let defaultVsockReconnectInitialDelayNanoseconds: UInt64 = 350_000_000
+
     public nonisolated let isWorkspaceDaemon: Bool
     private let hardwareBackend: any HardwareVMLowLevelBackend
     private let vsockConnectTimeoutNanoseconds: UInt64
     private let vsockRetryIntervalNanoseconds: UInt64
+    private let vsockReconnectInitialDelayNanoseconds: UInt64
     private let gracefulStopTimeoutNanoseconds: UInt64
 
     private var executionBackend: HypervisorExecutionBackend
     private var vsockSessions: [VMID: VsockMultiplexSession] = [:]
+    private var vsockSessionTokens: [VMID: UUID] = [:]
+    private var vsockGenerationCounters: [VMID: UInt64] = [:]
     private var terminalBuffers: [VMID: VT100ScreenBuffer] = [:]
     private var hardwareBoxes: [VMID: any HardwareVMInstanceHandle] = [:]
     private var hardwareBoxTokens: [VMID: UUID] = [:]
@@ -663,6 +668,7 @@ public actor AgentVMFleetCoordinator {
         hardwareBackendOverride: (any HardwareVMLowLevelBackend)? = nil,
         vsockConnectTimeoutNanoseconds: UInt64 = 180_000_000_000,
         vsockRetryIntervalNanoseconds: UInt64 = 1_000_000_000,
+        vsockReconnectInitialDelayNanoseconds: UInt64 = AgentVMFleetCoordinator.defaultVsockReconnectInitialDelayNanoseconds,
         gracefulStopTimeoutNanoseconds: UInt64 = 30_000_000_000
     ) throws {
         let createdStore = try AgentVMProjectStore(bundleURL: bundleURL, createIfMissing: true)
@@ -691,6 +697,7 @@ public actor AgentVMFleetCoordinator {
         self.hardwareBackend = hardwareBackendOverride ?? DefaultVZHardwareBackend()
         self.vsockConnectTimeoutNanoseconds = vsockConnectTimeoutNanoseconds
         self.vsockRetryIntervalNanoseconds = vsockRetryIntervalNanoseconds
+        self.vsockReconnectInitialDelayNanoseconds = vsockReconnectInitialDelayNanoseconds
         self.gracefulStopTimeoutNanoseconds = gracefulStopTimeoutNanoseconds
     }
 
@@ -1764,26 +1771,23 @@ public actor AgentVMFleetCoordinator {
             )
         }
 
-        let session = VsockMultiplexSession(vmID: vmID)
+        let session: VsockMultiplexSession
         do {
-            try await session.attachPOSIXFileDescriptor(
-                connectedDescriptor.fileDescriptor,
-                closeWhenDone: connectedDescriptor.closeWhenSessionEnds
+            vsockGenerationCounters[vmID] = 0
+            session = try await attachManagedVsockSession(
+                vmID: vmID,
+                boxToken: boxToken,
+                descriptor: connectedDescriptor,
+                persistState: persistRunningState,
+                vmSpec: record.spec
             )
         } catch {
-            await session.shutdown()
             await rollbackFailedBootAndReleaseLockIfNeeded(vmFD: vmFD)
             throw error
         }
 
-        await session.attachTerminalScreenBuffer(tty)
         hardwareBoxes[vmID] = box
         hardwareBoxTokens[vmID] = boxToken
-        vsockSessions[vmID] = session
-
-        for rule in record.spec.portForwards where rule.enabled {
-            _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
-        }
 
         onProgress?("Guest agent connected on vsock port \(guestPort) (attempt \(attempt)).")
         tty.feed("[VZBoot] Started Apple Virtualization.framework guest '\(record.spec.name)'.\r\n")
@@ -2044,6 +2048,7 @@ public actor AgentVMFleetCoordinator {
             }
         }
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+        vsockSessionTokens.removeValue(forKey: vmID)
         hardwareBoxTokens.removeValue(forKey: vmID)
         await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
@@ -2113,6 +2118,7 @@ public actor AgentVMFleetCoordinator {
     ) async {
         guard hardwareBoxTokens[vmID] == boxToken else { return }
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+        vsockSessionTokens.removeValue(forKey: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
             await session.shutdown()
         }
@@ -2134,6 +2140,7 @@ public actor AgentVMFleetCoordinator {
         guard hardwareBoxTokens[vmID] == boxToken else { return }
         hardwareBoxTokens.removeValue(forKey: vmID)
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+        vsockSessionTokens.removeValue(forKey: vmID)
 
         await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
@@ -2199,6 +2206,193 @@ public actor AgentVMFleetCoordinator {
                 )
             }
             try await store.appendDiagnostic(diag)
+        }
+    }
+
+    // MARK: - Vsock Disconnect Observation, 300-500ms Grace Window & 1s Reconnect Loop (Fixes A34)
+
+    private func attachManagedVsockSession(
+        vmID: VMID,
+        boxToken: UUID,
+        descriptor: HardwareVsockFDDescriptor,
+        persistState: Bool,
+        vmSpec: VMSpec
+    ) async throws -> VsockMultiplexSession {
+        let sessionToken = UUID()
+        let session = VsockMultiplexSession(vmID: vmID)
+        do {
+            try await session.attachPOSIXFileDescriptor(
+                descriptor.fileDescriptor,
+                closeWhenDone: descriptor.closeWhenSessionEnds,
+                onDisconnect: { [weak self] in
+                    guard let self else { return }
+                    await self.handleVsockTransportDisconnected(
+                        vmID: vmID,
+                        boxToken: boxToken,
+                        sessionToken: sessionToken,
+                        persistState: persistState
+                    )
+                }
+            )
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+
+        let tty = ensureTerminalBuffer(for: vmID)
+        await session.attachTerminalScreenBuffer(tty)
+        vsockSessions[vmID] = session
+        vsockSessionTokens[vmID] = sessionToken
+        vsockGenerationCounters[vmID] = (vsockGenerationCounters[vmID] ?? 0) &+ 1
+
+        for rule in vmSpec.portForwards where rule.enabled {
+            _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
+        }
+        return session
+    }
+
+    private func handleVsockTransportDisconnected(
+        vmID: VMID,
+        boxToken: UUID,
+        sessionToken: UUID,
+        persistState: Bool
+    ) async {
+        guard hardwareBoxTokens[vmID] == boxToken,
+              vsockSessionTokens[vmID] == sessionToken else {
+            return
+        }
+        vsockSessionTokens.removeValue(forKey: vmID)
+        if let deadSession = vsockSessions.removeValue(forKey: vmID) {
+            await deadSession.shutdown()
+        }
+        await portForwardManager.stopAllRules(for: vmID)
+
+        guard persistState else { return }
+        guard let box = hardwareBoxes[vmID], box.prematureStopReason() == nil else {
+            return
+        }
+
+        if var record = try? await store.fetchVM(vmID),
+           record.telemetry.state == .running || record.telemetry.state == .paused {
+            record.telemetry.guestAgentConnected = false
+            record.telemetry.hasLiveGuestTelemetry = false
+            record.telemetry.vsockStreamsOpen = 0
+            stampRuntimeOrigin(&record)
+            try? await store.upsertVM(record)
+        }
+
+        vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+        let initialDelayNs = vsockReconnectInitialDelayNanoseconds
+        let retryIntervalNs = vsockRetryIntervalNanoseconds
+        vsockReconnectTasks[vmID] = Task { [weak self] in
+            if initialDelayNs > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: initialDelayNs)
+                } catch {
+                    return
+                }
+            }
+            guard !Task.isCancelled, let self else { return }
+            await self.runVsockReconnectLoop(
+                vmID: vmID,
+                boxToken: boxToken,
+                retryIntervalNanoseconds: retryIntervalNs
+            )
+        }
+    }
+
+    private func runVsockReconnectLoop(
+        vmID: VMID,
+        boxToken: UUID,
+        retryIntervalNanoseconds: UInt64
+    ) async {
+        let guestPort = VsockWireConstants.defaultGuestVsockPort
+        var attempt = 0
+
+        while !Task.isCancelled {
+            guard hardwareBoxTokens[vmID] == boxToken,
+                  let box = hardwareBoxes[vmID],
+                  box.prematureStopReason() == nil else {
+                return
+            }
+            if vsockSessions[vmID] != nil {
+                return
+            }
+            guard let currentRecord = try? await store.fetchVM(vmID) else {
+                return
+            }
+            if currentRecord.telemetry.state == .stopped {
+                return
+            }
+            if currentRecord.telemetry.state == .paused {
+                do {
+                    try await Task.sleep(nanoseconds: max(10_000_000, retryIntervalNanoseconds))
+                } catch {
+                    return
+                }
+                continue
+            }
+
+            attempt += 1
+            do {
+                let desc = try await box.connectVsock(port: guestPort)
+                guard !Task.isCancelled,
+                      hardwareBoxTokens[vmID] == boxToken,
+                      hardwareBoxes[vmID] != nil,
+                      box.prematureStopReason() == nil else {
+                    if desc.closeWhenSessionEnds && desc.fileDescriptor >= 0 {
+                        _ = Darwin.close(desc.fileDescriptor)
+                    }
+                    await box.closeVsockConnection()
+                    return
+                }
+
+                let newSession = try await attachManagedVsockSession(
+                    vmID: vmID,
+                    boxToken: boxToken,
+                    descriptor: desc,
+                    persistState: true,
+                    vmSpec: currentRecord.spec
+                )
+                let generation = vsockGenerationCounters[vmID] ?? 1
+                if var refreshed = try? await store.fetchVM(vmID),
+                   refreshed.telemetry.state != .stopped {
+                    refreshed.telemetry.guestAgentConnected = true
+                    refreshed.telemetry.vsockStreamsOpen = await newSession.openStreamCount()
+                    stampRuntimeOrigin(&refreshed)
+                    try? await store.upsertVM(refreshed)
+
+                    let vmName = refreshed.spec.name
+                    let zhMsg = "客户机「\(vmName)」的 vsock 守护连接在断开后已重新连上（端口 \(guestPort)，第 \(attempt) 次重连尝试，连接代数 \(generation)；如客户机原地 reboot 或守护服务重启）。"
+                    let enMsg = "Reconnected guest agent vsock on VM '\(vmName)' after disconnect (port \(guestPort), attempt \(attempt), generation \(generation); e.g. in-place guest reboot or agent restart)."
+                    try? await store.appendDiagnostic(DiagnosticEvent(
+                        severity: .notice,
+                        subsystem: "VsockRPC",
+                        vmID: vmID,
+                        code: "VSOCK_RECONNECTED",
+                        message: enMsg,
+                        metadata: [
+                            "vmName": vmName,
+                            "port": "\(guestPort)",
+                            "attempt": "\(attempt)",
+                            "generation": "\(generation)",
+                            "message_zh": zhMsg,
+                            "message_en": enMsg
+                        ]
+                    ))
+                }
+                vsockReconnectTasks.removeValue(forKey: vmID)
+                return
+            } catch {
+                if Task.isCancelled || hardwareBoxTokens[vmID] != boxToken || box.prematureStopReason() != nil {
+                    return
+                }
+                do {
+                    try await Task.sleep(nanoseconds: max(10_000_000, retryIntervalNanoseconds))
+                } catch {
+                    return
+                }
+            }
         }
     }
 

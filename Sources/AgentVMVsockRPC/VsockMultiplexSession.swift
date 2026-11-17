@@ -313,6 +313,7 @@ public actor VsockMultiplexSession {
     private let accumulator = VsockStreamAccumulator()
 
     private var transportWrite: (@Sendable (Data) async throws -> Void)?
+    private var onTransportDisconnect: (@Sendable () async -> Void)?
     private var inboundTransportPumpTask: Task<Void, Never>?
     private var inboundTransportContinuation: AsyncStream<Data>.Continuation?
     private var attachedReadSource: DispatchSourceRead?
@@ -399,7 +400,8 @@ public actor VsockMultiplexSession {
     /// byte-for-byte over `receiveRawTransportBytes(_:)`.
     public func attachSimulatedGuestResponder() async {
         detachFDSourceIfPresent()
-        let inboundPipe = makeSerialInboundTransportPipe()
+        onTransportDisconnect = nil
+        let inboundPipe = makeSerialInboundTransportPipe(triggerDisconnectOnStreamEnd: false)
         let peer = SimulatedGuestWirePeer(vmID: vmID) { guestReplyWireBytes in
             inboundPipe.yield(guestReplyWireBytes)
         }
@@ -418,11 +420,16 @@ public actor VsockMultiplexSession {
 
     /// Attaches a live POSIX stream socket descriptor (e.g. `VZVirtioSocketConnection.fileDescriptor`)
     /// using non-blocking GCD `DispatchSourceRead` event notifications and a strict-FIFO `AsyncStream` pump.
-    public func attachPOSIXFileDescriptor(_ fileDescriptor: Int32, closeWhenDone: Bool = false) throws {
+    public func attachPOSIXFileDescriptor(
+        _ fileDescriptor: Int32,
+        closeWhenDone: Bool = false,
+        onDisconnect: (@Sendable () async -> Void)? = nil
+    ) throws {
         guard fileDescriptor >= 0 else {
             throw AgentVMError.vsockProtocolViolation(detail: "Invalid POSIX file descriptor \(fileDescriptor).")
         }
         detachFDSourceIfPresent()
+        self.onTransportDisconnect = onDisconnect
 
         var noSigPipe: Int32 = 1
         _ = Darwin.setsockopt(
@@ -444,7 +451,7 @@ public actor VsockMultiplexSession {
             try Self.writeAllToPOSIXDescriptor(fd: fileDescriptor, data: data)
         }
 
-        let inboundPipe = makeSerialInboundTransportPipe()
+        let inboundPipe = makeSerialInboundTransportPipe(triggerDisconnectOnStreamEnd: true)
         let readQueue = DispatchQueue(label: "com.agentvm.vsock.read.\(vmID.rawValue)", qos: .userInitiated)
         let source = DispatchSource.makeReadSource(fileDescriptor: fileDescriptor, queue: readQueue)
         let shouldClose = closeWhenDone
@@ -503,15 +510,18 @@ public actor VsockMultiplexSession {
 
     /// Gracefully tears down transport sources and fails any in-flight stream continuations.
     public func shutdown() {
+        shutdownWithReason("VsockMultiplexSession for VM '\(vmID.rawValue)' was shut down.")
+    }
+
+    private func shutdownWithReason(_ reason: String) {
         guard !isShutDown else { return }
         isShutDown = true
+        onTransportDisconnect = nil
         detachFDSourceIfPresent()
         pairedLoopbackPeer = nil
         simulatedPeerEndpoint = nil
 
-        let closedError = AgentVMError.vsockProtocolViolation(
-            detail: "VsockMultiplexSession for VM '\(vmID.rawValue)' was shut down."
-        )
+        let closedError = AgentVMError.vsockProtocolViolation(detail: reason)
 
         for (_, stream) in openStreams {
             for (_, waiter) in stream.creditWaiters {
@@ -556,13 +566,13 @@ public actor VsockMultiplexSession {
     // MARK: Inbound Raw Wire Byte Processing
 
     /// Feeds raw transport socket bytes into the `VsockStreamAccumulator`, validates `AVM1` framing & CRC-32,
-    /// updates stream sliding-window credits, and dispatches channel handlers.
+    /// updates stream sliding-window credits, and dispatches channel handlers one complete frame at a time.
     public func receiveRawTransportBytes(_ data: Data) async throws {
         guard !data.isEmpty else { return }
         wireBytesReceivedCount &+= UInt64(data.count)
 
-        let frames = try accumulator.ingest(data)
-        for (header, payload) in frames {
+        try accumulator.appendBytes(data)
+        while let (header, payload) = try accumulator.nextFrame() {
             framesReceivedCount &+= 1
             if header.flags.contains(.compressed) {
                 compressedFramesReceivedCount &+= 1
@@ -2057,7 +2067,7 @@ public actor VsockMultiplexSession {
 
     // MARK: POSIX Helpers
 
-    private func makeSerialInboundTransportPipe() -> AsyncStream<Data>.Continuation {
+    private func makeSerialInboundTransportPipe(triggerDisconnectOnStreamEnd: Bool) -> AsyncStream<Data>.Continuation {
         let (stream, continuation) = AsyncStream<Data>.makeStream()
         self.inboundTransportContinuation = continuation
         self.inboundTransportPumpTask = Task { [weak self] in
@@ -2066,8 +2076,24 @@ public actor VsockMultiplexSession {
                 guard let self else { break }
                 try? await self.receiveRawTransportBytes(chunk)
             }
+            guard triggerDisconnectOnStreamEnd, !Task.isCancelled, let self else { return }
+            await self.handleInboundTransportEOF()
         }
         return continuation
+    }
+
+    private func handleInboundTransportEOF() {
+        guard !isShutDown else { return }
+        // Detach self-reference before shutdown so we do not cancel the task currently executing this method.
+        inboundTransportPumpTask = nil
+        let callback = onTransportDisconnect
+        onTransportDisconnect = nil
+        shutdownWithReason("Guest vsock connection closed (EOF) for VM '\(vmID.rawValue)'.")
+        if let callback {
+            Task {
+                await callback()
+            }
+        }
     }
 
     private func detachFDSourceIfPresent() {

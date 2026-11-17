@@ -2,10 +2,9 @@
 # AgentVM Milestone M2 Workspace Daemon Acceptance Script.
 #
 # Stage 2 implements non-VM Rows 1-9 against the unsigned `.build/debug/AgentVM` binary
-# (or caller-supplied AGENTVM_BIN). Stage 3a + Stage 4 run real-VM Rows 10-16, 22-27, 29, and 32
+# (or caller-supplied AGENTVM_BIN). Stages 3a, 4, and 3b run real-VM Rows 10-16 and 22-34
 # when AGENTVM_REAL_VM=1 and AGENTVM_BIN carries `com.apple.security.virtualization`; rows
-# scheduled for Stage 3b (28, 30, 31, 33, 34), Stage 5 (17), Stage 6 (18-21), or Stages 7-8 (35-39)
-# remain marked "没跑".
+# scheduled for Stage 5 (17), Stage 6 (18-21), or Stages 7-8 (35-39) remain marked "没跑".
 #
 # Hard invariants:
 #   * Never launches the desktop UI (.app, window, or bare executable without a CLI subcommand).
@@ -1942,9 +1941,150 @@ PY
         fail_row 29 "up1_rc=$r29_up1_rc, up2_rc=$r29_up2_rc, extra_vz_count=$r29_extra_vz_count (pids='${r29_extra_vz//$'\n'/,}'), dstatus_rc=$r29_dstatus_rc, status_ok=$r29_status_ok"
     fi
 
-    # Rows 30-31 require Stage 3b SIGKILL crash/reconcile + dmesg verification.
-    unrun_row 30 "守护进程 SIGKILL 断电恢复组（第 30-31 行）在第 3b 段"
-    unrun_row 31 "守护进程 SIGKILL 后 dmesg recovery complete 核对在第 3b 段"
+    # --------------------------------------------------------------
+    # Row 30: `kill -9` workspace daemon while both `t1` and `t2` are running
+    #   Expect: within 30s both VirtualMachine processes exit; `ps --json` reports both
+    #           t1 and t2 as `stopped` without spawning a new daemon; `events --json` has
+    #           1 new `VM_RUNTIME_LOST` for t1 and 1 new `VM_RUNTIME_LOST` for t2.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r30-ps-pre.json" "$TMP_ROOT/r30-ps-pre.err" --lang en --workspace "$WS" ps --json
+    if [[ $LAST_RC -eq 0 ]]; then
+        T2_ID="$(
+            /usr/bin/python3 - "$TMP_ROOT/r30-ps-pre.json" <<'PY'
+import json, sys
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t2 = [v for v in vms if v.get("spec", {}).get("name") == "t2"]
+print(t2[0].get("spec", {}).get("id", "") if len(t2) == 1 else "")
+PY
+        )"
+    fi
+
+    run_cli "$TMP_ROOT/r30-ev-pre.json" "$TMP_ROOT/r30-ev-pre.err" --lang en --workspace "$WS" events --json
+    r30_ev_pre_rc=$LAST_RC
+
+    r30_daemon_pids="$(find_workspace_daemon_pids "$WS")"
+    r30_daemon_count="$(count_lines_nonempty "$r30_daemon_pids")"
+    r30_killed_pid=""
+    if [[ "$r30_daemon_count" == "1" ]] && is_pid_currently_agentvm_bin "$r30_daemon_pids"; then
+        r30_killed_pid="$r30_daemon_pids"
+    fi
+
+    r30_t0="$(now_sec)"
+    if [[ -n "$r30_killed_pid" ]]; then
+        kill -KILL "$r30_killed_pid" 2>/dev/null || true
+        r30_wait=0
+        while (( r30_wait < 50 )); do
+            if ! kill -0 "$r30_killed_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.05
+            r30_wait=$((r30_wait + 1))
+        done
+    fi
+
+    r30_vz_gone=0
+    if [[ -n "$r30_killed_pid" ]] && wait_for_extra_vz_count 0 30; then
+        r30_vz_gone=1
+    fi
+    r30_t1="$(now_sec)"
+    r30_vz_elapsed="$(diff_sec "$r30_t0" "$r30_t1")"
+
+    run_cli "$TMP_ROOT/r30-ps.json" "$TMP_ROOT/r30-ps.err" --lang en --workspace "$WS" ps --json
+    r30_ps_rc=$LAST_RC
+    r30_daemons_after_ps="$(find_workspace_daemon_pids "$WS")"
+    run_cli "$TMP_ROOT/r30-dstatus.out" "$TMP_ROOT/r30-dstatus.err" --lang en --workspace "$WS" daemon status
+    r30_dstatus_rc=$LAST_RC
+
+    r30_ps_stopped_ok=0
+    if [[ $r30_ps_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r30-ps.json" <<'PY' && r30_ps_stopped_ok=1 || r30_ps_stopped_ok=0
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+by_name = {v.get("spec", {}).get("name"): v for v in vms}
+for name in ("t1", "t2"):
+    v = by_name.get(name)
+    if not v:
+        sys.exit(1)
+    tel = v.get("telemetry", {})
+    if tel.get("state") != "stopped" or tel.get("guestAgentConnected") is not False:
+        sys.exit(1)
+PY
+    fi
+
+    run_cli "$TMP_ROOT/r30-ev-post.json" "$TMP_ROOT/r30-ev-post.err" --lang en --workspace "$WS" events --json
+    r30_ev_post_rc=$LAST_RC
+    r30_daemons_after_ev="$(find_workspace_daemon_pids "$WS")"
+
+    r30_lost_ok=0
+    if [[ $r30_ev_pre_rc -eq 0 && $r30_ev_post_rc -eq 0 && -n "$T1_ID" && -n "$T2_ID" ]]; then
+        /usr/bin/python3 - \
+            "$TMP_ROOT/r30-ev-pre.json" \
+            "$TMP_ROOT/r30-ev-post.json" \
+            "$T1_ID" \
+            "$T2_ID" <<'PY' && r30_lost_ok=1 || r30_lost_ok=0
+import json, sys
+
+pre = json.load(open(sys.argv[1], encoding="utf-8"))
+post = json.load(open(sys.argv[2], encoding="utf-8"))
+t1_id = sys.argv[3].strip()
+t2_id = sys.argv[4].strip()
+
+pre_ids = {ev.get("id") for ev in pre if ev.get("id")}
+new_lost = [
+    ev for ev in post
+    if ev.get("id") not in pre_ids and ev.get("code") == "VM_RUNTIME_LOST"
+]
+t1_lost = [ev for ev in new_lost if ev.get("vmID") == t1_id]
+t2_lost = [ev for ev in new_lost if ev.get("vmID") == t2_id]
+if len(t1_lost) != 1 or len(t2_lost) != 1:
+    sys.exit(1)
+PY
+    fi
+
+    if [[ -n "$r30_killed_pid" && $r30_vz_gone -eq 1 \
+        && $r30_ps_stopped_ok -eq 1 && -z "$r30_daemons_after_ps" && -z "$r30_daemons_after_ev" \
+        && $r30_dstatus_rc -eq 3 && $r30_lost_ok -eq 1 ]]; then
+        pass_row 30 "after SIGKILL daemon (pid=$r30_killed_pid): both VirtualMachine processes exited in ${r30_vz_elapsed}s (<30s); ps --json reported t1 & t2 stopped without spawning daemon; events recorded 1 VM_RUNTIME_LOST each for t1 & t2."
+    else
+        fail_row 30 "killed_pid='$r30_killed_pid', vz_gone=$r30_vz_gone (${r30_vz_elapsed}s), ps_stopped=$r30_ps_stopped_ok, daemons_ps='$r30_daemons_after_ps', dstatus_rc=$r30_dstatus_rc, lost_ok=$r30_lost_ok"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 31: Boot `t1` (`up t1`) and run `exec t1 -- dmesg`
+    #   Expect: `up` exits 0; guest `dmesg` contains ext4 `recovery complete`.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r31-up.out" "$TMP_ROOT/r31-up.err" --lang en --workspace "$WS" up t1
+    r31_up_rc=$LAST_RC
+    r31_up_elapsed="$LAST_ELAPSED_SEC"
+
+    run_cli "$TMP_ROOT/r31-dmesg.out" "$TMP_ROOT/r31-dmesg.err" --lang en --workspace "$WS" exec t1 -- dmesg
+    r31_dmesg_rc=$LAST_RC
+
+    r31_recovery_ok=0
+    r31_ext4_summary=""
+    if [[ $r31_up_rc -eq 0 && $r31_dmesg_rc -eq 0 && ! -s "$TMP_ROOT/r31-dmesg.err" ]]; then
+        r31_ext4_summary="$(
+            /usr/bin/python3 - "$TMP_ROOT/r31-dmesg.out" <<'PY'
+import re, sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+ext4_lines = [ln.strip() for ln in text.splitlines() if re.search(r"EXT4-fs|recovery|orphan", ln, re.IGNORECASE)]
+has_recovery = any("recovery complete" in ln.lower() for ln in ext4_lines)
+if not has_recovery:
+    sys.exit(1)
+print(" | ".join(ext4_lines))
+PY
+        )" && r31_recovery_ok=1 || r31_recovery_ok=0
+    fi
+
+    if [[ $r31_up_rc -eq 0 && $r31_dmesg_rc -eq 0 && $r31_recovery_ok -eq 1 ]]; then
+        pass_row 31 "'up t1' (${r31_up_elapsed}s) & 'exec t1 -- dmesg' exited 0; ext4 journal recovery confirmed: [$r31_ext4_summary]."
+    else
+        fail_row 31 "up_rc=$r31_up_rc, dmesg_rc=$r31_dmesg_rc, recovery_ok=$r31_recovery_ok, err='$(cat "$TMP_ROOT/r31-dmesg.err" 2>/dev/null | tr '\n' ' ')'"
+    fi
 
     # --------------------------------------------------------------
     # Row 32: Run `exec t1 -- true` 10 times and `exec t1 -- uname -r` 10 times
@@ -2097,8 +2237,56 @@ PY
         fail_row 33 "up2_rc=$r33_up2_rc, vz_before='$r33_vz_before', stop_rc=$r33_stop_rc, vz_gone=$r33_vz_gone (${r33_stop_elapsed}s), sock_gone=$r33_sock_gone, daemons='$r33_daemons_after', dstatus_rc=$r33_dstatus_rc, events_ok=$r33_events_ok"
     fi
 
-    # Row 34 requires Stage 3b part 2 clean shutdown dmesg verification.
-    unrun_row 34 "daemon stop 后下次开机 dmesg 无 recovery complete 核对在第 3b 段"
+    # --------------------------------------------------------------
+    # Row 34: Boot `t1` again (`up t1`), run `exec t1 -- dmesg`, then `daemon stop`
+    #   Expect: `dmesg` has NO `recovery complete` (proving Row 33 `daemon stop` shut down cleanly).
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r34-up.out" "$TMP_ROOT/r34-up.err" --lang en --workspace "$WS" up t1
+    r34_up_rc=$LAST_RC
+    r34_up_elapsed="$LAST_ELAPSED_SEC"
+
+    run_cli "$TMP_ROOT/r34-dmesg.out" "$TMP_ROOT/r34-dmesg.err" --lang en --workspace "$WS" exec t1 -- dmesg
+    r34_dmesg_rc=$LAST_RC
+
+    r34_clean_dmesg_ok=0
+    r34_ext4_summary=""
+    if [[ $r34_up_rc -eq 0 && $r34_dmesg_rc -eq 0 && ! -s "$TMP_ROOT/r34-dmesg.err" ]]; then
+        r34_ext4_summary="$(
+            /usr/bin/python3 - "$TMP_ROOT/r34-dmesg.out" <<'PY'
+import re, sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+if not text.strip():
+    sys.exit(1)
+if "recovery complete" in text.lower():
+    sys.exit(1)
+ext4_lines = [ln.strip() for ln in text.splitlines() if re.search(r"EXT4-fs|recovery|orphan", ln, re.IGNORECASE)]
+if not ext4_lines:
+    sys.exit(1)
+print(" | ".join(ext4_lines))
+PY
+        )" && r34_clean_dmesg_ok=1 || r34_clean_dmesg_ok=0
+    fi
+
+    run_cli "$TMP_ROOT/r34-stop.out" "$TMP_ROOT/r34-stop.err" --lang en --workspace "$WS" daemon stop
+    r34_stop_rc=$LAST_RC
+    r34_vz_gone=0
+    if wait_for_extra_vz_count 0 60; then
+        r34_vz_gone=1
+    fi
+    r34_sock_gone=0
+    if [[ ! -e "$WS/run/daemon.sock" ]]; then
+        r34_sock_gone=1
+    fi
+    r34_daemons_after="$(find_workspace_daemon_pids "$WS")"
+
+    if [[ $r34_up_rc -eq 0 && $r34_dmesg_rc -eq 0 && $r34_clean_dmesg_ok -eq 1 \
+        && $r34_stop_rc -eq 0 && $r34_vz_gone -eq 1 && $r34_sock_gone -eq 1 && -z "$r34_daemons_after" ]]; then
+        pass_row 34 "'up t1' (${r34_up_elapsed}s), 'exec t1 -- dmesg' confirmed zero 'recovery complete' [$r34_ext4_summary], and 'daemon stop' exited 0 cleanly."
+    else
+        fail_row 34 "up_rc=$r34_up_rc, dmesg_rc=$r34_dmesg_rc, clean_dmesg=$r34_clean_dmesg_ok, stop_rc=$r34_stop_rc, vz_gone=$r34_vz_gone, sock_gone=$r34_sock_gone, daemons='$r34_daemons_after'"
+    fi
 
     unrun_row 35 "待第 7 段 milestone 2 收尾脚本串联执行"
     unrun_row 36 "待第 7 段更新 m1-real-boot.sh 第 17 行后执行"

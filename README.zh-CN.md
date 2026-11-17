@@ -1,10 +1,10 @@
 **[English](README.md)** | **简体中文**
 
-# AgentVM `v1.3.0`
+# AgentVM `v1.4.0`
 
 > **当前状态（M2 — 工作区常驻守护进程与客户机实时遥测）**：APFS 写时复制（`clonefile(2)`）稀疏磁盘与离线快照血统管理、SQLite WAL 工作区持久化、纯 Swift NoCloud `cidata` ISO-9660 镜像生成以及 `JavaScriptCore` 策略沙盒现已在本地可用。以太网/IPv4/DNS/TLS 报文拆解和 `.pcapng` 读写目前只是库层面的能力（`AgentVMNetSwitch`，有单元测试覆盖）；命令行和桌面界面都还没有打开抓包文件的入口。`agentvm image pull debian-12-bookworm-arm64` 会下载固定版本的 Debian 12 arm64 云镜像并校验 SHA-512；`agentvm run <vm> -- <命令>` 用 `VZVirtualMachine` 执行一次性命令并关机；M2 新增每个工作区一个后台常驻守护进程（`daemon start|status|stop`、`events`），跨独立命令行进程持有运行中的 `VZVirtualMachine`，使 `up`、`exec`（多路并发 `AF_VSOCK` 输出/退出码回传，新建虚拟机支持 `SIGINT`/`SIGTERM` 取消；标准输入固定为 `/dev/null`）、`pause`、`resume`、`halt` 操作真实客户机，并在 `ps` 中汇报客户机 `/proc` 实时 CPU、内存与运行时长心跳。启动虚拟机需要带 `com.apple.security.virtualization` 权限的二进制，直接 `swift build` 编出来的没有。运行中虚拟机的快照、分叉、回滚在 M3 之前拒绝执行；桌面界面与 MCP 服务通过读库展示状态和遥测，在 M4 之前拒绝改动守护进程持有的机器；客户机网络走系统 NAT，用户态出站防火墙拦截与实时抓包排在 M5。
 
-[![Version](https://img.shields.io/badge/version-v1.3.0-D97724)](https://github.com/zxu756/AgentVM/releases)
+[![Version](https://img.shields.io/badge/version-v1.4.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
 [![Swift](https://img.shields.io/badge/Swift-6.0%20Strict%20Concurrency-D97724)](https://swift.org)
 [![Bilingual](https://img.shields.io/badge/界面语言-中文%20%7C%20EN-2A9D6F)](README.md)
@@ -15,7 +15,7 @@
 默认情况下，启动桌面应用或初始化 `.agentvm` 工作区均显示干净的空状态（0 台虚拟机、0 条数据包、0 条告警），绝不伪造客户机执行结果或遥测数值：
 
 - `create` 会创建一块带 GPT 分区表的空稀疏磁盘与一张 NoCloud `cidata` ISO-9660 配置盘。不带 `--image` 时磁盘内没有客户机操作系统；带 `--image debian-12-bookworm-arm64` 时，根磁盘是缓存镜像的克隆。
-- 对空磁盘或未运行的虚拟机执行 `agentvm up <vm>`、`agentvm exec <vm> -- ...` 会以非零退出码返回明确错误，不会静默回退到模拟器或把状态标为 `running`（`up` 预检失败时也不会拉起守护进程）；对空磁盘执行 `agentvm run` 退出码为 125。
+- 对空磁盘执行 `agentvm up <vm>`，或对空磁盘、未运行的虚拟机执行 `agentvm exec <vm> -- ...`，会以非零退出码返回明确错误，不会静默回退到模拟器或把状态标为 `running`（`up` 预检失败时也不会拉起守护进程）。对装有系统、已停止的虚拟机执行 `agentvm up` 会开机。对空磁盘执行 `agentvm run` 退出码为 125。
 - 每个工作区至多运行一个后台守护进程（`<工作区>/run/daemon.sock`，由 `up` 或 `daemon start` 按需通过双 fork + `setsid` 启动，不注册 `launchd`）。注销 macOS 会话或重启宿主机后**不保证**虚拟机仍在运行；守护进程退出或被强杀后虚拟机会退出，后续读取会把残留的 `running` 对账回 `stopped`（记录 `VM_RUNTIME_LOST`）。
 - 客户机守护脚本（`agentvm-guestd.py` v2）仅在新建虚拟机首次开机时经 `cloud-init` 写入。M2 之前创建的虚拟机仍运行旧版 `1.0.0` 脚本：`SIGINT`/`SIGTERM` 取消 `exec` 对旧脚本启动的客户机子进程无效，且旧心跳不含 CPU 采样，`ps` 的 CPU 列显示 `—`（从 `--image debian-12-bookworm-arm64` 重新创建即可获得 v2 脚本）。
 - 主机侧协议与会话模拟仅在显式传入 `--backend simulation` 时启用，或在桌面端显式传入 `--demo` / 点击「载入演示」（带 `[演示数据]` 标记）时载入。模拟运行的每一种输出都带标记：文本逐行加 `SIMULATED:` 前缀，`ps --json` 和 MCP `agentvm_list_fleet` 的记录里有 `"simulated": true`，`export-hcl` 多一行 `# SIMULATED:` 注释，导出的 `.pcapng` 和 HTML 文件内部也写有标记。

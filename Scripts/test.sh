@@ -19,11 +19,11 @@ Usage:
 
   milestone <N> writes the acceptance logs to a temporary directory and leaves the working tree untouched.
   Pass --record to copy them into reports/ (the committed evidence the README refers to).
-  milestone 1 requires AGENTVM_REAL_VM=1; without it, the real-VM portion is reported unrun and exits non-zero.
+  milestone 1 and milestone 2 require AGENTVM_REAL_VM=1 for real-VM rows; without it, real-VM rows are reported unrun and exit 2.
   No mode of this script launches the desktop UI.
 
 Environment:
-  AGENTVM_REAL_VM=1      enable real Virtualization.framework guest VM acceptance (m1-real-boot.sh)
+  AGENTVM_REAL_VM=1      enable real Virtualization.framework guest VM acceptance (m1-real-boot.sh, m2-daemon.sh)
   AGENTVM_BUILD_JOBS=N   pass `-j N` to swift build / swift test
 
 Modules:
@@ -48,14 +48,17 @@ map_module_to_filters() {
             echo "ModelsAndBinaryPrimitivesTests"
             echo "BilingualLocalizationTests"
             echo "CLIAndMCPDaemonStage4Tests"
+            echo "CLIAndMCPDaemonStage6Tests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
             echo "CLIAndMCPDaemonStage3aTests"
             echo "CLIAndMCPDaemonStage4Tests"
+            echo "CLIAndMCPDaemonStage6Tests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"
+            echo "CLIAndMCPDaemonStage5Tests"
             ;;
         AgentVMNetSwitch|NetSwitch)
             echo "NetSwitchDissectorAndPCAPTests"
@@ -65,6 +68,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage3bTests"
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage5Tests"
+            echo "CLIAndMCPDaemonStage6Tests"
             ;;
         AgentVMPluginHost|PluginHost)
             echo "PluginSandboxAndIACTests"
@@ -76,6 +80,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage3bTests"
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage5Tests"
+            echo "CLIAndMCPDaemonStage6Tests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -87,6 +92,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage3bTests"
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage5Tests"
+            echo "CLIAndMCPDaemonStage6Tests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -103,6 +109,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage3bTests"
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage5Tests"
+            echo "CLIAndMCPDaemonStage6Tests"
             echo "StudioViewsHonestyTests"
             ;;
         *)
@@ -250,8 +257,71 @@ run_milestone() {
                 echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
             fi
             ;;
-        2|3|4|5|6)
-            echo "SKIPPED: Milestone M${m} acceptance script is scheduled for M${m} (current branch is M1)."
+        2)
+            echo "==> [AgentVM] Milestone M2: touched module unit scopes"
+            run_scope \
+                AgentVMModels \
+                AgentVMStore \
+                AgentVMStorageCoW \
+                AgentVMVsockRPC \
+                AgentVMPluginHost \
+                AgentVMHypervisor \
+                AgentVMCLIAndMCP \
+                AgentVMWorkbenchShell \
+                AgentVM
+
+            local log_dir
+            log_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentvm-m2-logs.XXXXXX")"
+            echo "==> [AgentVM] Milestone M2: m0-acceptance.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/m0-acceptance.sh" "$log_dir/m0-acceptance.txt"
+            echo "==> [AgentVM] Milestone M2: readme-commands.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/readme-commands.sh" "$log_dir/readme-commands.txt"
+
+            echo "==> [AgentVM] Milestone M2: m2-daemon.sh"
+            if [[ ! -x "$ROOT_DIR/Scripts/acceptance/m2-daemon.sh" ]]; then
+                echo "ERROR: $ROOT_DIR/Scripts/acceptance/m2-daemon.sh not found or not executable" >&2
+                exit 1
+            fi
+            set +e
+            "$ROOT_DIR/Scripts/acceptance/m2-daemon.sh" 2>&1 | tee "$log_dir/m2-daemon.txt"
+            local m2_rc=${PIPESTATUS[0]}
+            set -e
+
+            if [[ "${AGENTVM_REAL_VM:-}" != "1" ]]; then
+                if [[ $m2_rc -ne 0 && $m2_rc -ne 2 ]]; then
+                    echo "ERROR: m2-daemon.sh failed (exit $m2_rc); log kept at $log_dir/m2-daemon.txt" >&2
+                    exit "$m2_rc"
+                fi
+                echo "UNRUN: Milestone M2 real-VM rows in m2-daemon.sh and m1-real-boot.sh did not run because AGENTVM_REAL_VM=1 is not set; milestone 2 exits 2 (logs at $log_dir)." >&2
+                exit 2
+            fi
+
+            if [[ $m2_rc -ne 0 && $m2_rc -ne 2 ]]; then
+                echo "ERROR: m2-daemon.sh failed (exit $m2_rc); log kept at $log_dir/m2-daemon.txt" >&2
+                exit "$m2_rc"
+            fi
+            if grep -qE '没跑 \[Row ([1-9]|[12][0-9]|3[0-467])\]' "$log_dir/m2-daemon.txt"; then
+                echo "ERROR: m2-daemon.sh left mandatory rows (1-34, 36, or 37) unrun despite AGENTVM_REAL_VM=1; log kept at $log_dir/m2-daemon.txt" >&2
+                exit 2
+            fi
+
+            echo "==> [AgentVM] Milestone M2: m1-real-boot.sh (regression guard)"
+            run_logged "$ROOT_DIR/Scripts/acceptance/m1-real-boot.sh" "$log_dir/m1-real-boot.txt"
+
+            if [[ $record -eq 1 ]]; then
+                mkdir -p "$ROOT_DIR/reports"
+                cp "$log_dir/m0-acceptance.txt" "$ROOT_DIR/reports/m0-acceptance.txt"
+                cp "$log_dir/readme-commands.txt" "$ROOT_DIR/reports/readme-commands.txt"
+                cp "$log_dir/m2-daemon.txt" "$ROOT_DIR/reports/m2-daemon.txt"
+                cp "$log_dir/m1-real-boot.txt" "$ROOT_DIR/reports/m1-real-boot.txt"
+                rm -rf "$log_dir"
+                echo "==> [AgentVM] Recorded reports/m0-acceptance.txt, reports/readme-commands.txt, reports/m2-daemon.txt, and reports/m1-real-boot.txt"
+            else
+                echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
+            fi
+            ;;
+        3|4|5|6)
+            echo "SKIPPED: Milestone M${m} acceptance script is scheduled for M${m} (current branch is M2)."
             exit 1
             ;;
         *)

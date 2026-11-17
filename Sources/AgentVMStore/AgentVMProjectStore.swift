@@ -136,6 +136,16 @@ public actor AgentVMProjectStore {
         self.db = try SQLiteWALDatabase(fileURL: dbURL, runMigrations: true)
     }
 
+    public func databaseJournalAndBusyTimeout() throws -> (journalMode: String, busyTimeoutMilliseconds: Int64) {
+        let jmRow = try db.queryOne("PRAGMA journal_mode;")
+        let btRow = try db.queryOne("PRAGMA busy_timeout;")
+        let jmCol = jmRow?.columnNames.first ?? "journal_mode"
+        let btCol = btRow?.columnNames.first ?? "timeout"
+        let jm = (try jmRow?.optionalString(jmCol)) ?? ""
+        let bt = (try btRow?.optionalInt64(btCol)) ?? 0
+        return (jm, bt)
+    }
+
     // MARK: - Project Manifest Persistence
 
     public func loadManifest() throws -> AgentVMProjectManifest {

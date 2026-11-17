@@ -839,6 +839,326 @@ struct CLIAndMCPDaemonStage3aTests {
             ).exitCode == 0)
         }
     }
+
+    // MARK: - Item 7 (Hypothesis 12): Two OS Processes, Separate AgentVMProjectStore Instances, 5s Telemetry Writes vs 20 `ps` Reads Over 30s
+
+    @Test("Item 7 (Hypothesis 12): two separate OS processes each open AgentVMProjectStore — one writes telemetry every 5s and the other runs 20 'ps' read paths over 30s with zero SQLITE_BUSY")
+    func hypothesis12TwoProcessesConcurrentTelemetryWritesAndPsReadsNoSQLiteBusy() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s3a-h12")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+
+        let wsURL = URL(fileURLWithPath: "\(realBase)/H12Concurrent.agentvm", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+
+        let setupCoordinator = try AgentVMFleetCoordinator(
+            bundleURL: wsURL,
+            executionBackend: .strictHardwareVZ
+        )
+        let t1Created = try await setupCoordinator.createSandboxVM(name: "t1", diskVirtualBytes: 16 * 1024 * 1024)
+        _ = try await setupCoordinator.createSandboxVM(name: "t2", diskVirtualBytes: 16 * 1024 * 1024)
+        let t1ID = t1Created.vmRecord.id
+
+        // Process 1 (`getpid()`) opens its own dedicated AgentVMProjectStore and holds t1's execution lock
+        // so Process 2's `ps` read path (`listVMsForReporting`) observes a live running hardware VM.
+        let writerStore = try AgentVMProjectStore(bundleURL: wsURL, createIfMissing: false)
+        let dbConfig = try await writerStore.databaseJournalAndBusyTimeout()
+        #expect(dbConfig.journalMode.lowercased() == "wal")
+        #expect(dbConfig.busyTimeoutMilliseconds >= 5_000)
+
+        let lockURL = wsURL.appendingPathComponent("locks/\(t1ID.rawValue).lock", isDirectory: false)
+        let t1Lock = try VMExecutionLock.acquire(at: lockURL, vmName: "t1")
+        defer { t1Lock.release() }
+
+        var seedRecord = try #require(try await writerStore.fetchVM(t1ID))
+        seedRecord.telemetry.state = .running
+        seedRecord.telemetry.simulated = false
+        seedRecord.telemetry.guestAgentConnected = true
+        seedRecord.telemetry.hasLiveGuestTelemetry = true
+        seedRecord.telemetry.uptimeSeconds = 0
+        seedRecord.telemetry.sampledAt = Date()
+        try await writerStore.upsertVM(seedRecord)
+
+        // Process 2 (`childProc.processIdentifier != getpid()`) runs `AgentVM --lang en --workspace <ws> mcp`
+        // (headless stdio, zero GUI, zero network), opening its own single AgentVMProjectStore for the entire 30s window.
+        let agentVMBinaryURL = try Self.locateBuiltAgentVMExecutable()
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        let childProc = Process()
+        childProc.executableURL = agentVMBinaryURL
+        childProc.arguments = ["--lang", "en", "--workspace", wsURL.path, "mcp"]
+        childProc.environment = [
+            "HOME": isolatedHome,
+            "CFFIXED_USER_HOME": isolatedHome,
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"
+        ]
+        childProc.standardInput = stdinPipe
+        childProc.standardOutput = stdoutPipe
+        childProc.standardError = stderrPipe
+        try childProc.run()
+        let childPID = childProc.processIdentifier
+        #expect(childPID > 0 && childPID != Darwin.getpid())
+
+        defer {
+            try? stdinPipe.fileHandleForWriting.close()
+            if childProc.isRunning {
+                childProc.terminate()
+                childProc.waitUntilExit()
+            }
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+        }
+
+        let startNs = DispatchTime.now().uptimeNanoseconds
+
+        // Task A (Process 1): write telemetry every 5 seconds across 30 seconds (t = 0, 5, 10, 15, 20, 25, 30s -> 7 writes).
+        let writerTask = Task<Stage3aH12WriterSummary, Never> {
+            var completedWrites = 0
+            var sqliteBusyCount = 0
+            var failureMessages: [String] = []
+
+            for tick in 0...6 {
+                let targetOffsetNs = UInt64(tick) * 5_000_000_000
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                let targetNs = startNs &+ targetOffsetNs
+                if targetNs > nowNs {
+                    try? await Task.sleep(nanoseconds: targetNs - nowNs)
+                }
+
+                do {
+                    if var rec = try await writerStore.fetchVM(t1ID) {
+                        rec.telemetry.state = .running
+                        rec.telemetry.simulated = false
+                        rec.telemetry.guestAgentConnected = true
+                        rec.telemetry.hasLiveGuestTelemetry = true
+                        rec.telemetry.uptimeSeconds = Double((tick + 1) * 5)
+                        rec.telemetry.cpuUsagePercent = Double(12 + tick * 6)
+                        rec.telemetry.memoryResidentMB = UInt64(512 + tick * 32)
+                        rec.telemetry.sampledAt = Date()
+                        try await writerStore.upsertVM(rec)
+                        completedWrites += 1
+                    } else {
+                        failureMessages.append("tick \(tick): fetchVM returned nil")
+                    }
+                } catch let err as AgentVMError {
+                    if case let .storageDatabaseError(code, _, detail) = err, code == 5 {
+                        sqliteBusyCount += 1
+                        failureMessages.append("tick \(tick): SQLITE_BUSY (\(detail))")
+                    } else {
+                        failureMessages.append("tick \(tick): \(err.errorCode) \(err.localizedDescription)")
+                    }
+                } catch {
+                    failureMessages.append("tick \(tick): \(error.localizedDescription)")
+                }
+            }
+
+            return Stage3aH12WriterSummary(
+                completedWrites: completedWrites,
+                sqliteBusyCount: sqliteBusyCount,
+                failureMessages: failureMessages
+            )
+        }
+
+        // Task B (Process 2): execute 20 `ps` read-path calls (`agentvm_list_fleet` -> `listVMsForReporting`)
+        // across the 30-second window, deliberately aligning bursts on the 5s write ticks!
+        let readScheduleSeconds: [Double] = [
+            0.0, 1.5, 3.0,
+            5.0, 5.01, 7.5,
+            10.0, 10.01, 12.5,
+            15.0, 15.01, 17.5,
+            20.0, 20.01, 22.5,
+            25.0, 25.01, 27.5,
+            29.99, 30.0
+        ]
+        #expect(readScheduleSeconds.count == 20)
+
+        let stdinFD = stdinPipe.fileHandleForWriting.fileDescriptor
+        let stdoutFD = stdoutPipe.fileHandleForReading.fileDescriptor
+
+        let readerTask = Task.detached(priority: .userInitiated) { () -> Stage3aH12ReaderSummary in
+            let lineReader = Stage3aFDLineReader(fd: stdoutFD)
+            let fleetDecoder = JSONDecoder()
+            fleetDecoder.dateDecodingStrategy = .iso8601
+
+            var completedReads = 0
+            var sqliteBusyCount = 0
+            var distinctUptimes = Set<Int>()
+            var failureMessages: [String] = []
+
+            for (idx, scheduledSec) in readScheduleSeconds.enumerated() {
+                let targetOffsetNs = UInt64(scheduledSec * 1_000_000_000.0)
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                let targetNs = startNs &+ targetOffsetNs
+                if targetNs > nowNs {
+                    try? await Task.sleep(nanoseconds: targetNs - nowNs)
+                }
+
+                let reqID = idx + 1
+                let reqLine = "{\"jsonrpc\":\"2.0\",\"id\":\(reqID),\"method\":\"tools/call\",\"params\":{\"name\":\"agentvm_list_fleet\",\"arguments\":{}}}\n"
+                guard Stage3aFDLineReader.writeAll(fd: stdinFD, data: Data(reqLine.utf8)) else {
+                    failureMessages.append("read #\(reqID): failed writing MCP request to Process 2 stdin")
+                    break
+                }
+
+                guard let respLine = lineReader.readLine() else {
+                    failureMessages.append("read #\(reqID): unexpected EOF from Process 2 stdout")
+                    break
+                }
+
+                guard let respObj = (try? JSONSerialization.jsonObject(with: Data(respLine.utf8))) as? [String: Any],
+                      let resultObj = respObj["result"] as? [String: Any],
+                      let contentArr = resultObj["content"] as? [[String: Any]] else {
+                    failureMessages.append("read #\(reqID): malformed JSON-RPC response: \(respLine)")
+                    continue
+                }
+
+                let isError = (resultObj["isError"] as? Bool) ?? false
+                let combinedText = contentArr.compactMap { $0["text"] as? String }.joined(separator: "\n")
+                if isError {
+                    if combinedText.contains("SQLite error (5)")
+                        || combinedText.localizedCaseInsensitiveContains("database is locked")
+                        || combinedText.localizedCaseInsensitiveContains("SQLITE_BUSY") {
+                        sqliteBusyCount += 1
+                    }
+                    failureMessages.append("read #\(reqID): \(combinedText)")
+                    continue
+                }
+
+                do {
+                    let decodedVMs = try fleetDecoder.decode([VMInstanceRecord].self, from: Data(combinedText.utf8))
+                    if let t1 = decodedVMs.first(where: { $0.id == t1ID }),
+                       decodedVMs.count == 2,
+                       t1.telemetry.state == .running {
+                        completedReads += 1
+                        distinctUptimes.insert(Int(t1.telemetry.uptimeSeconds.rounded()))
+                    } else {
+                        failureMessages.append("read #\(reqID): unexpected fleet snapshot count=\(decodedVMs.count)")
+                    }
+                } catch {
+                    failureMessages.append("read #\(reqID): fleet JSON decode failed: \(error.localizedDescription)")
+                }
+            }
+
+            return Stage3aH12ReaderSummary(
+                completedReads: completedReads,
+                sqliteBusyCount: sqliteBusyCount,
+                distinctObservedUptimeCount: distinctUptimes.count,
+                failureMessages: failureMessages
+            )
+        }
+
+        let writerSummary = await writerTask.value
+        let readerSummary = await readerTask.value
+        let elapsedSeconds = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000_000.0
+
+        try? stdinPipe.fileHandleForWriting.close()
+        childProc.waitUntilExit()
+        #expect(childProc.terminationStatus == 0)
+
+        #expect(elapsedSeconds >= 29.9, "Expected 30s Hypothesis 12 window, elapsed=\(elapsedSeconds)s")
+        #expect(writerSummary.sqliteBusyCount == 0, "Writer SQLITE_BUSY errors: \(writerSummary.failureMessages)")
+        #expect(readerSummary.sqliteBusyCount == 0, "Reader SQLITE_BUSY errors: \(readerSummary.failureMessages)")
+        #expect(writerSummary.failureMessages.isEmpty, "Writer failures: \(writerSummary.failureMessages)")
+        #expect(readerSummary.failureMessages.isEmpty, "Reader failures: \(readerSummary.failureMessages)")
+        #expect(writerSummary.completedWrites == 7)
+        #expect(readerSummary.completedReads == 20)
+        #expect(readerSummary.distinctObservedUptimeCount >= 5, "Reader observed \(readerSummary.distinctObservedUptimeCount) distinct telemetry commits across processes")
+    }
+
+    private static func locateBuiltAgentVMExecutable() throws -> URL {
+        let bundleDir = Bundle(for: Stage3aBundleLocatorToken.self).bundleURL.deletingLastPathComponent()
+        let sibling = bundleDir.appendingPathComponent("AgentVM", isDirectory: false)
+        if FileManager.default.isExecutableFile(atPath: sibling.path) {
+            return sibling
+        }
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let fallbacks = [
+            repoRoot.appendingPathComponent(".build/out/Products/Debug/AgentVM"),
+            repoRoot.appendingPathComponent(".build/arm64-apple-macosx/debug/AgentVM"),
+            repoRoot.appendingPathComponent(".build/debug/AgentVM")
+        ]
+        for candidate in fallbacks where FileManager.default.isExecutableFile(atPath: candidate.path) {
+            return candidate
+        }
+        throw NSError(
+            domain: "CLIAndMCPDaemonStage3aTests",
+            code: 404,
+            userInfo: [NSLocalizedDescriptionKey: "Unable to locate built AgentVM binary next to test bundle at \(bundleDir.path)."]
+        )
+    }
+}
+
+private final class Stage3aBundleLocatorToken {}
+
+private struct Stage3aH12WriterSummary: Sendable {
+    var completedWrites: Int
+    var sqliteBusyCount: Int
+    var failureMessages: [String]
+}
+
+private struct Stage3aH12ReaderSummary: Sendable {
+    var completedReads: Int
+    var sqliteBusyCount: Int
+    var distinctObservedUptimeCount: Int
+    var failureMessages: [String]
+}
+
+private final class Stage3aFDLineReader {
+    private let fd: Int32
+    private var buffer = Data()
+
+    init(fd: Int32) {
+        self.fd = fd
+    }
+
+    func readLine() -> String? {
+        let newline = UInt8(ascii: "\n")
+        var chunk = [UInt8](repeating: 0, count: 65_536)
+        while true {
+            if let nlIndex = buffer.firstIndex(of: newline) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<nlIndex)
+                buffer.removeSubrange(buffer.startIndex...nlIndex)
+                return String(decoding: lineData, as: UTF8.self)
+            }
+            let n = Darwin.read(fd, &chunk, chunk.count)
+            if n > 0 {
+                buffer.append(contentsOf: chunk.prefix(n))
+            } else if n < 0 && Darwin.errno == EINTR {
+                continue
+            } else {
+                if buffer.isEmpty {
+                    return nil
+                }
+                let remaining = buffer
+                buffer.removeAll()
+                return String(decoding: remaining, as: UTF8.self)
+            }
+        }
+    }
+
+    static func writeAll(fd: Int32, data: Data) -> Bool {
+        data.withUnsafeBytes { rawBuf in
+            guard let base = rawBuf.baseAddress else { return true }
+            var offset = 0
+            while offset < rawBuf.count {
+                let n = Darwin.write(fd, base.advanced(by: offset), rawBuf.count - offset)
+                if n > 0 {
+                    offset += n
+                } else if n < 0 && Darwin.errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
+    }
 }
 
 // MARK: - Deterministic Mock Hardware Backend for Stage 3a Tests

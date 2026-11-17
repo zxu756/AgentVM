@@ -50,6 +50,7 @@ map_module_to_filters() {
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
+            echo "CLIAndMCPDaemonStage3aTests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"

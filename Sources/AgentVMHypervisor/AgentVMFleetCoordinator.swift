@@ -802,6 +802,39 @@ public actor AgentVMFleetCoordinator {
         heldExecutionLocks[vmID] != nil || activeOneShotLocks.contains(vmID)
     }
 
+    private func rejectIfLockedByAnotherOwnerForLineage(
+        vmID: VMID,
+        vmName: String,
+        operation: String
+    ) throws {
+        guard !ownsExecutionLock(for: vmID) else { return }
+        if let holderPID = VMExecutionLock.readLiveHolderPID(at: lockFileURL(for: vmID)) {
+            throw AgentVMError.vmLockedForDeferredMilestone(
+                vmName: vmName,
+                holderPID: holderPID,
+                reason: .liveSnapshotBranchRestoreScheduledForM3(operation: operation)
+            )
+        }
+    }
+
+    private func rejectIfLockedByAnotherOwnerForLifecycleOrExec(
+        vmID: VMID,
+        vmName: String,
+        operation: String
+    ) throws {
+        guard !isSimulationBackend, !ownsExecutionLock(for: vmID) else { return }
+        if let holderPID = VMExecutionLock.readLiveHolderPID(at: lockFileURL(for: vmID)) {
+            if isWorkspaceDaemon {
+                throw AgentVMError.vmBusy(vmName: vmName, holderPID: holderPID)
+            }
+            throw AgentVMError.vmLockedForDeferredMilestone(
+                vmName: vmName,
+                holderPID: holderPID,
+                reason: .mcpAndStudioDaemonClientScheduledForM4(operation: operation)
+            )
+        }
+    }
+
     /// Serializes lifecycle transitions (`up`, `halt`, `pause`, `resume`) per `vmID` so at most one transition
     /// executes on a given VM at a time (Fixes A38).
     private func enqueueVMLifecycleOperation<T: Sendable>(
@@ -1375,6 +1408,14 @@ public actor AgentVMFleetCoordinator {
         if isSimulationBackend || isWorkspaceDaemon {
             return try await bootVM(vmID, onProgress: onProgress)
         }
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        try rejectIfLockedByAnotherOwnerForLifecycleOrExec(
+            vmID: vmID,
+            vmName: existing.spec.name,
+            operation: "up"
+        )
         let record = try await loadVMForOperation(vmID)
         try verifyBootableGuestSystem(for: record.spec)
         throw AgentVMError.persistentBootRequiresDaemon(vmName: record.spec.name)
@@ -1386,6 +1427,16 @@ public actor AgentVMFleetCoordinator {
         acquireExecutionLock: Bool,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> VMInstanceRecord {
+        if !isSimulationBackend && acquireExecutionLock {
+            guard let existing = try await store.fetchVM(vmID) else {
+                throw AgentVMError.vmNotFound(vmID)
+            }
+            try rejectIfLockedByAnotherOwnerForLifecycleOrExec(
+                vmID: vmID,
+                vmName: existing.spec.name,
+                operation: "up"
+            )
+        }
         var record = try await loadVMForOperation(vmID)
         if isSimulationBackend {
             if record.telemetry.state == .running {
@@ -1731,6 +1782,14 @@ public actor AgentVMFleetCoordinator {
         reason: String,
         language: AppLanguage
     ) async throws -> VMInstanceRecord {
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        try rejectIfLockedByAnotherOwnerForLifecycleOrExec(
+            vmID: vmID,
+            vmName: existing.spec.name,
+            operation: "pause"
+        )
         var record = try await loadVMForOperation(vmID)
         if !isSimulationBackend,
            record.telemetry.state == .running,
@@ -1787,6 +1846,14 @@ public actor AgentVMFleetCoordinator {
         _ vmID: VMID,
         language: AppLanguage
     ) async throws -> VMInstanceRecord {
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        try rejectIfLockedByAnotherOwnerForLifecycleOrExec(
+            vmID: vmID,
+            vmName: existing.spec.name,
+            operation: "resume"
+        )
         var record = try await loadVMForOperation(vmID)
         if !isSimulationBackend,
            record.telemetry.state == .running,
@@ -1855,6 +1922,14 @@ public actor AgentVMFleetCoordinator {
         language: AppLanguage = .en,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> VMInstanceRecord {
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        try rejectIfLockedByAnotherOwnerForLifecycleOrExec(
+            vmID: vmID,
+            vmName: existing.spec.name,
+            operation: "halt"
+        )
         var record = try await loadVMForOperation(vmID)
         if !isSimulationBackend,
            record.telemetry.state == .running,
@@ -1906,6 +1981,14 @@ public actor AgentVMFleetCoordinator {
         isPinned: Bool = false,
         triggerCommand: String? = nil
     ) async throws -> SnapshotNode {
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        try rejectIfLockedByAnotherOwnerForLineage(
+            vmID: vmID,
+            vmName: existing.spec.name,
+            operation: "snapshot"
+        )
         var record = try await loadVMForOperation(vmID)
         guard let bootDisk = record.spec.blockDevices.first else {
             throw AgentVMError.diskImageOperationFailed(
@@ -1997,6 +2080,14 @@ public actor AgentVMFleetCoordinator {
         bootImmediately: Bool = true
     ) async throws -> CoWBranchForkResult {
         let startNs = DispatchTime.now().uptimeNanoseconds
+        guard let existingParent = try await store.fetchVM(parentVMID) else {
+            throw AgentVMError.vmNotFound(parentVMID)
+        }
+        try rejectIfLockedByAnotherOwnerForLineage(
+            vmID: parentVMID,
+            vmName: existingParent.spec.name,
+            operation: "branch"
+        )
         let parentRecord = try await loadVMForOperation(parentVMID)
         try await rejectDuplicateVMName(branchName)
         guard let parentDisk = parentRecord.spec.blockDevices.first else {
@@ -2134,6 +2225,14 @@ public actor AgentVMFleetCoordinator {
         guard let snap = try await store.fetchSnapshot(snapshotID) else {
             throw AgentVMError.snapshotNotFound(snapshotID)
         }
+        guard let existing = try await store.fetchVM(snap.vmID) else {
+            throw AgentVMError.vmNotFound(snap.vmID)
+        }
+        try rejectIfLockedByAnotherOwnerForLineage(
+            vmID: snap.vmID,
+            vmName: existing.spec.name,
+            operation: "restore"
+        )
         var record = try await loadVMForOperation(snap.vmID)
 
         let wasRunning = (record.telemetry.state == .running)
@@ -2170,6 +2269,14 @@ public actor AgentVMFleetCoordinator {
     // MARK: - Guarded Guest Command Execution & Network Packet Processing
 
     public func executeInGuest(vmID: VMID, request: GuestExecRequest) async throws -> GuestExecResult {
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        try rejectIfLockedByAnotherOwnerForLifecycleOrExec(
+            vmID: vmID,
+            vmName: existing.spec.name,
+            operation: "exec"
+        )
         var record = try await loadVMForOperation(vmID)
         if record.telemetry.state != .running {
             _ = try await bootPersistentVM(vmID)

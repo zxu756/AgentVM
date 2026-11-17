@@ -293,6 +293,12 @@ public enum BaseImageErrorReason: Sendable, Equatable {
     case checksumMismatch(expectedSHA512: String, actualSHA512: String)
 }
 
+/// Structured milestone-deferred reason when another process holds a VM's `VMExecutionLock` (Fixes A39).
+public enum VMLockedDeferredMilestoneReason: Sendable, Equatable {
+    case liveSnapshotBranchRestoreScheduledForM3(operation: String)
+    case mcpAndStudioDaemonClientScheduledForM4(operation: String)
+}
+
 public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case virtualizationUnsupported(reason: String)
     case virtualizationEntitlementMissing
@@ -301,6 +307,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case diskSizeTooSmallForImage(imageID: String, requestedBytes: UInt64, imageBytes: UInt64)
     case vmNameAlreadyExists(name: String, existingID: VMID)
     case vmBusy(vmName: String, holderPID: Int32?)
+    case vmLockedForDeferredMilestone(vmName: String, holderPID: Int32?, reason: VMLockedDeferredMilestoneReason)
     case runUnsupportedInSimulation(vmName: String)
     case persistentBootRequiresDaemon(vmName: String)
     case airgapPolicyUnsupportedBeforeM5(vmName: String)
@@ -356,7 +363,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             }
         case .diskSizeTooSmallForImage: return "ERR_DISK_SIZE_TOO_SMALL"
         case .vmNameAlreadyExists: return "ERR_VM_NAME_EXISTS"
-        case .vmBusy: return "ERR_VM_LOCKED"
+        case .vmBusy, .vmLockedForDeferredMilestone: return "ERR_VM_LOCKED"
         case .runUnsupportedInSimulation: return "ERR_RUN_SIMULATION_UNSUPPORTED"
         case .persistentBootRequiresDaemon: return "ERR_DAEMON_REQUIRED"
         case .airgapPolicyUnsupportedBeforeM5: return "ERR_AIRGAP_UNSUPPORTED"
@@ -467,6 +474,19 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "虚拟机「\(vmName)」正被另一进程占用；同一时刻只能有一个进程使用同一台虚拟机。"
                 : "VM '\(vmName)' is currently in use by another process; only one process may use a VM at a time."
+        case let .vmLockedForDeferredMilestone(vmName, holderPID, reason):
+            let holderEn = holderPID.map { "process \($0)" } ?? "another process"
+            let holderZh = holderPID.map { "进程 \($0)" } ?? "另一进程"
+            switch reason {
+            case let .liveSnapshotBranchRestoreScheduledForM3(operation):
+                return isZh
+                    ? "虚拟机「\(vmName)」正由\(holderZh)持有运行中，无法执行「\(operation)」；运行中的快照、分叉与回滚安排在 M3 实现。请先执行 'agentvm halt \(vmName)' 停机后再操作。"
+                    : "VM '\(vmName)' is currently held running by \(holderEn); cannot perform '\(operation)' while running because live snapshot, branch, and restore are scheduled for M3. Run 'agentvm halt \(vmName)' first."
+            case let .mcpAndStudioDaemonClientScheduledForM4(operation):
+                return isZh
+                    ? "虚拟机「\(vmName)」正由\(holderZh)（工作区守护进程）持有，当前进程无法直接执行「\(operation)」；MCP 与桌面界面接入守护进程安排在 M4 实现。请改用命令行 'agentvm \(operation) \(vmName)' 操作。"
+                    : "VM '\(vmName)' is currently held by \(holderEn) (workspace daemon) and cannot perform '\(operation)' directly from this process; MCP and Studio UI daemon integration is scheduled for M4. Use the CLI ('agentvm \(operation) \(vmName)') instead."
+            }
         case let .runUnsupportedInSimulation(vmName):
             return isZh
                 ? "'agentvm run' 仅支持在真实虚拟机上执行命令，不支持 --backend simulation（未启动虚拟机「\(vmName)」，未执行任何操作）。"
@@ -609,6 +629,13 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return "Run 'agentvm ps' to list existing virtual machines."
         case .vmBusy:
             return "Wait for the process currently using this VM to finish, or create a separate VM."
+        case let .vmLockedForDeferredMilestone(vmName, _, reason):
+            switch reason {
+            case .liveSnapshotBranchRestoreScheduledForM3:
+                return "Run 'agentvm halt \(vmName)' first; live snapshot, branch, and restore on running VMs are scheduled for M3."
+            case let .mcpAndStudioDaemonClientScheduledForM4(operation):
+                return "Use the CLI ('agentvm \(operation) \(vmName)') while MCP and Studio UI daemon integration is scheduled for M4."
+            }
         case .runUnsupportedInSimulation:
             return "Omit '--backend simulation' to run on a real hardware VM."
         case let .persistentBootRequiresDaemon(vmName):

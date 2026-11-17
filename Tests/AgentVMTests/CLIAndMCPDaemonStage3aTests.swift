@@ -663,6 +663,182 @@ struct CLIAndMCPDaemonStage3aTests {
             _ = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t1"], curatedEntriesOverride: [entry], environment: env, daemonSpawnOverride: forbiddenSpawn)
         }
     }
+
+    // MARK: - Item 5 (A39): Cross-Process Lock Protection (`snapshot`/`branch`/`restore` -> M3, MCP & UI Coordinator `up`/`halt`/`pause`/`resume`/`exec` -> M4)
+
+    @Test("Item 5 (A39): when VM lock is held by daemon, CLI/MCP snapshot/branch/restore fail exit 1 ERR_VM_LOCKED (M3, disk inode untouched), and non-daemon coordinator & MCP up/halt/pause/resume/exec fail ERR_VM_LOCKED (M4)")
+    func crossProcessLockProtectsSnapshotBranchRestoreM3AndMCPAndCoordinatorLifecycleExecM4_A39() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s3a-i5")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+
+        let (cacheDir, cachedURL, entry) = try await stageBootableCachedImage(in: realBase)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let wsURL = URL(fileURLWithPath: "\(realBase)/A39Protect.agentvm", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = [
+            "HOME": isolatedHome,
+            "CFFIXED_USER_HOME": isolatedHome,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+        let forbiddenSpawn = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exit 96"],
+            environment: env
+        )
+
+        #expect(await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "create", "t1", "--image", entry.id],
+            curatedEntriesOverride: [entry],
+            environment: env
+        ).exitCode == 0)
+
+        let inspectStore = try AgentVMProjectStore(bundleURL: wsURL, createIfMissing: false)
+        let createdRecord = try #require(try await inspectStore.listVMs().first(where: { $0.spec.name == "t1" }))
+        let vmID = createdRecord.id
+        let baseSnapID = try #require(createdRecord.currentHeadSnapshotID)
+        let rootDiskPath = try #require(createdRecord.spec.blockDevices.first?.imagePath)
+        var diskStatBefore = Darwin.stat()
+        #expect(stat(rootDiskPath, &diskStatBefore) == 0)
+
+        let mockBackend = Stage3aMockHardwareBackend()
+        defer { mockBackend.closeAllDescriptors() }
+
+        try await withStartedDaemonServer(
+            workspaceURL: wsURL,
+            imageCacheDirectoryURL: cacheDir,
+            curatedImageEntries: [entry],
+            hardwareBackendOverride: mockBackend
+        ) { _ in
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+
+            // 1. CLI `snapshot`, `branch`, `restore` while daemon holds lock -> exit 1, ERR_VM_LOCKED, mentions M3 (EN & ZH).
+            for lang in ["en", "zh"] {
+                let snapRes = await cli.execute(
+                    arguments: ["--lang", lang, "--workspace", wsURL.path, "snapshot", "t1", "live-attempt"],
+                    curatedEntriesOverride: [entry],
+                    environment: env
+                )
+                #expect(snapRes.exitCode == 1, "snapshot (\(lang)) exited \(snapRes.exitCode): \(snapRes.stderr)")
+                #expect(snapRes.stderr.contains("ERR_VM_LOCKED"))
+                #expect(snapRes.stderr.contains("M3"))
+
+                let branchRes = await cli.execute(
+                    arguments: ["--lang", lang, "--workspace", wsURL.path, "branch", "t1", "t1-child", "--no-boot"],
+                    curatedEntriesOverride: [entry],
+                    environment: env
+                )
+                #expect(branchRes.exitCode == 1, "branch (\(lang)) exited \(branchRes.exitCode): \(branchRes.stderr)")
+                #expect(branchRes.stderr.contains("ERR_VM_LOCKED"))
+                #expect(branchRes.stderr.contains("M3"))
+
+                let restoreRes = await cli.execute(
+                    arguments: ["--lang", lang, "--workspace", wsURL.path, "restore", baseSnapID.rawValue],
+                    curatedEntriesOverride: [entry],
+                    environment: env
+                )
+                #expect(restoreRes.exitCode == 1, "restore (\(lang)) exited \(restoreRes.exitCode): \(restoreRes.stderr)")
+                #expect(restoreRes.stderr.contains("ERR_VM_LOCKED"))
+                #expect(restoreRes.stderr.contains("M3"))
+            }
+
+            // Root disk inode and persisted running state must remain untouched!
+            var diskStatAfter = Darwin.stat()
+            #expect(stat(rootDiskPath, &diskStatAfter) == 0)
+            #expect(diskStatAfter.st_ino == diskStatBefore.st_ino)
+            let dbRecAfterCLI = try #require(try await inspectStore.fetchVM(vmID))
+            #expect(dbRecAfterCLI.telemetry.state == .running)
+
+            // 2. Separate non-daemon AgentVMFleetCoordinator (used by Studio UI & MCP, no GUI started):
+            //    `bootPersistentVM` (up), `haltVM` (halt), `pauseVM` (pause), `resumeVM` (resume), `executeInGuest` (exec)
+            //    must ALL fail with ERR_VM_LOCKED and explain M4 in both EN and ZH without altering SQLite state!
+            let externalCoordinator = try AgentVMFleetCoordinator(
+                bundleURL: wsURL,
+                executionBackend: .strictHardwareVZ,
+                imageCacheDirectoryURL: cacheDir,
+                curatedImageEntries: [entry]
+            )
+
+            let uiLifecycleChecks: [(String, () async throws -> Void)] = [
+                ("up", { _ = try await externalCoordinator.bootPersistentVM(vmID) }),
+                ("halt", { _ = try await externalCoordinator.haltVM(vmID) }),
+                ("pause", { _ = try await externalCoordinator.pauseVM(vmID) }),
+                ("resume", { _ = try await externalCoordinator.resumeVM(vmID) }),
+                ("exec", { _ = try await externalCoordinator.executeInGuest(vmID: vmID, request: GuestExecRequest(executable: "true")) })
+            ]
+            for (opName, call) in uiLifecycleChecks {
+                var caught: AgentVMError?
+                do {
+                    try await call()
+                } catch let err as AgentVMError {
+                    caught = err
+                }
+                let err = try #require(caught, "Expected non-daemon coordinator '\(opName)' to throw ERR_VM_LOCKED")
+                #expect(err.errorCode == "ERR_VM_LOCKED")
+                #expect(err.localizedMessage(in: .en).contains("M4"))
+                #expect(err.localizedMessage(in: .zhHans).contains("M4"))
+            }
+
+            // Verify external coordinator did NOT overwrite daemon's `running` state in SQLite!
+            let dbRecAfterCoord = try #require(try await inspectStore.fetchVM(vmID))
+            #expect(dbRecAfterCoord.telemetry.state == .running)
+
+            // 3. MCP JSON-RPC server (`AgentVMMCPServer`) rejects snapshot/branch/restore (M3) and exec (M4) with ERR_VM_LOCKED.
+            let mcp = AgentVMMCPServer(coordinator: externalCoordinator)
+            let mcpCalls: [(String, [String: Any], String)] = [
+                ("agentvm_capture_snapshot", ["vmID": vmID.rawValue, "title": "mcp-snap"], "M3"),
+                ("agentvm_fork_cow_branch", ["parentVMID": vmID.rawValue, "branchName": "mcp-child", "bootImmediately": false], "M3"),
+                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue], "M3"),
+                ("agentvm_exec_command", ["vmID": vmID.rawValue, "executable": "uname", "arguments": ["-r"]], "M4")
+            ]
+            for (idx, item) in mcpCalls.enumerated() {
+                let reqObj: [String: Any] = [
+                    "jsonrpc": "2.0",
+                    "id": idx + 1,
+                    "method": "tools/call",
+                    "params": [
+                        "name": item.0,
+                        "arguments": item.1
+                    ]
+                ]
+                let reqLine = String(decoding: try JSONSerialization.data(withJSONObject: reqObj), as: UTF8.self)
+                let respLine = try #require(await mcp.handleJSONRPCLine(reqLine))
+                let respObj = try #require(try JSONSerialization.jsonObject(with: Data(respLine.utf8)) as? [String: Any])
+                let resultObj = try #require(respObj["result"] as? [String: Any])
+                #expect((resultObj["isError"] as? Bool) == true, "Expected MCP \(item.0) to return isError=true")
+                let contentArr = try #require(resultObj["content"] as? [[String: Any]])
+                let text = contentArr.compactMap { $0["text"] as? String }.joined(separator: "\n")
+                #expect(text.contains("ERR_VM_LOCKED"), "MCP \(item.0) missing ERR_VM_LOCKED: \(text)")
+                #expect(text.contains(item.2), "MCP \(item.0) missing \(item.2): \(text)")
+            }
+
+            // Daemon still holds `t1` in `running` state and halts it cleanly.
+            let psCheck = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "ps", "--json"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(psCheck.exitCode == 0)
+            #expect(psCheck.stdout.contains("\"state\" : \"running\""))
+
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+        }
+    }
 }
 
 // MARK: - Deterministic Mock Hardware Backend for Stage 3a Tests

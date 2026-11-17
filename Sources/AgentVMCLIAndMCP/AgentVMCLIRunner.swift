@@ -786,6 +786,13 @@ public struct AgentVMCLIRunner: Sendable {
                     hintLine = "提示：请去掉 '--backend simulation' 在真实虚拟机上运行。"
                 } else if case .vmBusy = err {
                     hintLine = "提示：请等待当前正在使用该虚拟机的进程结束，或创建另一台虚拟机。"
+                } else if case let .vmLockedForDeferredMilestone(vmName, _, reason) = err {
+                    switch reason {
+                    case .liveSnapshotBranchRestoreScheduledForM3:
+                        hintLine = "提示：请先运行 'agentvm halt \(vmName)' 停机；运行中的快照、分叉与回滚将在 M3 支持。"
+                    case let .mcpAndStudioDaemonClientScheduledForM4(operation):
+                        hintLine = "提示：请改用命令行 'agentvm \(operation) \(vmName)'；MCP 与界面接入守护进程将在 M4 支持。"
+                    }
                 } else {
                     hintLine = "提示：查看审计日志抽屉或运行 'agentvm doctor' 进行环境自检。"
                 }

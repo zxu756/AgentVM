@@ -22,12 +22,167 @@ struct CLIAndMCPDaemonStage2Tests {
         return DaemonSocketAddressResolver.canonicalRealPath(of: URL(fileURLWithPath: raw, isDirectory: true))
     }
 
+    private static func sweepDarwinUserTempSymlinks(pointingUnder basePath: String) {
+        guard let darwinTempDir = try? DaemonSocketAddressResolver.darwinUserTempDirectoryURL() else {
+            return
+        }
+        let canonicalBase = DaemonSocketAddressResolver.canonicalRealPath(
+            of: URL(fileURLWithPath: basePath, isDirectory: true)
+        )
+        var prefixes = [canonicalBase]
+        if canonicalBase.hasPrefix("/private/tmp/") {
+            prefixes.append(String(canonicalBase.dropFirst("/private".count)))
+        } else if canonicalBase.hasPrefix("/tmp/") {
+            prefixes.append("/private" + canonicalBase)
+        }
+        let uniquePrefixes = Array(Set(prefixes))
+
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: darwinTempDir.path) else {
+            return
+        }
+        for name in names where name.hasPrefix("avm-") {
+            let linkPath = darwinTempDir.appendingPathComponent(name, isDirectory: false).path
+            var st = Darwin.stat()
+            guard Darwin.lstat(linkPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK else {
+                continue
+            }
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let len = Darwin.readlink(linkPath, &buf, Int(PATH_MAX))
+            guard len > 0 else { continue }
+            let rawTarget = String(decoding: buf.prefix(len).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            let resolvedTarget: String
+            if rawTarget.hasPrefix("/") {
+                resolvedTarget = DaemonSocketAddressResolver.canonicalRealPath(
+                    of: URL(fileURLWithPath: rawTarget, isDirectory: true)
+                )
+            } else {
+                resolvedTarget = DaemonSocketAddressResolver.canonicalRealPath(
+                    of: darwinTempDir.appendingPathComponent(rawTarget, isDirectory: true)
+                )
+            }
+            let matches = uniquePrefixes.contains { prefix in
+                rawTarget == prefix
+                    || rawTarget.hasPrefix(prefix + "/")
+                    || resolvedTarget == prefix
+                    || resolvedTarget.hasPrefix(prefix + "/")
+            }
+            if matches {
+                _ = Darwin.unlink(linkPath)
+            }
+        }
+    }
+
+    private static func forceCleanupWorkspaceDaemon(
+        workspaceURL: URL,
+        trackedPIDs: [pid_t] = [],
+        pidFilePaths: [String] = []
+    ) {
+        let paths = DaemonWorkspacePaths(workspaceURL: workspaceURL)
+        let lockHolderBefore = DaemonSingletonLock.readHolderInfo(at: paths.lockFileURL)?.pid
+
+        _ = try? DaemonClient.stopDaemon(
+            workspaceURL: paths.workspaceURL,
+            language: .en,
+            waitTimeoutSeconds: 2.0
+        )
+
+        var pids: Set<pid_t> = []
+        let selfPID = Darwin.getpid()
+        for p in trackedPIDs where p > 0 && p != selfPID {
+            pids.insert(p)
+        }
+        if let lockPID = lockHolderBefore, lockPID > 0 && lockPID != selfPID {
+            pids.insert(lockPID)
+        }
+        if let lockPIDAfter = DaemonSingletonLock.readHolderInfo(at: paths.lockFileURL)?.pid,
+           lockPIDAfter > 0 && lockPIDAfter != selfPID {
+            pids.insert(lockPIDAfter)
+        }
+        for filePath in pidFilePaths {
+            if let raw = try? String(contentsOfFile: filePath, encoding: .utf8),
+               let parsed = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+               parsed > 0 && parsed != selfPID {
+                pids.insert(parsed)
+            }
+        }
+
+        for p in pids {
+            _ = Darwin.kill(p, SIGTERM)
+            let deadline = DispatchTime.now().uptimeNanoseconds &+ 3_000_000_000
+            while DispatchTime.now().uptimeNanoseconds < deadline {
+                var reapSt: Int32 = 0
+                _ = Darwin.waitpid(p, &reapSt, WNOHANG)
+                if Darwin.kill(p, 0) != 0 && Darwin.errno == ESRCH {
+                    break
+                }
+                Darwin.usleep(20_000)
+            }
+            if Darwin.kill(p, 0) == 0 {
+                _ = Darwin.kill(p, SIGKILL)
+                var reapSt: Int32 = 0
+                _ = Darwin.waitpid(p, &reapSt, 0)
+            }
+        }
+
+        _ = Darwin.unlink(paths.directSocketPath)
+        if let plan = try? DaemonSocketAddressResolver.computePlan(for: paths.workspaceURL) {
+            DaemonSocketAddressResolver.removeSymlinkIfPresent(for: plan)
+        }
+    }
+
+    private func withStartedDaemonServer<T>(
+        workspaceURL: URL,
+        semanticVersion: SemanticVersion = .current,
+        onShutdownAllMachines: (@Sendable () async -> Void)? = nil,
+        _ body: (WorkspaceDaemonServer) async throws -> T
+    ) async throws -> T {
+        let outcome = try await WorkspaceDaemonServer.start(
+            workspaceURL: workspaceURL,
+            semanticVersion: semanticVersion,
+            onShutdownAllMachines: onShutdownAllMachines
+        )
+        guard case let .started(server) = outcome else {
+            Issue.record("Expected WorkspaceDaemonServer.start to win singleton lock for \(workspaceURL.path)")
+            throw NSError(domain: "CLIAndMCPDaemonStage2Tests", code: 1)
+        }
+        defer {
+            server.listener.close(unlinkSocket: true, removeSymlink: true)
+            server.singletonLock.release(clearFile: true)
+            server.logManager.close()
+        }
+        do {
+            let result = try await body(server)
+            await server.stopAndCleanup()
+            return result
+        } catch {
+            await server.stopAndCleanup()
+            throw error
+        }
+    }
+
+    private func withDetachedDaemonCleanupScope<T>(
+        workspaceURL: URL,
+        pidFilePaths: [String] = [],
+        _ body: (Stage2PIDTracker) async throws -> T
+    ) async throws -> T {
+        let tracker = Stage2PIDTracker()
+        defer {
+            Self.forceCleanupWorkspaceDaemon(
+                workspaceURL: workspaceURL,
+                trackedPIDs: tracker.snapshot(),
+                pidFilePaths: pidFilePaths
+            )
+        }
+        return try await body(tracker)
+    }
+
     // MARK: - Item 0: Canonical Real Path Socket Length Check (`/private/tmp` Existence Independence)
 
     @Test("Item 0: /private/tmp workspace where stripped path <= 103B and canonical /private/tmp path > 103B resolves identical symlink address before and after daemon.sock exists")
     func privateTmpSocketLengthUsesCanonicalRealPathConsistentlyBeforeAndAfterBind() throws {
         let realBase = try makePrivateTmpDirectory(prefix: "avm-p0")
         defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
         #expect(realBase.hasPrefix("/private/tmp/"))
 
         let suffix = "/ws.agentvm/run/daemon.sock"
@@ -86,8 +241,10 @@ struct CLIAndMCPDaemonStage2Tests {
             acceptedSem.signal()
         }
         let clientConn = try DaemonSocketClient.connectWorkspace(workspaceURL: privateWSURL)
+        defer { clientConn.close() }
         acceptedSem.wait()
         let serverConn = try #require(acceptedBox.load()).get()
+        defer { serverConn.close() }
         clientConn.close()
         serverConn.close()
         server.shutdownAndCleanup()
@@ -227,7 +384,9 @@ struct CLIAndMCPDaemonStage2Tests {
     func daemonServerStartupOrderStatusStopSignalsAndVersionMismatch() async throws {
         let realBase = try makePrivateTmpDirectory(prefix: "avm-d1")
         defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
         let wsURL = URL(fileURLWithPath: "\(realBase)/Daemon1.agentvm", isDirectory: true)
+        defer { Self.forceCleanupWorkspaceDaemon(workspaceURL: wsURL) }
         let cli = AgentVMCLIRunner()
         let isolatedHome = "\(realBase)/home"
         try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
@@ -289,120 +448,94 @@ struct CLIAndMCPDaemonStage2Tests {
         #expect(FileManager.default.fileExists(atPath: paths.directSocketPath))
 
         let shutdownHookBox = Stage2AtomicFlag()
-        let startOutcome = try await WorkspaceDaemonServer.start(
+        try await withStartedDaemonServer(
             workspaceURL: wsURL,
             onShutdownAllMachines: {
                 shutdownHookBox.set()
             }
-        )
-        guard case let .started(server) = startOutcome else {
-            Issue.record("Expected WorkspaceDaemonServer.start to win singleton lock")
-            return
+        ) { server in
+            #expect(server.recordedStartupSteps == ["lock", "unlink", "reconcile", "bind", "ready"])
+
+            // Verify daemon.log contains `ready` line and VM_RUNTIME_LOST was recorded before bind.
+            let logText = try String(contentsOf: paths.daemonLogFileURL, encoding: .utf8)
+            #expect(logText.contains("ready"))
+            let diagEvents = try await seedCoord.store.listDiagnostics(vmID: crashedVM.id, limit: 20)
+            #expect(diagEvents.filter { $0.code == "VM_RUNTIME_LOST" }.count == 1)
+
+            // Second contender starting on same workspace loses lock cleanly (.alreadyRunning).
+            let secondStart = try await WorkspaceDaemonServer.start(workspaceURL: wsURL)
+            if case .started(let unexpected) = secondStart {
+                await unexpected.stopAndCleanup()
+                Issue.record("Second WorkspaceDaemonServer must report alreadyRunning")
+            }
+
+            // 4. `daemon status` and `daemon status --json` exit 0 and report live daemon metadata.
+            let liveStatusText = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status"],
+                environment: env
+            )
+            #expect(liveStatusText.exitCode == 0)
+            #expect(liveStatusText.stdout.contains("\(Darwin.getpid())"))
+
+            let liveStatusJSON = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status", "--json"],
+                environment: env
+            )
+            #expect(liveStatusJSON.exitCode == 0)
+            let liveObj = try #require(
+                try JSONSerialization.jsonObject(with: Data(liveStatusJSON.stdout.utf8)) as? [String: Any]
+            )
+            #expect(liveObj["running"] as? Bool == true)
+            #expect((liveObj["pid"] as? Int) == Int(Darwin.getpid()))
+
+            // 5. `daemon stop` invokes the "shut down all machines" hook, removes socket, clears lock, and exits 0.
+            let stopLive = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "stop", "--json"],
+                environment: env
+            )
+            #expect(stopLive.exitCode == 0)
+            await server.waitUntilStopped()
+            #expect(shutdownHookBox.isSet() == true)
+            #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
         }
-        defer {
-            Task { await server.stopAndCleanup() }
-        }
-
-        #expect(server.recordedStartupSteps == ["lock", "unlink", "reconcile", "bind", "ready"])
-
-        // Verify daemon.log contains `ready` line and VM_RUNTIME_LOST was recorded before bind.
-        let logText = try String(contentsOf: paths.daemonLogFileURL, encoding: .utf8)
-        #expect(logText.contains("ready"))
-        let diagEvents = try await seedCoord.store.listDiagnostics(vmID: crashedVM.id, limit: 20)
-        #expect(diagEvents.filter { $0.code == "VM_RUNTIME_LOST" }.count == 1)
-
-        // Second contender starting on same workspace loses lock cleanly (.alreadyRunning).
-        let secondStart = try await WorkspaceDaemonServer.start(workspaceURL: wsURL)
-        if case .started(let unexpected) = secondStart {
-            await unexpected.stopAndCleanup()
-            Issue.record("Second WorkspaceDaemonServer must report alreadyRunning")
-        }
-
-        // 4. `daemon status` and `daemon status --json` exit 0 and report live daemon metadata.
-        let liveStatusText = await cli.execute(
-            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status"],
-            environment: env
-        )
-        #expect(liveStatusText.exitCode == 0)
-        #expect(liveStatusText.stdout.contains("\(Darwin.getpid())"))
-
-        let liveStatusJSON = await cli.execute(
-            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status", "--json"],
-            environment: env
-        )
-        #expect(liveStatusJSON.exitCode == 0)
-        let liveObj = try #require(
-            try JSONSerialization.jsonObject(with: Data(liveStatusJSON.stdout.utf8)) as? [String: Any]
-        )
-        #expect(liveObj["running"] as? Bool == true)
-        #expect((liveObj["pid"] as? Int) == Int(Darwin.getpid()))
-
-        // 5. `daemon stop` invokes the "shut down all machines" hook, removes socket, clears lock, and exits 0.
-        let stopLive = await cli.execute(
-            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "stop", "--json"],
-            environment: env
-        )
-        #expect(stopLive.exitCode == 0)
-        await server.waitUntilStopped()
-        #expect(shutdownHookBox.isSet() == true)
-        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
 
         // 6. Start a daemon advertising an older SemanticVersion (1.2.0) -> client `daemon status` fails with
         //    ERR_DAEMON_VERSION_MISMATCH hinting `agentvm daemon stop`, and SIGTERM stops it cleanly.
         let sigtermHookBox = Stage2AtomicFlag()
-        guard case let .started(oldVerServer) = try await WorkspaceDaemonServer.start(
+        try await withStartedDaemonServer(
             workspaceURL: wsURL,
             semanticVersion: SemanticVersion(major: 1, minor: 2, patch: 0),
             onShutdownAllMachines: {
                 sigtermHookBox.set()
             }
-        ) else {
-            Issue.record("Expected second daemon server to start after stop")
-            return
+        ) { oldVerServer in
+            let mismatchEn = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status"],
+                environment: env
+            )
+            #expect(mismatchEn.exitCode == 1)
+            #expect(mismatchEn.stderr.contains("ERR_DAEMON_VERSION_MISMATCH"))
+            #expect(mismatchEn.stderr.contains("agentvm daemon stop"))
+
+            let mismatchZh = await cli.execute(
+                arguments: ["--lang", "zh", "--workspace", wsURL.path, "daemon", "status"],
+                environment: env
+            )
+            #expect(mismatchZh.exitCode == 1)
+            #expect(mismatchZh.stderr.contains("ERR_DAEMON_VERSION_MISMATCH"))
+            #expect(mismatchZh.stderr.contains("agentvm daemon stop"))
+
+            // Deliver SIGTERM handler -> executes same graceful stop as `daemon stop`.
+            await oldVerServer.handleTerminationSignal(SIGTERM)
+            await oldVerServer.waitUntilStopped()
+            #expect(sigtermHookBox.isSet() == true)
+            #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
         }
-        defer {
-            Task { await oldVerServer.stopAndCleanup() }
-        }
-
-        let mismatchEn = await cli.execute(
-            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status"],
-            environment: env
-        )
-        #expect(mismatchEn.exitCode == 1)
-        #expect(mismatchEn.stderr.contains("ERR_DAEMON_VERSION_MISMATCH"))
-        #expect(mismatchEn.stderr.contains("agentvm daemon stop"))
-
-        let mismatchZh = await cli.execute(
-            arguments: ["--lang", "zh", "--workspace", wsURL.path, "daemon", "status"],
-            environment: env
-        )
-        #expect(mismatchZh.exitCode == 1)
-        #expect(mismatchZh.stderr.contains("ERR_DAEMON_VERSION_MISMATCH"))
-        #expect(mismatchZh.stderr.contains("agentvm daemon stop"))
-
-        // Deliver SIGTERM handler -> executes same graceful stop as `daemon stop`.
-        await oldVerServer.handleTerminationSignal(SIGTERM)
-        await oldVerServer.waitUntilStopped()
-        #expect(sigtermHookBox.isSet() == true)
-        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
     }
 
     // MARK: - Item 2: Detached `posix_spawn` Launcher, `daemon start`, Contender Exit 0, Crash Tail & `up` Preflight
 
-    @Test("Item 2a: DaemonProcessLauncher & 'daemon start' spawn detached session leader (SETSID, CLOEXEC, fd 0/1/2), handle exit-0 contender race, report 20-line daemon.log tail on non-zero exit, and stop cleanly")
-    func daemonStartDetachedPosixSpawnContenderRaceFailureLogTailAndTeardown() async throws {
-        let realBase = try makePrivateTmpDirectory(prefix: "avm-d2a")
-        defer { try? FileManager.default.removeItem(atPath: realBase) }
-        let isolatedHome = "\(realBase)/home"
-        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
-        let env = ["HOME": isolatedHome, "CFFIXED_USER_HOME": isolatedHome]
-        let cli = AgentVMCLIRunner()
-
-        // 1. Offline Python helper speaking the exact single-line DaemonRPC hello + status + stop protocol
-        //    so `swift test` exercises real `posix_spawn` (`SETSID | CLOEXEC_DEFAULT`, fd 0/1/2) without needing
-        //    a pre-built `.build/debug/AgentVM` binary.
-        let helperScriptPath = "\(realBase)/mock_daemon_rpc.py"
-        let pidFilePath = "\(realBase)/mock.pid"
+    private func writeMockDaemonPythonScript(to scriptPath: String) throws {
         let verMajor = SemanticVersion.current.major
         let verMinor = SemanticVersion.current.minor
         let verPatch = SemanticVersion.current.patch
@@ -412,6 +545,9 @@ struct CLIAndMCPDaemonStage2Tests {
 
         ws = sys.argv[1]
         pid_file = sys.argv[2]
+        connect_sock_override = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else ""
+        symlink_override = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else ""
+
         run_dir = os.path.join(ws, "run")
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
         os.chmod(run_dir, 0o700)
@@ -439,19 +575,29 @@ struct CLIAndMCPDaemonStage2Tests {
         os.ftruncate(lock_fd, 0)
         os.write(lock_fd, (json.dumps(holder) + "\\n").encode("utf-8"))
 
-        sock_path = os.path.join(run_dir, "daemon.sock")
+        phys_sock_path = os.path.join(run_dir, "daemon.sock")
         try:
-            os.unlink(sock_path)
+            os.unlink(phys_sock_path)
         except FileNotFoundError:
             pass
 
+        if symlink_override:
+            try:
+                if os.path.islink(symlink_override) and os.readlink(symlink_override) == run_dir:
+                    pass
+                else:
+                    os.symlink(run_dir, symlink_override)
+            except FileExistsError:
+                pass
+
+        bind_sock_path = connect_sock_override if connect_sock_override else phys_sock_path
+
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.settimeout(10.0)
-        srv.bind(sock_path)
-        os.chmod(sock_path, 0o600)
+        srv.bind(bind_sock_path)
+        os.chmod(phys_sock_path, 0o600)
         srv.listen(16)
 
-        # Record open fds so test can verify POSIX_SPAWN_CLOEXEC_DEFAULT closed leaked parent descriptors
         open_fds = []
         for candidate in range(0, 64):
             try:
@@ -516,7 +662,7 @@ struct CLIAndMCPDaemonStage2Tests {
                             "pid": pid,
                             "protocolVersion": \(currentProto),
                             "semanticVersion": ver_obj,
-                            "socketPath": sock_path,
+                            "socketPath": bind_sock_path,
                             "startedAt": started_at,
                             "vms": [],
                             "workspacePath": ws
@@ -530,9 +676,14 @@ struct CLIAndMCPDaemonStage2Tests {
                     except OSError:
                         pass
                     try:
-                        os.unlink(sock_path)
+                        os.unlink(phys_sock_path)
                     except FileNotFoundError:
                         pass
+                    if symlink_override:
+                        try:
+                            os.unlink(symlink_override)
+                        except FileNotFoundError:
+                            pass
                     resp = {
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -542,13 +693,36 @@ struct CLIAndMCPDaemonStage2Tests {
                     break
 
         try:
-            os.unlink(sock_path)
+            os.unlink(phys_sock_path)
         except FileNotFoundError:
             pass
+        if symlink_override:
+            try:
+                os.unlink(symlink_override)
+            except FileNotFoundError:
+                pass
         os.ftruncate(lock_fd, 0)
         os.close(lock_fd)
         """
-        try Data(pySource.utf8).write(to: URL(fileURLWithPath: helperScriptPath))
+        try Data(pySource.utf8).write(to: URL(fileURLWithPath: scriptPath))
+    }
+
+    @Test("Item 2a: DaemonProcessLauncher & 'daemon start' spawn detached session leader (SETSID, CLOEXEC, fd 0/1/2), handle exit-0 contender race, report 20-line daemon.log tail on non-zero exit, and stop cleanly")
+    func daemonStartDetachedPosixSpawnContenderRaceFailureLogTailAndTeardown() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-d2a")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = ["HOME": isolatedHome, "CFFIXED_USER_HOME": isolatedHome]
+        let cli = AgentVMCLIRunner()
+
+        // 1. Offline Python helper speaking the exact single-line DaemonRPC hello + status + stop protocol
+        //    so `swift test` exercises real `posix_spawn` (`SETSID | CLOEXEC_DEFAULT`, fd 0/1/2) without needing
+        //    a pre-built `.build/debug/AgentVM` binary.
+        let helperScriptPath = "\(realBase)/mock_daemon_rpc.py"
+        let pidFilePath = "\(realBase)/mock.pid"
+        try writeMockDaemonPythonScript(to: helperScriptPath)
 
         // Open an extra pipe in the parent WITHOUT O_CLOEXEC to prove POSIX_SPAWN_CLOEXEC_DEFAULT prevents inheritance!
         var extraPipe: [Int32] = [-1, -1]
@@ -566,84 +740,60 @@ struct CLIAndMCPDaemonStage2Tests {
             environment: env
         )
 
-        var spawnedPIDToCleanup: pid_t = 0
-        defer {
-            var pids: Set<pid_t> = []
-            if spawnedPIDToCleanup > 0 {
-                pids.insert(spawnedPIDToCleanup)
+        try await withDetachedDaemonCleanupScope(workspaceURL: ws1, pidFilePaths: [pidFilePath]) { tracker in
+            let start1 = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", ws1.path, "daemon", "start", "--json"],
+                environment: env,
+                daemonSpawnOverride: pySpawnOverride
+            )
+            #expect(start1.exitCode == 0, "daemon start failed: \(start1.stderr)")
+            let start1Obj = try #require(
+                try JSONSerialization.jsonObject(with: Data(start1.stdout.utf8)) as? [String: Any]
+            )
+            let childPID = pid_t(try #require(start1Obj["pid"] as? Int))
+            tracker.record(childPID)
+            #expect(childPID > 0 && childPID != Darwin.getpid())
+
+            // Verify SETSID made the child its own process group / session leader (`pgid == pid`).
+            #expect(Darwin.getpgid(childPID) == childPID)
+
+            // Close parent's write end of `extraPipe` while child is still alive: immediate EOF (0 bytes) on
+            // non-blocking `extraPipe[0]` proves `POSIX_SPAWN_CLOEXEC_DEFAULT` prevented inheritance.
+            _ = Darwin.close(extraPipe[1])
+            extraPipe[1] = -1
+            let pipeFlags = Darwin.fcntl(extraPipe[0], F_GETFL)
+            if pipeFlags >= 0 {
+                _ = Darwin.fcntl(extraPipe[0], F_SETFL, pipeFlags | O_NONBLOCK)
             }
-            if let raw = try? String(contentsOfFile: pidFilePath, encoding: .utf8),
-               let parsed = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-               parsed > 0 {
-                pids.insert(parsed)
-            }
-            for p in pids {
-                _ = Darwin.kill(p, SIGTERM)
-                let deadline = DispatchTime.now().uptimeNanoseconds &+ 3_000_000_000
-                while DispatchTime.now().uptimeNanoseconds < deadline {
-                    var reapSt: Int32 = 0
-                    _ = Darwin.waitpid(p, &reapSt, WNOHANG)
-                    if Darwin.kill(p, 0) != 0 && Darwin.errno == ESRCH {
-                        break
-                    }
-                    Darwin.usleep(20_000)
-                }
-                if Darwin.kill(p, 0) == 0 {
-                    _ = Darwin.kill(p, SIGKILL)
-                    var reapSt: Int32 = 0
-                    _ = Darwin.waitpid(p, &reapSt, 0)
-                }
-            }
+            var eofByte: UInt8 = 0
+            let pipeReadRC = Darwin.read(extraPipe[0], &eofByte, 1)
+            #expect(pipeReadRC == 0)
+
+            // Verify daemon.log received child stdout.
+            let ws1Log = try String(contentsOf: ws1Paths.daemonLogFileURL, encoding: .utf8)
+            #expect(ws1Log.contains("ready pid=\(childPID)"))
+
+            // Second `daemon start` returns 0 and reports the exact same PID without spawning another daemon.
+            let start2 = await cli.execute(
+                arguments: ["--lang", "zh", "--workspace", ws1.path, "daemon", "start"],
+                environment: env,
+                daemonSpawnOverride: pySpawnOverride
+            )
+            #expect(start2.exitCode == 0)
+            #expect(start2.stdout.contains("\(childPID)"))
+
+            // Stop the spawned daemon cleanly and verify process + socket are gone.
+            let stop1 = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", ws1.path, "daemon", "stop"],
+                environment: env
+            )
+            #expect(stop1.exitCode == 0)
+            #expect(Darwin.kill(childPID, 0) != 0 && Darwin.errno == ESRCH)
         }
-
-        let start1 = await cli.execute(
-            arguments: ["--lang", "en", "--workspace", ws1.path, "daemon", "start", "--json"],
-            environment: env,
-            daemonSpawnOverride: pySpawnOverride
-        )
-        #expect(start1.exitCode == 0, "daemon start failed: \(start1.stderr)")
-        let start1Obj = try #require(
-            try JSONSerialization.jsonObject(with: Data(start1.stdout.utf8)) as? [String: Any]
-        )
-        let childPID = pid_t(try #require(start1Obj["pid"] as? Int))
-        spawnedPIDToCleanup = childPID
-        #expect(childPID > 0 && childPID != Darwin.getpid())
-
-        // Verify SETSID made the child its own process group / session leader (`pgid == pid`).
-        #expect(Darwin.getpgid(childPID) == childPID)
-
-        // Close parent's write end of `extraPipe` while child is still alive: immediate EOF (0 bytes) on
-        // `extraPipe[0]` proves `POSIX_SPAWN_CLOEXEC_DEFAULT` prevented the child from inheriting `extraPipe[1]`.
-        _ = Darwin.close(extraPipe[1])
-        extraPipe[1] = -1
-        var eofByte: UInt8 = 0
-        let pipeReadRC = Darwin.read(extraPipe[0], &eofByte, 1)
-        #expect(pipeReadRC == 0)
-
-        // Verify daemon.log received child stdout.
-        let ws1Log = try String(contentsOf: ws1Paths.daemonLogFileURL, encoding: .utf8)
-        #expect(ws1Log.contains("ready pid=\(childPID)"))
-
-        // Second `daemon start` returns 0 and reports the exact same PID without spawning another daemon.
-        let start2 = await cli.execute(
-            arguments: ["--lang", "zh", "--workspace", ws1.path, "daemon", "start"],
-            environment: env,
-            daemonSpawnOverride: pySpawnOverride
-        )
-        #expect(start2.exitCode == 0)
-        #expect(start2.stdout.contains("\(childPID)"))
-
-        // Stop the spawned daemon cleanly and verify process + socket are gone.
-        let stop1 = await cli.execute(
-            arguments: ["--lang", "en", "--workspace", ws1.path, "daemon", "stop"],
-            environment: env
-        )
-        #expect(stop1.exitCode == 0)
-        #expect(Darwin.kill(childPID, 0) != 0 && Darwin.errno == ESRCH)
-        spawnedPIDToCleanup = 0
 
         // 2. Contender exiting 0 (`waitpid(WNOHANG)` exit 0 keeps polling until winner binds).
         let wsRace = URL(fileURLWithPath: "\(realBase)/Race.agentvm", isDirectory: true)
+        defer { Self.forceCleanupWorkspaceDaemon(workspaceURL: wsRace) }
         let winnerTask = Task<WorkspaceDaemonServer?, Error> {
             try await Task.sleep(nanoseconds: 250_000_000)
             let out = try await WorkspaceDaemonServer.start(workspaceURL: wsRace)
@@ -657,19 +807,28 @@ struct CLIAndMCPDaemonStage2Tests {
             arguments: [],
             environment: env
         )
-        let raceStart = await cli.execute(
-            arguments: ["--lang", "en", "--workspace", wsRace.path, "daemon", "start", "--json"],
-            environment: env,
-            daemonSpawnOverride: contenderOverride
-        )
-        let winnerServer = try await winnerTask.value
-        if let winnerServer {
-            await winnerServer.stopAndCleanup()
+        do {
+            let raceStart = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsRace.path, "daemon", "start", "--json"],
+                environment: env,
+                daemonSpawnOverride: contenderOverride
+            )
+            let winnerServer = try await winnerTask.value
+            if let winnerServer {
+                await winnerServer.stopAndCleanup()
+            }
+            #expect(raceStart.exitCode == 0, "Expected contender exit-0 to keep polling winner: \(raceStart.stderr)")
+        } catch {
+            winnerTask.cancel()
+            if let winnerServer = try? await winnerTask.value {
+                await winnerServer.stopAndCleanup()
+            }
+            throw error
         }
-        #expect(raceStart.exitCode == 0, "Expected contender exit-0 to keep polling winner: \(raceStart.stderr)")
 
         // 3. Non-zero child exit writes trailing 20 lines of `daemon.log` to stderr and exits 1.
         let wsCrash = URL(fileURLWithPath: "\(realBase)/Crash.agentvm", isDirectory: true)
+        defer { Self.forceCleanupWorkspaceDaemon(workspaceURL: wsCrash) }
         let crashOverride = DaemonSpawnCommandOverride(
             executablePath: "/bin/sh",
             arguments: ["-c", "i=1; while [ $i -le 25 ]; do echo \"crash-line-$i\"; i=$((i+1)); done; exit 17"],
@@ -691,7 +850,9 @@ struct CLIAndMCPDaemonStage2Tests {
     func upPreflightChecksBootableSystemClearsSimStateChecksEntitlementAndNeverLaunchesDaemonInStage2() async throws {
         let realBase = try makePrivateTmpDirectory(prefix: "avm-d2b")
         defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
         let wsURL = URL(fileURLWithPath: "\(realBase)/UpPreflight.agentvm", isDirectory: true)
+        defer { Self.forceCleanupWorkspaceDaemon(workspaceURL: wsURL) }
         let cacheDir = URL(fileURLWithPath: "\(realBase)/cache", isDirectory: true)
         let isolatedHome = "\(realBase)/home"
         try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
@@ -806,7 +967,9 @@ struct CLIAndMCPDaemonStage2Tests {
     func connectOnlyCommandsDisconnectedExitCodesA52AndLiveDaemonListAndEvents() async throws {
         let realBase = try makePrivateTmpDirectory(prefix: "avm-d34")
         defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
         let wsURL = URL(fileURLWithPath: "\(realBase)/Client34.agentvm", isDirectory: true)
+        defer { Self.forceCleanupWorkspaceDaemon(workspaceURL: wsURL) }
         let isolatedHome = "\(realBase)/home"
         try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
         let env = ["HOME": isolatedHome, "CFFIXED_USER_HOME": isolatedHome]
@@ -915,31 +1078,23 @@ struct CLIAndMCPDaemonStage2Tests {
         #expect(badLimit.exitCode == AgentVMCLIRunner.usageErrorExitCode)
 
         // 4. With live WorkspaceDaemonServer running, `ps`, `exec`, `halt`, `pause` route over RPC cleanly.
-        guard case let .started(server) = try await WorkspaceDaemonServer.start(workspaceURL: wsURL) else {
-            Issue.record("Expected WorkspaceDaemonServer to start")
-            return
+        try await withStartedDaemonServer(workspaceURL: wsURL) { _ in
+            let livePs = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "ps", "--json"], environment: env)
+            #expect(livePs.exitCode == 0)
+            let liveFleet = try decoder.decode([VMInstanceRecord].self, from: Data(livePs.stdout.utf8))
+            #expect(liveFleet.count == 2)
+
+            let liveExec = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "b", "--", "true"], environment: env)
+            #expect(liveExec.exitCode == 125)
+            #expect(liveExec.stderr.contains("ERR_LIFECYCLE_STATE"))
+            #expect(liveExec.stderr.contains("agentvm up b"))
+
+            let liveHalt = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "b"], environment: env)
+            #expect(liveHalt.exitCode == 0)
+
+            let livePause = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "pause", "b"], environment: env)
+            #expect(livePause.exitCode == 1)
         }
-        defer {
-            Task { await server.stopAndCleanup() }
-        }
-
-        let livePs = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "ps", "--json"], environment: env)
-        #expect(livePs.exitCode == 0)
-        let liveFleet = try decoder.decode([VMInstanceRecord].self, from: Data(livePs.stdout.utf8))
-        #expect(liveFleet.count == 2)
-
-        let liveExec = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "b", "--", "true"], environment: env)
-        #expect(liveExec.exitCode == 125)
-        #expect(liveExec.stderr.contains("ERR_LIFECYCLE_STATE"))
-        #expect(liveExec.stderr.contains("agentvm up b"))
-
-        let liveHalt = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "b"], environment: env)
-        #expect(liveHalt.exitCode == 0)
-
-        let livePause = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "pause", "b"], environment: env)
-        #expect(livePause.exitCode == 1)
-
-        await server.stopAndCleanup()
     }
 
     @Test("Item 5 (A53): cliSubcommands, bilingual helpBanner, and all 3 acceptance script whitelists include daemon and events (plus image & run in readme-commands.sh)")
@@ -1012,6 +1167,121 @@ struct CLIAndMCPDaemonStage2Tests {
         #expect(!codeLines.contains("pkill -f"))
         #expect(!codeLines.contains("pgrep -f 'daemon run'"))
         #expect(!codeLines.contains("pgrep -f \"daemon run\""))
+    }
+
+    @Test("Cleanup on failure: throwing mid-test stops both in-process WorkspaceDaemonServer and detached posix_spawn daemon and removes DARWIN_USER_TEMP_DIR avm-* symlinks")
+    func cleanupStopsDaemonsAndRemovesLongPathSymlinksWhenStage2TestThrowsMidFlight() async throws {
+        struct SimulatedStage2AbortError: Error {}
+
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s2fail")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = ["HOME": isolatedHome, "CFFIXED_USER_HOME": isolatedHome]
+        let cli = AgentVMCLIRunner()
+
+        // 1. In-process `WorkspaceDaemonServer` on a >=120B workspace: throw mid-scope and verify
+        //    socket, lock, and DARWIN_USER_TEMP_DIR `avm-*` symlink are already cleaned up upon catch.
+        let wsLongInProc = URL(
+            fileURLWithPath: "\(realBase)/\(String(repeating: "inproc-long-seg-", count: 6))/ws.agentvm",
+            isDirectory: true
+        )
+        #expect(wsLongInProc.path.utf8.count >= 120)
+        var inProcSymURL: URL?
+        var didCatchInProc = false
+
+        do {
+            try await withStartedDaemonServer(workspaceURL: wsLongInProc) { server in
+                #expect(server.address.mode == .tempDirectorySymlink)
+                let sym = try #require(server.address.symlinkURL)
+                inProcSymURL = sym
+                var st = Darwin.stat()
+                #expect(Darwin.lstat(sym.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK)
+                #expect(DaemonSingletonLock.readHolderInfo(at: server.paths.lockFileURL) != nil)
+                throw SimulatedStage2AbortError()
+            }
+        } catch is SimulatedStage2AbortError {
+            didCatchInProc = true
+        }
+
+        #expect(didCatchInProc)
+        let checkedInProcSym = try #require(inProcSymURL)
+        var stInProc = Darwin.stat()
+        #expect(Darwin.lstat(checkedInProcSym.path, &stInProc) != 0 && Darwin.errno == ENOENT)
+        #expect(!FileManager.default.fileExists(atPath: DaemonWorkspacePaths(workspaceURL: wsLongInProc).directSocketPath))
+        #expect(DaemonSingletonLock.readHolderInfo(at: DaemonWorkspacePaths(workspaceURL: wsLongInProc).lockFileURL) == nil)
+
+        // 2. Detached `posix_spawn` child daemon on a >=120B workspace: throw mid-scope without calling `daemon stop`
+        //    and verify both the detached daemon PID (`ESRCH`) and DARWIN_USER_TEMP_DIR `avm-*` symlink (`ENOENT`) are gone.
+        let helperScriptPath = "\(realBase)/mock_daemon_rpc.py"
+        let pidFilePath = "\(realBase)/mock_long.pid"
+        try writeMockDaemonPythonScript(to: helperScriptPath)
+
+        let wsLongDetached = URL(
+            fileURLWithPath: "\(realBase)/\(String(repeating: "detached-long-seg-", count: 6))/ws.agentvm",
+            isDirectory: true
+        )
+        #expect(wsLongDetached.path.utf8.count >= 120)
+        let detachedPaths = DaemonWorkspacePaths(workspaceURL: wsLongDetached)
+        let detachedPlan = try DaemonSocketAddressResolver.computePlan(for: wsLongDetached)
+        let detachedSymURL = try #require(detachedPlan.symlinkURL)
+
+        let pyLongOverride = DaemonSpawnCommandOverride(
+            executablePath: "/usr/bin/python3",
+            arguments: [
+                "-I",
+                helperScriptPath,
+                detachedPaths.canonicalWorkspacePath,
+                pidFilePath,
+                detachedPlan.connectSocketPath,
+                detachedSymURL.path
+            ],
+            environment: env
+        )
+
+        var capturedDetachedPID: pid_t = 0
+        var didCatchDetached = false
+        do {
+            try await withDetachedDaemonCleanupScope(workspaceURL: wsLongDetached, pidFilePaths: [pidFilePath]) { tracker in
+                let startRes = await cli.execute(
+                    arguments: ["--lang", "en", "--workspace", wsLongDetached.path, "daemon", "start", "--json"],
+                    environment: env,
+                    daemonSpawnOverride: pyLongOverride
+                )
+                #expect(startRes.exitCode == 0, "daemon start failed: \(startRes.stderr)")
+                let obj = try #require(
+                    try JSONSerialization.jsonObject(with: Data(startRes.stdout.utf8)) as? [String: Any]
+                )
+                let pid = pid_t(try #require(obj["pid"] as? Int))
+                tracker.record(pid)
+                capturedDetachedPID = pid
+                #expect(Darwin.kill(pid, 0) == 0)
+                var st = Darwin.stat()
+                #expect(Darwin.lstat(detachedSymURL.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK)
+                throw SimulatedStage2AbortError()
+            }
+        } catch is SimulatedStage2AbortError {
+            didCatchDetached = true
+        }
+
+        #expect(didCatchDetached)
+        #expect(capturedDetachedPID > 0)
+        #expect(Darwin.kill(capturedDetachedPID, 0) != 0 && Darwin.errno == ESRCH)
+        var stDetached = Darwin.stat()
+        #expect(Darwin.lstat(detachedSymURL.path, &stDetached) != 0 && Darwin.errno == ENOENT)
+    }
+}
+
+private final class Stage2PIDTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pids: [pid_t] = []
+    func record(_ pid: pid_t) {
+        guard pid > 0 else { return }
+        lock.withLock { pids.append(pid) }
+    }
+    func snapshot() -> [pid_t] {
+        lock.withLock { pids }
     }
 }
 

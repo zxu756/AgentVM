@@ -442,14 +442,15 @@ struct CLIAndMCPDaemonRPCTests {
 
         // 4. Existing symlink pointing elsewhere throws error on both bind and connect and is NEVER overwritten.
         let foreignTarget = tempRoot.appendingPathComponent("foreign-dir/run", isDirectory: true).path
-        #expect(Darwin.symlink(foreignTarget, symlinkURL.path) == 0)
         defer { _ = Darwin.unlink(symlinkURL.path) }
+        #expect(Darwin.symlink(foreignTarget, symlinkURL.path) == 0)
 
         do {
-            _ = try DaemonSocketAddressResolver.prepareForBind(
+            let (unexpectedPlan, _) = try DaemonSocketAddressResolver.prepareForBind(
                 workspaceURL: longWS,
                 userTempDirectoryOverride: isolatedTempDir
             )
+            DaemonSocketAddressResolver.removeSymlinkIfPresent(for: unexpectedPlan)
             Issue.record("Expected symlinkTargetMismatch on prepareForBind")
         } catch let err as DaemonSocketError {
             guard case .symlinkTargetMismatch = err else {
@@ -522,12 +523,10 @@ struct CLIAndMCPDaemonRPCTests {
         }
 
         let clientConn = try DaemonSocketClient.connectDirect(socketPath: paths.directSocketPath)
+        defer { clientConn.close() }
         acceptDone.wait()
         let serverConn = try #require(acceptedBox.load()).get()
-        defer {
-            clientConn.close()
-            serverConn.close()
-        }
+        defer { serverConn.close() }
 
         #expect(serverConn.peerUID == Darwin.getuid())
         #expect(clientConn.peerUID == Darwin.getuid())
@@ -633,7 +632,8 @@ struct CLIAndMCPDaemonRPCTests {
             startedAt: Date(timeIntervalSince1970: 1_763_339_999)
         )
         switch secondOutcome {
-        case .bound:
+        case let .bound(unexpectedServer2):
+            unexpectedServer2.shutdownAndCleanup()
             Issue.record("Second contender must not acquire daemon.lock while server1 holds it")
             return
         case let .alreadyRunning(holder):
@@ -655,8 +655,10 @@ struct CLIAndMCPDaemonRPCTests {
             acceptSem.signal()
         }
         let client = try DaemonSocketClient.connectDirect(socketPath: paths.directSocketPath)
+        defer { client.close() }
         acceptSem.wait()
         let accepted = try #require(acceptedBox.load()).get()
+        defer { accepted.close() }
         try client.writeLineData(Data(#"{"still":"alive"}"#.utf8))
         #expect(try accepted.makeLineReader().readLineData() == Data(#"{"still":"alive"}"#.utf8))
         client.close()
@@ -678,6 +680,7 @@ struct CLIAndMCPDaemonRPCTests {
             Issue.record("Expected acquireLockAndBind to succeed after server1 shutdownAndCleanup")
             return
         }
+        defer { server3.shutdownAndCleanup() }
         #expect(server3.holderInfo.executablePath == "/opt/agentvm/bin/AgentVM-restarted")
         server3.shutdownAndCleanup()
     }
@@ -695,6 +698,96 @@ struct CLIAndMCPDaemonRPCTests {
         return URL(fileURLWithPath: String(cString: createdPtr), isDirectory: true).standardizedFileURL
     }
 
+    private static func sweepDarwinUserTempSymlinks(pointingUnder tempRoot: URL) {
+        guard let darwinTempDir = try? DaemonSocketAddressResolver.darwinUserTempDirectoryURL() else {
+            return
+        }
+        let canonicalRoot = DaemonSocketAddressResolver.canonicalRealPath(of: tempRoot)
+        let stdRoot = tempRoot.standardizedFileURL.path
+        var prefixes = [canonicalRoot, stdRoot]
+        if canonicalRoot.hasPrefix("/private/tmp/") {
+            prefixes.append(String(canonicalRoot.dropFirst("/private".count)))
+        } else if stdRoot.hasPrefix("/tmp/") {
+            prefixes.append("/private" + stdRoot)
+        }
+        let uniquePrefixes = Array(Set(prefixes))
+
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: darwinTempDir.path) else {
+            return
+        }
+        for name in names where name.hasPrefix("avm-") {
+            let linkPath = darwinTempDir.appendingPathComponent(name, isDirectory: false).path
+            var st = Darwin.stat()
+            guard Darwin.lstat(linkPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK else {
+                continue
+            }
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let len = Darwin.readlink(linkPath, &buf, Int(PATH_MAX))
+            guard len > 0 else { continue }
+            let rawTarget = String(decoding: buf.prefix(len).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            let resolvedTarget: String
+            if rawTarget.hasPrefix("/") {
+                resolvedTarget = DaemonSocketAddressResolver.canonicalRealPath(
+                    of: URL(fileURLWithPath: rawTarget, isDirectory: true)
+                )
+            } else {
+                resolvedTarget = DaemonSocketAddressResolver.canonicalRealPath(
+                    of: darwinTempDir.appendingPathComponent(rawTarget, isDirectory: true)
+                )
+            }
+            let matches = uniquePrefixes.contains { prefix in
+                rawTarget == prefix
+                    || rawTarget.hasPrefix(prefix + "/")
+                    || resolvedTarget == prefix
+                    || resolvedTarget.hasPrefix(prefix + "/")
+            }
+            if matches {
+                _ = Darwin.unlink(linkPath)
+            }
+        }
+    }
+
+    private func withDarwinTempCleanedRoot<T>(
+        prefix: String = "avm-h11",
+        _ body: (URL) throws -> T
+    ) throws -> T {
+        let tempRoot = try makeShortTmpMkdtemp(prefix: prefix)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: tempRoot) }
+        return try body(tempRoot)
+    }
+
+    private func withBoundWorkspaceServer<T>(
+        workspaceURL: URL,
+        _ body: (DaemonBoundWorkspaceServer) throws -> T
+    ) throws -> T {
+        let outcome = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(workspaceURL: workspaceURL)
+        guard case let .bound(server) = outcome else {
+            Issue.record("Expected acquireLockAndBind to bind workspace \(workspaceURL.path)")
+            throw NSError(domain: "CLIAndMCPDaemonRPCTests", code: 1)
+        }
+        defer { server.shutdownAndCleanup() }
+        return try body(server)
+    }
+
+    private func assertBindFailsWithSymlinkMismatch(
+        workspaceURL: URL,
+        recordFailure: (String) -> Void = { Issue.record(Comment(rawValue: $0)) }
+    ) throws {
+        do {
+            let unexpectedOutcome = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(workspaceURL: workspaceURL)
+            if case let .bound(unexpectedServer) = unexpectedOutcome {
+                unexpectedServer.shutdownAndCleanup()
+            }
+            recordFailure("Expected symlinkTargetMismatch when DARWIN_USER_TEMP_DIR symlink points elsewhere")
+        } catch let err as DaemonSocketError {
+            guard case .symlinkTargetMismatch = err else {
+                recordFailure("Unexpected error: \(err)")
+                return
+            }
+        }
+    }
+
     private func assertLiveRPCLineRoundTrip(
         server: DaemonBoundWorkspaceServer,
         workspaceURL: URL
@@ -707,12 +800,10 @@ struct CLIAndMCPDaemonRPCTests {
         }
 
         let clientConn = try DaemonSocketClient.connectWorkspace(workspaceURL: workspaceURL)
+        defer { clientConn.close() }
         acceptSem.wait()
         let serverConn = try #require(acceptBox.load()).get()
-        defer {
-            clientConn.close()
-            serverConn.close()
-        }
+        defer { serverConn.close() }
 
         let clientHello = DaemonRPCHello(executablePath: "/opt/agentvm/client")
         let daemonHello = DaemonRPCHello(executablePath: "/opt/agentvm/daemon")
@@ -761,123 +852,192 @@ struct CLIAndMCPDaemonRPCTests {
 
     @Test("Item 6 (Hypothesis 11): >=120-byte workspace, exact 103-byte direct boundary, exact 104-byte symlink boundary, and existing-symlink conflict over real DARWIN_USER_TEMP_DIR")
     func hypothesis11LongPathSymlinkAndExact103Vs104Boundaries() throws {
-        let tempRoot = try makeShortTmpMkdtemp(prefix: "avm-h11")
-        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        try withDarwinTempCleanedRoot(prefix: "avm-h11") { tempRoot in
+            let darwinTempDir = try DaemonSocketAddressResolver.darwinUserTempDirectoryURL()
+            let canonicalTempRoot = DaemonSocketAddressResolver.canonicalRealPath(of: tempRoot)
+            let fixedOverhead = canonicalTempRoot.utf8.count + 1 + "/ws.agentvm/run/daemon.sock".utf8.count
+            #expect(fixedOverhead < 90)
 
-        let darwinTempDir = try DaemonSocketAddressResolver.darwinUserTempDirectoryURL()
-        let canonicalTempRoot = DaemonSocketAddressResolver.canonicalRealPath(of: tempRoot)
-        let fixedOverhead = canonicalTempRoot.utf8.count + 1 + "/ws.agentvm/run/daemon.sock".utf8.count
-        #expect(fixedOverhead < 90)
+            // 1. Exact 103-byte socket path boundary: direct bind/connect, zero symlink in DARWIN_USER_TEMP_DIR.
+            let pad103 = String(repeating: "a", count: 103 - fixedOverhead)
+            let ws103 = tempRoot.appendingPathComponent(pad103, isDirectory: true)
+                .appendingPathComponent("ws.agentvm", isDirectory: true)
+            let paths103 = DaemonWorkspacePaths(workspaceURL: ws103)
+            #expect(paths103.directSocketPathUTF8ByteCount == 103)
 
-        // 1. Exact 103-byte socket path boundary: direct bind/connect, zero symlink in DARWIN_USER_TEMP_DIR.
-        let pad103 = String(repeating: "a", count: 103 - fixedOverhead)
-        let ws103 = tempRoot.appendingPathComponent(pad103, isDirectory: true)
-            .appendingPathComponent("ws.agentvm", isDirectory: true)
-        let paths103 = DaemonWorkspacePaths(workspaceURL: ws103)
-        #expect(paths103.directSocketPathUTF8ByteCount == 103)
+            try withBoundWorkspaceServer(workspaceURL: ws103) { srv103 in
+                #expect(srv103.address.mode == .direct)
+                #expect(srv103.address.symlinkURL == nil)
+                try assertLiveRPCLineRoundTrip(server: srv103, workspaceURL: ws103)
+            }
 
-        guard case let .bound(srv103) = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(workspaceURL: ws103) else {
-            Issue.record("Expected 103-byte socket path to bind")
-            return
-        }
-        defer { srv103.shutdownAndCleanup() }
-        #expect(srv103.address.mode == .direct)
-        #expect(srv103.address.symlinkURL == nil)
-        try assertLiveRPCLineRoundTrip(server: srv103, workspaceURL: ws103)
-        srv103.shutdownAndCleanup()
+            // 2. Exact 104-byte socket path boundary: uses DARWIN_USER_TEMP_DIR/avm-<sha256-16> symlink.
+            let pad104 = String(repeating: "b", count: 104 - fixedOverhead)
+            let ws104 = tempRoot.appendingPathComponent(pad104, isDirectory: true)
+                .appendingPathComponent("ws.agentvm", isDirectory: true)
+            let paths104 = DaemonWorkspacePaths(workspaceURL: ws104)
+            #expect(paths104.directSocketPathUTF8ByteCount == 104)
 
-        // 2. Exact 104-byte socket path boundary: uses DARWIN_USER_TEMP_DIR/avm-<sha256-16> symlink.
-        let pad104 = String(repeating: "b", count: 104 - fixedOverhead)
-        let ws104 = tempRoot.appendingPathComponent(pad104, isDirectory: true)
-            .appendingPathComponent("ws.agentvm", isDirectory: true)
-        let paths104 = DaemonWorkspacePaths(workspaceURL: ws104)
-        #expect(paths104.directSocketPathUTF8ByteCount == 104)
+            var symStat = Darwin.stat()
+            var sym104URL: URL?
+            try withBoundWorkspaceServer(workspaceURL: ws104) { srv104 in
+                #expect(srv104.address.mode == .tempDirectorySymlink)
+                let sym104 = try #require(srv104.address.symlinkURL)
+                sym104URL = sym104
+                #expect(sym104.deletingLastPathComponent().standardizedFileURL == darwinTempDir)
+                #expect(Darwin.lstat(sym104.path, &symStat) == 0 && (symStat.st_mode & S_IFMT) == S_IFLNK)
+                try assertLiveRPCLineRoundTrip(server: srv104, workspaceURL: ws104)
+            }
+            if let sym104 = sym104URL {
+                #expect(Darwin.lstat(sym104.path, &symStat) != 0 && Darwin.errno == ENOENT)
+            }
 
-        guard case let .bound(srv104) = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(workspaceURL: ws104) else {
-            Issue.record("Expected 104-byte socket path to bind via symlink")
-            return
-        }
-        defer { srv104.shutdownAndCleanup() }
-        #expect(srv104.address.mode == .tempDirectorySymlink)
-        let sym104 = try #require(srv104.address.symlinkURL)
-        #expect(sym104.deletingLastPathComponent().standardizedFileURL == darwinTempDir)
-        var symStat = Darwin.stat()
-        #expect(Darwin.lstat(sym104.path, &symStat) == 0 && (symStat.st_mode & S_IFMT) == S_IFLNK)
-        try assertLiveRPCLineRoundTrip(server: srv104, workspaceURL: ws104)
-        srv104.shutdownAndCleanup()
-        #expect(Darwin.lstat(sym104.path, &symStat) != 0 && Darwin.errno == ENOENT)
+            // 3. >= 120-byte workspace path: bind, connect, exchange RPC lines via DARWIN_USER_TEMP_DIR symlink.
+            let wsLong = tempRoot
+                .appendingPathComponent(String(repeating: "deep-workspace-segment-", count: 6), isDirectory: true)
+                .appendingPathComponent("ws.agentvm", isDirectory: true)
+            #expect(wsLong.standardizedFileURL.path.utf8.count >= 120)
 
-        // 3. >= 120-byte workspace path: bind, connect, exchange RPC lines via DARWIN_USER_TEMP_DIR symlink.
-        let wsLong = tempRoot
-            .appendingPathComponent(String(repeating: "deep-workspace-segment-", count: 6), isDirectory: true)
-            .appendingPathComponent("ws.agentvm", isDirectory: true)
-        #expect(wsLong.standardizedFileURL.path.utf8.count >= 120)
+            var physStat = Darwin.stat()
+            var symLongURL: URL?
+            try withBoundWorkspaceServer(workspaceURL: wsLong) { srvLong in
+                #expect(srvLong.address.mode == .tempDirectorySymlink)
+                let symLong = try #require(srvLong.address.symlinkURL)
+                symLongURL = symLong
+                #expect(srvLong.address.connectSocketPath.utf8.count <= 103)
 
-        guard case let .bound(srvLong) = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(workspaceURL: wsLong) else {
-            Issue.record("Expected >=120-byte workspace to bind via symlink")
-            return
-        }
-        defer { srvLong.shutdownAndCleanup() }
-        #expect(srvLong.address.mode == .tempDirectorySymlink)
-        let symLong = try #require(srvLong.address.symlinkURL)
-        #expect(srvLong.address.connectSocketPath.utf8.count <= 103)
+                #expect(stat(DaemonWorkspacePaths(workspaceURL: wsLong).directSocketPath, &physStat) == 0)
+                #expect((physStat.st_mode & S_IFMT) == S_IFSOCK)
+                #expect((physStat.st_mode & 0o777) == 0o600)
 
-        var physStat = Darwin.stat()
-        #expect(stat(DaemonWorkspacePaths(workspaceURL: wsLong).directSocketPath, &physStat) == 0)
-        #expect((physStat.st_mode & S_IFMT) == S_IFSOCK)
-        #expect((physStat.st_mode & 0o777) == 0o600)
+                try assertLiveRPCLineRoundTrip(server: srvLong, workspaceURL: wsLong)
+            }
+            if let symLong = symLongURL {
+                #expect(Darwin.lstat(symLong.path, &symStat) != 0 && Darwin.errno == ENOENT)
+            }
+            #expect(stat(DaemonWorkspacePaths(workspaceURL: wsLong).directSocketPath, &physStat) != 0 && Darwin.errno == ENOENT)
 
-        try assertLiveRPCLineRoundTrip(server: srvLong, workspaceURL: wsLong)
-        srvLong.shutdownAndCleanup()
-        #expect(Darwin.lstat(symLong.path, &symStat) != 0 && Darwin.errno == ENOENT)
-        #expect(stat(DaemonWorkspacePaths(workspaceURL: wsLong).directSocketPath, &physStat) != 0 && Darwin.errno == ENOENT)
+            // 4. Existing symlink in DARWIN_USER_TEMP_DIR pointing elsewhere fails without overwriting and releases lock.
+            let wsConflict = tempRoot
+                .appendingPathComponent(String(repeating: "conflict-workspace-seg-", count: 6), isDirectory: true)
+                .appendingPathComponent("ws.agentvm", isDirectory: true)
+            #expect(wsConflict.standardizedFileURL.path.utf8.count >= 120)
+            let conflictPlan = try DaemonSocketAddressResolver.computePlan(for: wsConflict)
+            let conflictSymURL = try #require(conflictPlan.symlinkURL)
+            let wrongTarget = tempRoot.appendingPathComponent("wrong-place/run", isDirectory: true).path
+            defer { _ = Darwin.unlink(conflictSymURL.path) }
+            _ = Darwin.unlink(conflictSymURL.path)
+            #expect(Darwin.symlink(wrongTarget, conflictSymURL.path) == 0)
 
-        // 4. Existing symlink in DARWIN_USER_TEMP_DIR pointing elsewhere fails without overwriting and releases lock.
-        let wsConflict = tempRoot
-            .appendingPathComponent(String(repeating: "conflict-workspace-seg-", count: 6), isDirectory: true)
-            .appendingPathComponent("ws.agentvm", isDirectory: true)
-        #expect(wsConflict.standardizedFileURL.path.utf8.count >= 120)
-        let conflictPlan = try DaemonSocketAddressResolver.computePlan(for: wsConflict)
-        let conflictSymURL = try #require(conflictPlan.symlinkURL)
-        let wrongTarget = tempRoot.appendingPathComponent("wrong-place/run", isDirectory: true).path
-        _ = Darwin.unlink(conflictSymURL.path)
-        #expect(Darwin.symlink(wrongTarget, conflictSymURL.path) == 0)
-        defer { _ = Darwin.unlink(conflictSymURL.path) }
+            try assertBindFailsWithSymlinkMismatch(workspaceURL: wsConflict)
 
-        do {
-            _ = try DaemonWorkspaceServerBootstrap.acquireLockAndBind(workspaceURL: wsConflict)
-            Issue.record("Expected symlinkTargetMismatch when DARWIN_USER_TEMP_DIR symlink points elsewhere")
-        } catch let err as DaemonSocketError {
-            guard case .symlinkTargetMismatch = err else {
-                Issue.record("Unexpected error: \(err)")
-                return
+            do {
+                let unexpectedConn = try DaemonSocketClient.connectWorkspace(workspaceURL: wsConflict)
+                unexpectedConn.close()
+                Issue.record("Expected client connectWorkspace to fail on mismatched symlink")
+            } catch let err as DaemonSocketError {
+                guard case .symlinkTargetMismatch = err else {
+                    Issue.record("Unexpected client error: \(err)")
+                    return
+                }
+            }
+
+            // Verify foreign symlink target is untouched AND daemon.lock was released on failure!
+            var linkBuf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+            let n = Darwin.readlink(conflictSymURL.path, &linkBuf, Int(PATH_MAX))
+            #expect(n > 0)
+            let remainingTarget = String(decoding: linkBuf.prefix(n).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            #expect(remainingTarget == wrongTarget)
+
+            let lockProbe = try DaemonSingletonLock.tryAcquire(workspaceURL: wsConflict)
+            switch lockProbe {
+            case let .acquired(lock):
+                lock.release(clearFile: true)
+            case .alreadyHeld:
+                Issue.record("Failed acquireLockAndBind must release daemon.lock before rethrowing")
             }
         }
+    }
+
+    @Test("Cleanup on failure: throwing mid-test or failing after unexpected conflict bind removes avm-* symlinks in DARWIN_USER_TEMP_DIR and releases daemon.lock")
+    func cleanupRemovesDarwinTempSymlinksAndLocksWhenTestFailsMidExecution() throws {
+        struct SimulatedMidTestFailure: Error {}
+
+        // 1. Throwing mid-flight inside `withDarwinTempCleanedRoot` + `withBoundWorkspaceServer` on a >=120B workspace
+        //    must still unlink the `avm-*` symlink in DARWIN_USER_TEMP_DIR, delete `daemon.sock`, and remove `tempRoot`.
+        var capturedRoot1: URL?
+        var capturedSym1: URL?
+        var didCatch1 = false
 
         do {
-            _ = try DaemonSocketClient.connectWorkspace(workspaceURL: wsConflict)
-            Issue.record("Expected client connectWorkspace to fail on mismatched symlink")
-        } catch let err as DaemonSocketError {
-            guard case .symlinkTargetMismatch = err else {
-                Issue.record("Unexpected client error: \(err)")
-                return
+            try withDarwinTempCleanedRoot(prefix: "avm-cfail1") { tempRoot in
+                capturedRoot1 = tempRoot
+                let wsLong = tempRoot
+                    .appendingPathComponent(String(repeating: "abort-mid-test-segment-", count: 6), isDirectory: true)
+                    .appendingPathComponent("ws.agentvm", isDirectory: true)
+                try withBoundWorkspaceServer(workspaceURL: wsLong) { srv in
+                    let sym = try #require(srv.address.symlinkURL)
+                    capturedSym1 = sym
+                    var st = Darwin.stat()
+                    #expect(Darwin.lstat(sym.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK)
+                    throw SimulatedMidTestFailure()
+                }
             }
+        } catch is SimulatedMidTestFailure {
+            didCatch1 = true
         }
 
-        // Verify foreign symlink target is untouched AND daemon.lock was released on failure!
-        var linkBuf = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
-        let n = Darwin.readlink(conflictSymURL.path, &linkBuf, Int(PATH_MAX))
-        #expect(n > 0)
-        let remainingTarget = String(decoding: linkBuf.prefix(n).map { UInt8(bitPattern: $0) }, as: UTF8.self)
-        #expect(remainingTarget == wrongTarget)
+        #expect(didCatch1)
+        let sym1 = try #require(capturedSym1)
+        let root1 = try #require(capturedRoot1)
+        var st1 = Darwin.stat()
+        #expect(Darwin.lstat(sym1.path, &st1) != 0 && Darwin.errno == ENOENT)
+        #expect(!FileManager.default.fileExists(atPath: root1.path))
 
-        let lockProbe = try DaemonSingletonLock.tryAcquire(workspaceURL: wsConflict)
-        switch lockProbe {
-        case let .acquired(lock):
-            lock.release(clearFile: true)
-        case .alreadyHeld:
-            Issue.record("Failed acquireLockAndBind must release daemon.lock before rethrowing")
+        // 2. Simulate the exact 12:25 leak scenario: `assertBindFailsWithSymlinkMismatch` encounters an unexpected
+        //    successful `.bound` server (because no conflicting symlink was planted at its hash) AND a stray `avm-*`
+        //    symlink pointing into `tempRoot`, then the test aborts mid-execution. Both `avm-*` symlinks must be gone.
+        var capturedRoot2: URL?
+        var capturedUnexpectedSym: URL?
+        var capturedStraySym: URL?
+        var recordedFailures: [String] = []
+        var didCatch2 = false
+
+        do {
+            try withDarwinTempCleanedRoot(prefix: "avm-cfail2") { tempRoot in
+                capturedRoot2 = tempRoot
+                let wsUnexpected = tempRoot
+                    .appendingPathComponent(String(repeating: "unexpected-bind-segment-", count: 6), isDirectory: true)
+                    .appendingPathComponent("ws.agentvm", isDirectory: true)
+                let plan = try DaemonSocketAddressResolver.computePlan(for: wsUnexpected)
+                let sym = try #require(plan.symlinkURL)
+                capturedUnexpectedSym = sym
+
+                let darwinTemp = try DaemonSocketAddressResolver.darwinUserTempDirectoryURL()
+                let straySym = darwinTemp.appendingPathComponent("avm-teststray\(UUID().uuidString.prefix(8).lowercased())")
+                capturedStraySym = straySym
+                let strayTarget = tempRoot.appendingPathComponent("conflict-workspace-orphan/run").path
+                #expect(Darwin.symlink(strayTarget, straySym.path) == 0)
+
+                try assertBindFailsWithSymlinkMismatch(
+                    workspaceURL: wsUnexpected,
+                    recordFailure: { recordedFailures.append($0) }
+                )
+                throw SimulatedMidTestFailure()
+            }
+        } catch is SimulatedMidTestFailure {
+            didCatch2 = true
         }
+
+        #expect(didCatch2)
+        #expect(recordedFailures.count == 1)
+        let sym2 = try #require(capturedUnexpectedSym)
+        let stray2 = try #require(capturedStraySym)
+        let root2 = try #require(capturedRoot2)
+        var st2 = Darwin.stat()
+        #expect(Darwin.lstat(sym2.path, &st2) != 0 && Darwin.errno == ENOENT)
+        #expect(Darwin.lstat(stray2.path, &st2) != 0 && Darwin.errno == ENOENT)
+        #expect(!FileManager.default.fileExists(atPath: root2.path))
     }
 }
 

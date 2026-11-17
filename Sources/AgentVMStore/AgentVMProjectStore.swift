@@ -679,6 +679,33 @@ public actor AgentVMProjectStore {
         return try rows.map(decodeDiagnosticRow)
     }
 
+    /// Atomically transitions a non-simulated `running` VM record to `stopped` and appends a single
+    /// `VM_RUNTIME_LOST` diagnostic inside one `BEGIN IMMEDIATE` transaction so concurrent reconcilers
+    /// (`ps`, `daemon run`) never emit duplicate diagnostics for the same interruption.
+    public func reconcileLostRunningVM(
+        vmID: VMID,
+        diagnostic: DiagnosticEvent
+    ) throws -> (record: VMInstanceRecord?, didReconcile: Bool) {
+        try db.inTransaction(mode: .immediate) {
+            guard var current = try fetchVM(vmID) else {
+                return (nil, false)
+            }
+            guard current.telemetry.state == .running, !current.telemetry.simulated else {
+                return (current, false)
+            }
+            current.telemetry.state = .stopped
+            current.telemetry.simulated = false
+            current.telemetry.guestAgentConnected = false
+            current.telemetry.hasLiveGuestTelemetry = false
+            current.telemetry.vsockStreamsOpen = 0
+            current.telemetry.cpuUsagePercent = 0
+            current.telemetry.memoryResidentMB = 0
+            try upsertVM(current)
+            try appendDiagnostic(diagnostic)
+            return (current, true)
+        }
+    }
+
     private func decodeDiagnosticRow(_ row: SQLiteRow) throws -> DiagnosticEvent {
         let severity = DiagnosticSeverity(rawValue: try row.string("severity")) ?? .info
         let metadata = try row.optionalJSON([String: String].self, column: "metadata_json", decoder: jsonDecoder) ?? [:]

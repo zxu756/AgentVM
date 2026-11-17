@@ -57,9 +57,11 @@ public final class VMExecutionLock: @unchecked Sendable {
             let errCode = Darwin.errno
             if errCode == EWOULDBLOCK || errCode == EAGAIN {
                 var holderPID = readHolderPID(fromFD: fd)
-                if holderPID == nil {
+                var attempts = 0
+                while holderPID == nil && attempts < 10 {
                     Darwin.usleep(5_000)
                     holderPID = readHolderPID(fromFD: fd)
+                    attempts += 1
                 }
                 _ = Darwin.close(fd)
                 throw AgentVMError.vmBusy(vmName: vmName, holderPID: holderPID)
@@ -73,36 +75,55 @@ public final class VMExecutionLock: @unchecked Sendable {
         }
 
         let ownerStamp = Data("pid=\(Darwin.getpid())\nvm=\(vmName)\n".utf8)
-        _ = Darwin.ftruncate(fd, 0)
         ownerStamp.withUnsafeBytes { rawBuf in
             if let base = rawBuf.baseAddress {
                 _ = Darwin.pwrite(fd, base, rawBuf.count, 0)
             }
         }
+        _ = Darwin.ftruncate(fd, off_t(ownerStamp.count))
 
         return VMExecutionLock(lockFileURL: standardized, fd: fd)
     }
 
+    /// Lock-free liveness probe (Fixes A45): reads the recorded holder PID without calling `flock`,
+    /// then checks process existence via `kill(pid, 0)` so frequent `ps` / reconciliation probes
+    /// never contend with `VMExecutionLock.acquire`.
     public static func isLocked(at lockFileURL: URL) -> Bool {
+        readLiveHolderPID(at: lockFileURL) != nil
+    }
+
+    public static func readLiveHolderPID(at lockFileURL: URL) -> Int32? {
         let standardized = lockFileURL.standardizedFileURL
-        guard FileManager.default.fileExists(atPath: standardized.path) else {
-            return false
-        }
-        var probeFD = Darwin.open(standardized.path, O_RDWR | O_CLOEXEC)
-        if probeFD < 0 {
-            probeFD = Darwin.open(standardized.path, O_RDONLY | O_CLOEXEC)
-        }
+        let probeFD = Darwin.open(standardized.path, O_RDONLY | O_CLOEXEC)
         guard probeFD >= 0 else {
-            return false
+            return nil
         }
         defer { _ = Darwin.close(probeFD) }
 
-        if posixFlock(probeFD, LOCK_EX | LOCK_NB) != 0 {
-            let errCode = Darwin.errno
-            return errCode == EWOULDBLOCK || errCode == EAGAIN
+        let (parsedPID, bytesRead) = readHolderPIDAndByteCount(fromFD: probeFD)
+        let candidatePID: Int32?
+        if let parsedPID {
+            candidatePID = parsedPID
+        } else if bytesRead > 0 {
+            Darwin.usleep(1_000)
+            candidatePID = readHolderPIDAndByteCount(fromFD: probeFD).pid
+        } else {
+            candidatePID = nil
         }
-        _ = posixFlock(probeFD, LOCK_UN)
-        return false
+
+        guard let pid = candidatePID, pid > 0 else {
+            return nil
+        }
+        if pid == Darwin.getpid() {
+            return pid
+        }
+        if Darwin.kill(pid, 0) == 0 {
+            return pid
+        }
+        if Darwin.errno == EPERM {
+            return pid
+        }
+        return nil
     }
 
     public func release() {
@@ -122,19 +143,23 @@ public final class VMExecutionLock: @unchecked Sendable {
     }
 
     private static func readHolderPID(fromFD fd: Int32) -> Int32? {
+        readHolderPIDAndByteCount(fromFD: fd).pid
+    }
+
+    private static func readHolderPIDAndByteCount(fromFD fd: Int32) -> (pid: Int32?, bytesRead: Int) {
         var scratch = [UInt8](repeating: 0, count: 256)
         let n = Darwin.pread(fd, &scratch, scratch.count, 0)
-        guard n > 0 else { return nil }
+        guard n > 0 else { return (nil, 0) }
         let text = String(decoding: scratch.prefix(n), as: UTF8.self)
         for line in text.split(whereSeparator: \.isNewline) {
             if line.hasPrefix("pid=") {
                 let rawPID = line.dropFirst("pid=".count).trimmingCharacters(in: .whitespaces)
                 if let parsed = Int32(rawPID), parsed > 0 {
-                    return parsed
+                    return (parsed, n)
                 }
             }
         }
-        return nil
+        return (nil, n)
     }
 }
 
@@ -600,14 +625,60 @@ public actor AgentVMFleetCoordinator {
         executionBackend == .deterministicSimulation
     }
 
-    // MARK: - Simulated Runtime State Hygiene
+    // MARK: - Simulated Runtime State Hygiene & Crash Reconciliation (`VM_RUNTIME_LOST`)
 
-    /// VM records as this process should report them (`ps`, `ps --json`, MCP `agentvm_list_fleet`, HTML export).
+    public static func vmRuntimeLostMessage(vmName: String, language: AppLanguage) -> String {
+        if language == .zhHans {
+            return "上次运行异常中断：持有这台机器的进程没有正常退出（\(vmName)）。"
+        }
+        return "Previous run terminated unexpectedly: the process holding this VM ('\(vmName)') did not exit cleanly."
+    }
+
+    public static func localizedDiagnosticMessage(for event: DiagnosticEvent, in language: AppLanguage) -> String {
+        if event.code == "VM_RUNTIME_LOST" {
+            if language == .zhHans, let zh = event.metadata["message_zh"], !zh.isEmpty {
+                return zh
+            }
+            if language == .en, let en = event.metadata["message_en"], !en.isEmpty {
+                return en
+            }
+            if let vmName = event.metadata["vmName"], !vmName.isEmpty {
+                return vmRuntimeLostMessage(vmName: vmName, language: language)
+            }
+        }
+        return event.message
+    }
+
+    private nonisolated func makeVMRuntimeLostDiagnostic(
+        for record: VMInstanceRecord,
+        language: AppLanguage
+    ) -> DiagnosticEvent {
+        let zhMsg = Self.vmRuntimeLostMessage(vmName: record.spec.name, language: .zhHans)
+        let enMsg = Self.vmRuntimeLostMessage(vmName: record.spec.name, language: .en)
+        return DiagnosticEvent(
+            severity: .warning,
+            subsystem: "Hypervisor",
+            vmID: record.id,
+            code: "VM_RUNTIME_LOST",
+            message: (language == .zhHans) ? zhMsg : enMsg,
+            metadata: [
+                "vmName": record.spec.name,
+                "message_zh": zhMsg,
+                "message_en": enMsg
+            ]
+        )
+    }
+
+    /// VM records as this process should report them (`ps`, `ps --json`, `daemon list`, MCP `agentvm_list_fleet`, HTML export).
     ///
     /// Lifecycle state written by the simulation backend is stored with `telemetry.simulated == true`, so a
     /// hardware-backend process that reads it reports it as simulated. Under the simulation backend every
     /// record's runtime state is, by definition, reported by the simulator, so the flag is set on all of them.
-    public func listVMsForReporting() async throws -> [VMInstanceRecord] {
+    ///
+    /// When a non-simulated VM is recorded as `running` in SQLite while neither held in this process nor
+    /// locked by a live `VMExecutionLock` holder, it is atomically reconciled to `stopped` and a single
+    /// `VM_RUNTIME_LOST` diagnostic is appended for that interruption.
+    public func listVMsForReporting(language: AppLanguage = .en) async throws -> [VMInstanceRecord] {
         let vms = try await store.listVMs()
         if isSimulationBackend {
             return vms.map { record in
@@ -624,21 +695,99 @@ public actor AgentVMFleetCoordinator {
                !record.telemetry.simulated,
                hardwareBoxes[record.id] == nil,
                !VMExecutionLock.isLocked(at: lockFileURL(for: record.id)) {
-                var stopped = record
-                stopped.telemetry.state = .stopped
-                stopped.telemetry.guestAgentConnected = false
-                stopped.telemetry.hasLiveGuestTelemetry = false
-                stopped.telemetry.vsockStreamsOpen = 0
-                stopped.telemetry.cpuUsagePercent = 0
-                stopped.telemetry.memoryResidentMB = 0
-                stampRuntimeOrigin(&stopped)
-                try? await store.upsertVM(stopped)
-                reconciledList.append(stopped)
+                let diag = makeVMRuntimeLostDiagnostic(for: record, language: language)
+                if let reconciled = try await store.reconcileLostRunningVM(vmID: record.id, diagnostic: diag).record {
+                    reconciledList.append(reconciled)
+                } else {
+                    var fallback = record
+                    fallback.telemetry.state = .stopped
+                    fallback.telemetry.guestAgentConnected = false
+                    fallback.telemetry.hasLiveGuestTelemetry = false
+                    fallback.telemetry.vsockStreamsOpen = 0
+                    fallback.telemetry.cpuUsagePercent = 0
+                    fallback.telemetry.memoryResidentMB = 0
+                    stampRuntimeOrigin(&fallback)
+                    reconciledList.append(fallback)
+                }
             } else {
                 reconciledList.append(record)
             }
         }
         return reconciledList
+    }
+
+    /// Startup reconciliation executed by `agentvm daemon run` after acquiring `daemon.lock` and before `bind`/`listen`.
+    @discardableResult
+    public func reconcileStaleRunningVMs(language: AppLanguage = .en) async throws -> [VMInstanceRecord] {
+        try await listVMsForReporting(language: language)
+    }
+
+    /// Discards any simulated state (A52) and reconciles any unlocked crashed hardware `running` state
+    /// before a disconnected CLI client (`exec`, `pause`, `resume`, `halt`) inspects or reports the VM's state.
+    public func prepareDisconnectedVMForClientOperation(
+        _ vmID: VMID,
+        language: AppLanguage = .en
+    ) async throws -> VMInstanceRecord {
+        let record = try await loadVMForOperation(vmID)
+        if !isSimulationBackend,
+           record.telemetry.state == .running,
+           !record.telemetry.simulated,
+           hardwareBoxes[vmID] == nil,
+           !VMExecutionLock.isLocked(at: lockFileURL(for: vmID)) {
+            let diag = makeVMRuntimeLostDiagnostic(for: record, language: language)
+            if let reconciled = try await store.reconcileLostRunningVM(vmID: vmID, diagnostic: diag).record {
+                return reconciled
+            }
+        }
+        return record
+    }
+
+    /// Client-side preflight before `agentvm up` may spawn or contact the workspace daemon:
+    /// 1. Discards any state left by `--backend simulation` (`loadVMForOperation`).
+    /// 2. Verifies a bootable guest OS/kernel exists on disk (`verifyBootableGuestSystem`).
+    /// 3. Verifies host Virtualization.framework support and current executable's `com.apple.security.virtualization` entitlement.
+    public func preflightPersistentBoot(
+        _ vmID: VMID,
+        checkProcessEntitlement: Bool = true,
+        hasEntitlementOverride: (@Sendable () -> Bool)? = nil
+    ) async throws -> VMInstanceRecord {
+        let record = try await loadVMForOperation(vmID)
+        try verifyBootableGuestSystem(for: record.spec)
+        if checkProcessEntitlement {
+            guard VZVirtualMachine.isSupported else {
+                throw AgentVMError.virtualizationUnsupported(
+                    reason: "VZVirtualMachine.isSupported returned false (this host cannot run Virtualization.framework guests)."
+                )
+            }
+            let entitled = hasEntitlementOverride?()
+                ?? HostHypervisorProbe.currentProcessHasBooleanEntitlement(HostHypervisorProbe.virtualizationEntitlementKey)
+            guard entitled else {
+                throw AgentVMError.virtualizationEntitlementMissing
+            }
+        }
+        return record
+    }
+
+    /// Returns records for VMs currently held in memory by this daemon process (`daemon status`).
+    public func daemonHeldVMs() async throws -> [VMInstanceRecord] {
+        guard !hardwareBoxes.isEmpty else { return [] }
+        let heldIDs = Set(hardwareBoxes.keys)
+        let all = try await store.listVMs()
+        return all.filter { heldIDs.contains($0.id) }
+    }
+
+    /// Gracefully shuts down all VMs held by this daemon process (`daemon stop` / `SIGTERM` / `SIGINT`).
+    public func shutdownAllDaemonHeldVMs() async -> [VMID] {
+        let heldIDs = hardwareBoxes.keys.sorted()
+        guard !heldIDs.isEmpty else { return [] }
+        var stopped: [VMID] = []
+        stopped.reserveCapacity(heldIDs.count)
+        for vmID in heldIDs {
+            if (try? await haltVM(vmID)) != nil {
+                stopped.append(vmID)
+            }
+        }
+        return stopped
     }
 
     /// Loads a VM record for a lifecycle or exec operation.

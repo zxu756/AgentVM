@@ -71,6 +71,7 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
             "modprobe vmw_vsock_virtio_transport || true",
             "systemctl daemon-reload",
             "systemctl enable --now serial-getty@hvc0.service || true",
+            "sync",
             "systemctl enable --now \(unitName)"
         ]
     }

@@ -861,4 +861,29 @@ struct VsockRPCAndTerminalTests {
         await session.shutdown()
         proc.waitUntilExit()
     }
+
+    @Test("A48: cloudInitRunCommands places 'sync' immediately before 'systemctl enable --now <unit>' so agentvm-guestd.py is flushed to disk before vsock connects")
+    func guestAgentCloudInitRunCommandsPlacesSyncImmediatelyBeforeSystemctlEnableA48() throws {
+        let defaultGen = GuestAgentBootstrapGenerator()
+        let defaultCmds = defaultGen.cloudInitRunCommands()
+        let syncIndex = try #require(defaultCmds.firstIndex(of: "sync"))
+        let enableIndex = try #require(defaultCmds.firstIndex(of: "systemctl enable --now agentvm-guestd.service"))
+        #expect(syncIndex + 1 == enableIndex)
+
+        let customGen = GuestAgentBootstrapGenerator(systemdUnitPath: "/etc/systemd/system/custom-guestd.service")
+        let customCmds = customGen.cloudInitRunCommands()
+        let customSyncIndex = try #require(customCmds.firstIndex(of: "sync"))
+        let customEnableIndex = try #require(customCmds.firstIndex(of: "systemctl enable --now custom-guestd.service"))
+        #expect(customSyncIndex + 1 == customEnableIndex)
+
+        let enriched = defaultGen.applying(to: CloudInitSpec(hostname: "a48-node", injectGuestVsockAgent: true))
+        let rendered = ISO9660CloudInitBuilder().renderNoCloudFiles(from: enriched)
+        let userData = try #require(rendered.first(where: { $0.path.hasSuffix("user-data") })?.utf8String)
+        let lines = userData.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+        let syncCandidates: Set<String> = ["- sync", "- 'sync'", "- \"sync\""]
+        let foundSyncIdx = lines.firstIndex(where: { syncCandidates.contains($0) })
+        let yamlSyncIdx = try #require(foundSyncIdx)
+        let yamlEnableIdx = try #require(lines.firstIndex(where: { $0.contains("systemctl enable --now agentvm-guestd.service") }))
+        #expect(yamlSyncIdx + 1 == yamlEnableIdx)
+    }
 }

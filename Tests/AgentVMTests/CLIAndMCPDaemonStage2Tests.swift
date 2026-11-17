@@ -793,6 +793,188 @@ struct CLIAndMCPDaemonStage2Tests {
         #expect(!FileManager.default.fileExists(atPath: paths.lockFileURL.path))
         #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
     }
+
+    // MARK: - Items 3, 4 & 5: Connect-Only Commands, A52, `ps` `list`/Fallback, `events`, and A53 Whitelists
+
+    @Test("Items 3 & 4: connect-only commands never spawn daemon, match Row 2 exit codes (exec 125 + A52 simulated reset, halt 0, pause 1, resume 1, stop 0), route ps via daemon list or DB reconciliation, and serve bilingual 'events'")
+    func connectOnlyCommandsDisconnectedExitCodesA52AndLiveDaemonListAndEvents() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-d34")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        let wsURL = URL(fileURLWithPath: "\(realBase)/Client34.agentvm", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = ["HOME": isolatedHome, "CFFIXED_USER_HOME": isolatedHome]
+        let cli = AgentVMCLIRunner()
+        let paths = DaemonWorkspacePaths(workspaceURL: wsURL)
+
+        let forbiddenSpawn = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exit 92"],
+            environment: env
+        )
+
+        #expect(await cli.execute(arguments: ["--workspace", wsURL.path, "init"], environment: env).exitCode == 0)
+        #expect(await cli.execute(arguments: ["--workspace", wsURL.path, "create", "a"], environment: env).exitCode == 0)
+        #expect(await cli.execute(arguments: ["--workspace", wsURL.path, "create", "b"], environment: env).exitCode == 0)
+
+        // 1. Row 2 sequence with no daemon running:
+        //    ps (0), ps --json (0), events --json (0), exec a -- true (125 ERR_LIFECYCLE_STATE + up hint),
+        //    halt a (0), pause a (1), resume a (1), daemon stop (0) — zero daemon spawned, no daemon.sock!
+        let rPs = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "ps"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rPs.exitCode == 0)
+
+        let rPsJSON = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "ps", "--json"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rPsJSON.exitCode == 0)
+
+        let rEventsJSON = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "events", "--json"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rEventsJSON.exitCode == 0)
+
+        let rExecEn = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "a", "--", "true"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rExecEn.exitCode == 125)
+        #expect(rExecEn.stdout.isEmpty)
+        #expect(rExecEn.stderr.contains("ERR_LIFECYCLE_STATE"))
+        #expect(rExecEn.stderr.contains("agentvm up a"))
+
+        let rExecZh = await cli.execute(arguments: ["--lang", "zh", "--workspace", wsURL.path, "exec", "a", "--", "true"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rExecZh.exitCode == 125)
+        #expect(rExecZh.stderr.contains("ERR_LIFECYCLE_STATE"))
+        #expect(rExecZh.stderr.contains("agentvm up a"))
+
+        let rHalt = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "a"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rHalt.exitCode == 0)
+
+        let rPause = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "pause", "a"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rPause.exitCode == 1)
+
+        let rResume = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "resume", "a"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rResume.exitCode == 1)
+
+        let rStop = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "stop"], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        #expect(rStop.exitCode == 0)
+
+        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
+        #expect(!FileManager.default.fileExists(atPath: paths.lockFileURL.path))
+
+        // 2. A52: Put `a` into simulated running, then run hardware `exec a -- true`:
+        //    must strip simulated running state FIRST and report state 'stopped' (never fake 'running'), exiting 125.
+        #expect(await cli.execute(arguments: ["--backend", "simulation", "--workspace", wsURL.path, "up", "a"], environment: env).exitCode == 0)
+        let execAfterSim = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "a", "--", "true"],
+            environment: env,
+            daemonSpawnOverride: forbiddenSpawn
+        )
+        #expect(execAfterSim.exitCode == 125)
+        #expect(execAfterSim.stderr.contains("ERR_LIFECYCLE_STATE"))
+        #expect(execAfterSim.stderr.contains("stopped"))
+        #expect(!execAfterSim.stderr.contains("state 'running'"))
+        #expect(execAfterSim.stderr.contains("agentvm up a"))
+
+        // Simulation mode stays in-process and works unchanged.
+        #expect(await cli.execute(arguments: ["--backend", "simulation", "--workspace", wsURL.path, "up", "a"], environment: env).exitCode == 0)
+        let simExec = await cli.execute(arguments: ["--backend", "simulation", "--workspace", wsURL.path, "exec", "a", "--", "uname", "-a"], environment: env)
+        #expect(simExec.exitCode == 0)
+        #expect(simExec.stdout.hasPrefix("SIMULATED:"))
+
+        // 3. Crashed hardware VM `b`: `ps` reconciles to `stopped` + writes `VM_RUNTIME_LOST`, and `events` reads it in EN & ZH.
+        let store = try AgentVMProjectStore(bundleURL: wsURL, createIfMissing: false)
+        var crashedB = try #require(try await store.listVMs().first(where: { $0.spec.name == "b" }))
+        crashedB.telemetry.state = .running
+        crashedB.telemetry.simulated = false
+        try await store.upsertVM(crashedB)
+
+        let psReconcile = await cli.execute(arguments: ["--lang", "zh", "--workspace", wsURL.path, "ps", "--json"], environment: env)
+        #expect(psReconcile.exitCode == 0)
+        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
+
+        let evZhJSON = await cli.execute(arguments: ["--lang", "zh", "--workspace", wsURL.path, "events", "--vm", "b", "--limit", "5", "--json"], environment: env)
+        #expect(evZhJSON.exitCode == 0)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decodedZhEvents = try decoder.decode([DiagnosticEvent].self, from: Data(evZhJSON.stdout.utf8))
+        let lostZh = try #require(decodedZhEvents.first(where: { $0.code == "VM_RUNTIME_LOST" }))
+        #expect(lostZh.message.contains("上次运行异常中断：持有这台机器的进程没有正常退出"))
+
+        let evEnJSON = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "events", "--vm", "b", "--limit", "5", "--json"], environment: env)
+        #expect(evEnJSON.exitCode == 0)
+        let decodedEnEvents = try decoder.decode([DiagnosticEvent].self, from: Data(evEnJSON.stdout.utf8))
+        let lostEn = try #require(decodedEnEvents.first(where: { $0.code == "VM_RUNTIME_LOST" }))
+        #expect(lostEn.message.contains("Previous run terminated unexpectedly"))
+
+        let evTextZh = await cli.execute(arguments: ["--lang", "zh", "--workspace", wsURL.path, "events", "--vm", "b", "--limit", "1"], environment: env)
+        #expect(evTextZh.exitCode == 0)
+        #expect(evTextZh.stdout.contains("VM_RUNTIME_LOST"))
+        #expect(evTextZh.stdout.contains("上次运行异常中断：持有这台机器的进程没有正常退出"))
+
+        let badLimit = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "events", "--limit", "0"], environment: env)
+        #expect(badLimit.exitCode == AgentVMCLIRunner.usageErrorExitCode)
+
+        // 4. With live WorkspaceDaemonServer running, `ps`, `exec`, `halt`, `pause` route over RPC cleanly.
+        guard case let .started(server) = try await WorkspaceDaemonServer.start(workspaceURL: wsURL) else {
+            Issue.record("Expected WorkspaceDaemonServer to start")
+            return
+        }
+        defer {
+            Task { await server.stopAndCleanup() }
+        }
+
+        let livePs = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "ps", "--json"], environment: env)
+        #expect(livePs.exitCode == 0)
+        let liveFleet = try decoder.decode([VMInstanceRecord].self, from: Data(livePs.stdout.utf8))
+        #expect(liveFleet.count == 2)
+
+        let liveExec = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "b", "--", "true"], environment: env)
+        #expect(liveExec.exitCode == 125)
+        #expect(liveExec.stderr.contains("ERR_LIFECYCLE_STATE"))
+        #expect(liveExec.stderr.contains("agentvm up b"))
+
+        let liveHalt = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "b"], environment: env)
+        #expect(liveHalt.exitCode == 0)
+
+        let livePause = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "pause", "b"], environment: env)
+        #expect(livePause.exitCode == 1)
+
+        await server.stopAndCleanup()
+    }
+
+    @Test("Item 5 (A53): cliSubcommands, bilingual helpBanner, and all 3 acceptance script whitelists include daemon and events (plus image & run in readme-commands.sh)")
+    func subcommandRegistrationHelpBannerAndAcceptanceScriptWhitelistsA53() throws {
+        #expect(AgentVMCLIRunner.cliSubcommands.contains("daemon"))
+        #expect(AgentVMCLIRunner.cliSubcommands.contains("events"))
+
+        let helpEn = AgentVMCLIRunner.helpBanner(language: .en)
+        let helpZh = AgentVMCLIRunner.helpBanner(language: .zhHans)
+        #expect(helpEn.contains("daemon"))
+        #expect(helpEn.contains("events"))
+        #expect(helpZh.contains("daemon"))
+        #expect(helpZh.contains("events"))
+
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        let readmeScript = try String(
+            contentsOf: repoRoot.appendingPathComponent("Scripts/acceptance/readme-commands.sh"),
+            encoding: .utf8
+        )
+        for token in ["\"image\"", "\"run\"", "\"daemon\"", "\"events\""] {
+            #expect(readmeScript.contains(token), "readme-commands.sh missing \(token)")
+        }
+
+        let m0Script = try String(
+            contentsOf: repoRoot.appendingPathComponent("Scripts/acceptance/m0-acceptance.sh"),
+            encoding: .utf8
+        )
+        #expect(m0Script.contains("|daemon|") || m0Script.contains("daemon|"))
+        #expect(m0Script.contains("|events|") || m0Script.contains("|events)"))
+
+        let m1Script = try String(
+            contentsOf: repoRoot.appendingPathComponent("Scripts/acceptance/m1-real-boot.sh"),
+            encoding: .utf8
+        )
+        #expect(m1Script.contains("|daemon|") || m1Script.contains("daemon|"))
+        #expect(m1Script.contains("|events|") || m1Script.contains("|events)"))
+    }
 }
 
 private final class Stage2AtomicFlag: @unchecked Sendable {

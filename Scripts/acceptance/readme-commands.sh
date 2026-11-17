@@ -48,7 +48,8 @@ READMES = [("README.md", "en"), ("README.zh-CN.md", "zh")]
 # Subcommands that route the executable to its headless CLI. A command line without one of these would
 # open the desktop UI, so it is rejected before anything is executed.
 CLI_SUBCOMMANDS = {
-    "doctor", "init", "ps", "list", "create", "up", "boot", "start", "pause", "resume", "halt", "stop",
+    "doctor", "init", "ps", "list", "image", "create", "run", "daemon", "events",
+    "up", "boot", "start", "pause", "resume", "halt", "stop",
     "branch", "fork", "snapshot", "restore", "exec", "pcap", "policy", "plugin", "export-hcl",
     "export-html", "help", "version",
 }

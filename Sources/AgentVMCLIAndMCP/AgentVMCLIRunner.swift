@@ -235,7 +235,7 @@ private final class StreamedBinaryOutputCollector: @unchecked Sendable {
 public struct AgentVMCLIRunner: Sendable {
     public static let cliSubcommands: Set<String> = [
         "doctor", "init", "ps", "list", "image", "create", "run",
-        "daemon",
+        "daemon", "events",
         "up", "boot", "start", "pause", "resume", "halt", "stop",
         "branch", "fork", "snapshot", "restore",
         "exec", "pcap", "policy", "plugin",
@@ -509,6 +509,15 @@ public struct AgentVMCLIRunner: Sendable {
                 )
             }
         }
+        if subcommand == "events" {
+            if let usageErr = Self.validateEventsSubcommandUsage(parsed: parsed, language: language) {
+                let rawStderr = usageErr + "\n"
+                return CLIExecutionOutcome(
+                    exitCode: Self.usageErrorExitCode,
+                    stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                )
+            }
+        }
         var parsedRun: ParsedRunArguments?
         if subcommand == "run" {
             switch Self.parseRunArguments(rest, language: language) {
@@ -630,7 +639,21 @@ public struct AgentVMCLIRunner: Sendable {
             case "ps", "list":
                 let asJSON = parsed.flags.contains("--json")
                 if asJSON { stdoutFormat = .json }
-                rawOutcome = try await runListVMs(coordinator: coordinator, asJSON: asJSON, language: language)
+                rawOutcome = try await runListVMs(
+                    coordinator: coordinator,
+                    asJSON: asJSON,
+                    isSimulation: isSimulationFlagged,
+                    language: language
+                )
+            case "events":
+                let asJSON = parsed.flags.contains("--json")
+                if asJSON { stdoutFormat = .json }
+                rawOutcome = try await runEvents(
+                    coordinator: coordinator,
+                    parsed: parsed,
+                    asJSON: asJSON,
+                    language: language
+                )
             case "create":
                 rawOutcome = try await runCreateVM(
                     coordinator: coordinator,
@@ -699,7 +722,12 @@ public struct AgentVMCLIRunner: Sendable {
             case "restore":
                 rawOutcome = try await runRestore(coordinator: coordinator, parsed: parsed, language: language)
             case "exec":
-                rawOutcome = try await runExec(coordinator: coordinator, args: rest, language: language)
+                rawOutcome = try await runExec(
+                    coordinator: coordinator,
+                    args: rest,
+                    isSimulation: isSimulationFlagged,
+                    language: language
+                )
             case "pcap":
                 rawOutcome = try await runPCAP(
                     coordinator: coordinator,
@@ -757,7 +785,9 @@ public struct AgentVMCLIRunner: Sendable {
                 hintLine = "Hint: \(err.remediationHint)"
             }
             let rawStderr = streamedProgressStderr.snapshot() + "[\(err.errorCode)] \(localizedErr)\n\(hintLine)\n"
-            let errorExitCode: Int32 = (subcommand == "run") ? Self.runInfrastructureErrorExitCode : 1
+            let errorExitCode: Int32 = (subcommand == "run" || (subcommand == "exec" && !isSimulationFlagged))
+                ? Self.runInfrastructureErrorExitCode
+                : 1
             return CLIExecutionOutcome(
                 exitCode: errorExitCode,
                 stdoutData: Data(),
@@ -890,10 +920,30 @@ public struct AgentVMCLIRunner: Sendable {
         return CLIExecutionOutcome(exitCode: 0, stdout: out)
     }
 
-    private func runListVMs(coordinator: AgentVMFleetCoordinator, asJSON: Bool, language: AppLanguage) async throws -> CLIExecutionOutcome {
-        // `listVMsForReporting` carries `telemetry.simulated`: true for state the simulator wrote (any backend
-        // reading it) and for every record when this process itself runs the simulation backend.
-        let vms = try await coordinator.listVMsForReporting()
+    private func runListVMs(
+        coordinator: AgentVMFleetCoordinator,
+        asJSON: Bool,
+        isSimulation: Bool,
+        language: AppLanguage
+    ) async throws -> CLIExecutionOutcome {
+        // Under hardware backend, query live daemon `list` RPC first (connect-only, never spawning);
+        // if no daemon is running, fall back to SQLite + crash reconciliation (`VM_RUNTIME_LOST`).
+        let vms: [VMInstanceRecord]
+        if !isSimulation {
+            let rpcOutcome = try DaemonClient.performUnaryCall(
+                workspaceURL: coordinator.store.bundleURL,
+                call: .list(DaemonRPCListParams(lang: language)),
+                resultType: DaemonRPCListResult.self
+            )
+            switch rpcOutcome {
+            case let .connected((_, listResult)):
+                vms = listResult.vms
+            case .daemonNotRunning:
+                vms = try await coordinator.listVMsForReporting(language: language)
+            }
+        } else {
+            vms = try await coordinator.listVMsForReporting(language: language)
+        }
         if asJSON {
             return CLIExecutionOutcome(exitCode: 0, stdout: try Self.encodeFleetJSON(vms) + "\n")
         }
@@ -1062,11 +1112,47 @@ public struct AgentVMCLIRunner: Sendable {
             throw AgentVMError.persistentBootRequiresDaemon(vmName: record.spec.name)
         }
         let updated: VMInstanceRecord
-        switch action {
-        case "boot": updated = try await coordinator.bootPersistentVM(vmID)
-        case "pause": updated = try await coordinator.pauseVM(vmID)
-        case "resume": updated = try await coordinator.resumeVM(vmID)
-        default: updated = try await coordinator.haltVM(vmID)
+        if !isSimulation {
+            let params = DaemonRPCVMLifecycleParams(vm: vmID.rawValue, lang: language)
+            let call: DaemonRPCCall
+            switch action {
+            case "pause":
+                call = .pause(params)
+            case "resume":
+                call = .resume(params)
+            default:
+                call = .halt(params)
+            }
+            let rpcOutcome = try DaemonClient.performUnaryCall(
+                workspaceURL: coordinator.store.bundleURL,
+                call: call,
+                resultType: DaemonRPCVMLifecycleResult.self
+            )
+            switch rpcOutcome {
+            case let .connected((_, lifeRes)):
+                updated = lifeRes.vm
+            case .daemonNotRunning:
+                // Connect-only fallback: treat as "no machine running" (strips simulated state & reconciles crash).
+                let prepared = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: language)
+                switch action {
+                case "pause":
+                    updated = try await coordinator.pauseVM(vmID)
+                case "resume":
+                    if prepared.telemetry.state != .stopped {
+                        _ = try await coordinator.haltVM(vmID)
+                    }
+                    updated = try await coordinator.resumeVM(vmID)
+                default:
+                    updated = try await coordinator.haltVM(vmID)
+                }
+            }
+        } else {
+            switch action {
+            case "boot": updated = try await coordinator.bootPersistentVM(vmID)
+            case "pause": updated = try await coordinator.pauseVM(vmID)
+            case "resume": updated = try await coordinator.resumeVM(vmID)
+            default: updated = try await coordinator.haltVM(vmID)
+            }
         }
         let stateText = updated.telemetry.markedStateLabel(
             localizedState: isZh ? Self.localizedStateLabelZh(updated.telemetry.state) : nil
@@ -1165,7 +1251,12 @@ public struct AgentVMCLIRunner: Sendable {
         return CLIExecutionOutcome(exitCode: 0, stdout: msg)
     }
 
-    private func runExec(coordinator: AgentVMFleetCoordinator, args: [String], language: AppLanguage) async throws -> CLIExecutionOutcome {
+    private func runExec(
+        coordinator: AgentVMFleetCoordinator,
+        args: [String],
+        isSimulation: Bool,
+        language: AppLanguage
+    ) async throws -> CLIExecutionOutcome {
         let isZh = (language == .zhHans)
         guard let vmToken = args.first else {
             throw AgentVMError.cliUsageError(
@@ -1174,7 +1265,6 @@ public struct AgentVMCLIRunner: Sendable {
                     : "Usage: agentvm exec <vm-id-or-name> -- <command> [args...]"
             )
         }
-        let vmID = try await resolveVMID(vmToken, coordinator: coordinator)
         var cmdTokens = Array(args.dropFirst())
         if cmdTokens.first == "--" {
             cmdTokens.removeFirst()
@@ -1184,6 +1274,59 @@ public struct AgentVMCLIRunner: Sendable {
                 detail: isZh ? "缺少要在客户机中执行的可执行命令。" : "Missing executable after VM identifier."
             )
         }
+        let vmID = try await resolveVMID(vmToken, coordinator: coordinator)
+
+        if !isSimulation {
+            let execParams = DaemonRPCExecParams(
+                vm: vmID.rawValue,
+                executable: exe,
+                arguments: Array(cmdTokens.dropFirst()),
+                workingDirectory: "/",
+                runAsUser: "root",
+                environment: [:],
+                timeoutSeconds: 3600,
+                lang: language
+            )
+            do {
+                let rpcOutcome = try DaemonClient.performUnaryCall(
+                    workspaceURL: coordinator.store.bundleURL,
+                    call: .exec(execParams),
+                    resultType: DaemonRPCExecResult.self
+                )
+                switch rpcOutcome {
+                case let .connected((_, execRes)):
+                    return CLIExecutionOutcome(exitCode: execRes.exitCode)
+                case .daemonNotRunning:
+                    // A52: strip any state written by `--backend simulation` (and reconcile crashed running state)
+                    // BEFORE formatting the `ERR_LIFECYCLE_STATE` message so we never report a fake simulated `running`.
+                    let rec = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: language)
+                    let rpcErr = DaemonLifecycleErrorFormatter.execNotRunningRPCError(
+                        vmName: rec.spec.name,
+                        vmID: rec.id,
+                        state: rec.telemetry.state,
+                        language: language
+                    )
+                    return CLIExecutionOutcome(
+                        exitCode: Self.runInfrastructureErrorExitCode,
+                        stderr: DaemonLifecycleErrorFormatter.formatExecRPCErrorStderr(
+                            rpcErr,
+                            vmName: rec.spec.name,
+                            language: language
+                        )
+                    )
+                }
+            } catch let rpcErr as DaemonRPCError {
+                return CLIExecutionOutcome(
+                    exitCode: Self.runInfrastructureErrorExitCode,
+                    stderr: DaemonLifecycleErrorFormatter.formatExecRPCErrorStderr(
+                        rpcErr,
+                        vmName: vmToken,
+                        language: language
+                    )
+                )
+            }
+        }
+
         let result = try await coordinator.executeInGuest(
             vmID: vmID,
             request: GuestExecRequest(executable: exe, arguments: Array(cmdTokens.dropFirst()))
@@ -1193,6 +1336,61 @@ public struct AgentVMCLIRunner: Sendable {
             stdoutData: result.stdoutData,
             stderrData: result.stderrData
         )
+    }
+
+    private func runEvents(
+        coordinator: AgentVMFleetCoordinator,
+        parsed: ParsedSubcommandArguments,
+        asJSON: Bool,
+        language: AppLanguage
+    ) async throws -> CLIExecutionOutcome {
+        let isZh = (language == .zhHans)
+        let filterVMID: VMID?
+        if let rawVM = parsed.options["--vm"] {
+            let trimmed = rawVM.trimmingCharacters(in: .whitespacesAndNewlines)
+            filterVMID = try await resolveVMID(trimmed, coordinator: coordinator)
+        } else {
+            filterVMID = nil
+        }
+        let limit = parsed.options["--limit"].flatMap(Int.init) ?? 200
+        let rawEvents = try await coordinator.store.listDiagnostics(vmID: filterVMID, limit: limit)
+        let localizedEvents: [DiagnosticEvent] = rawEvents.map { ev in
+            var copy = ev
+            copy.message = AgentVMFleetCoordinator.localizedDiagnosticMessage(for: ev, in: language)
+            return copy
+        }
+
+        if asJSON {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(localizedEvents)
+            return CLIExecutionOutcome(exitCode: 0, stdout: String(decoding: data, as: UTF8.self) + "\n")
+        }
+
+        if localizedEvents.isEmpty {
+            let emptyMsg = isZh ? "暂无诊断事件。\n" : "No diagnostic events recorded.\n"
+            return CLIExecutionOutcome(exitCode: 0, stdout: emptyMsg)
+        }
+
+        let vms = try await coordinator.store.listVMs()
+        let namesByID = Dictionary(uniqueKeysWithValues: vms.map { ($0.id, $0.spec.name) })
+        let iso = ISO8601DateFormatter()
+        let lines: [String] = localizedEvents.map { ev in
+            let ts = iso.string(from: ev.timestamp)
+            let vmPart: String
+            if let vid = ev.vmID {
+                if let vmName = namesByID[vid] {
+                    vmPart = " [\(vmName) / \(vid.rawValue)]"
+                } else {
+                    vmPart = " [\(vid.rawValue)]"
+                }
+            } else {
+                vmPart = ""
+            }
+            return "\(ts) [\(ev.severity.rawValue.uppercased())] [\(ev.code)]\(vmPart) \(ev.message)"
+        }
+        return CLIExecutionOutcome(exitCode: 0, stdout: lines.joined(separator: "\n") + "\n")
     }
 
     private func runOneShot(
@@ -2077,6 +2275,31 @@ public struct AgentVMCLIRunner: Sendable {
         }
     }
 
+    private static func validateEventsSubcommandUsage(
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage
+    ) -> String? {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+
+        if let rawVM = parsed.options["--vm"] {
+            if rawVM.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return isZh
+                    ? "选项「--vm」需要非空的虚拟机名称或 ID。\(helpHintZh)"
+                    : "Option '--vm' requires a non-empty VM name or ID. \(helpHintEn)"
+            }
+        }
+        if let rawLimit = parsed.options["--limit"] {
+            guard let n = Int(rawLimit), n >= 1 else {
+                return isZh
+                    ? "无效的「--limit」值「\(rawLimit)」（需要 >= 1 的整数）。\(helpHintZh)"
+                    : "Invalid '--limit' value '\(rawLimit)' (expected integer >= 1). \(helpHintEn)"
+            }
+        }
+        return nil
+    }
+
     // MARK: - Formatting & Resolution Helpers
 
     private func resolveVMID(_ token: String, coordinator: AgentVMFleetCoordinator) async throws -> VMID {
@@ -2135,6 +2358,11 @@ public struct AgentVMCLIRunner: Sendable {
                 flags: ["--json"],
                 maxPositionals: 1,
                 allowedFirstPositional: ["run", "start", "status", "stop"]
+            ),
+            "events": SubcommandGrammar(
+                flags: ["--json"],
+                valueOptions: ["--vm", "--limit"],
+                maxPositionals: 0
             ),
             "create": SubcommandGrammar(
                 valueOptions: ["--owner", "--cpus", "--memory-mb", "--image", "--disk-size"],
@@ -2355,6 +2583,11 @@ public struct AgentVMCLIRunner: Sendable {
               init [--seed-demo]              初始化空 .agentvm 工作区（加 --seed-demo 显式载入带 [演示数据] 标记的合成演示集群）
               ps [--json]                     列出沙盒虚拟机、状态、CPU/内存遥测（未实测时显示 —）、IPv4 与 CoW 脏块；
                                               模拟后端写入的状态显示为 SIMULATED:<状态>，JSON 里是 telemetry.simulated = true
+              events [--vm <名称>] [--limit N] [--json]
+                                              读取工作区诊断事件账本（diagnostics 表），支持按虚拟机过滤与条数限制
+              daemon start|status|stop [--json]
+                                              启动、查询或停止本工作区的后台常驻守护进程（未运行时 status 返回退出码 3）；
+                                              daemon run --workspace <绝对路径> 在前台运行守护进程本体
               image list [--json]             列出基础镜像目录条目、支持状态与共享缓存状态（默认 ~/Library/Caches/AgentVM/images）
               image pull <id>                 通过 HTTPS（支持断点续传）下载基础镜像至共享缓存并校验大小与 SHA-512
               image verify <id>               在本地重新计算缓存镜像的 SHA-512 与大小并核对固定目录记录（不联网）
@@ -2399,6 +2632,11 @@ public struct AgentVMCLIRunner: Sendable {
           init [--seed-demo]              Initialize an empty .agentvm bundle (pass --seed-demo for [DEMO]-labeled synthetic data)
           ps [--json]                     List sandbox VMs, states, telemetry ('—' when unmeasured), IPv4, and CoW dirty bytes;
                                           state written by the simulator shows as SIMULATED:<state> (JSON: telemetry.simulated = true)
+          events [--vm <name>] [--limit N] [--json]
+                                          Read diagnostic events from the workspace diagnostics ledger
+          daemon start|status|stop [--json]
+                                          Start, inspect, or stop this workspace's background daemon (status exits 3 when not running);
+                                          daemon run --workspace <abs-path> runs the daemon server in the foreground
           image list [--json]             List curated base images, support status, and shared cache status (AGENTVM_IMAGE_CACHE)
           image pull <id>                 Download base image over HTTPS (resumable Range) and verify size & SHA-512
           image verify <id>               Recompute cached image SHA-512 & size against pinned catalog entry (offline)

@@ -431,7 +431,7 @@ ensure_cli_subcommand() {
     for token in "$@"; do
         [[ "$token" == "--" ]] && break
         case "$token" in
-            doctor|init|ps|list|image|create|run|up|boot|start|pause|resume|halt|stop|branch|fork|snapshot|restore|exec|pcap|policy|plugin|export-hcl|export-html|help|version|mcp)
+            doctor|init|ps|list|image|create|run|daemon|events|up|boot|start|pause|resume|halt|stop|branch|fork|snapshot|restore|exec|pcap|policy|plugin|export-hcl|export-html|help|version|mcp)
                 has_subcommand=1
                 break
                 ;;

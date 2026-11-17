@@ -324,6 +324,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case snapshotNotFound(SnapshotID)
     case invalidLifecycleTransition(vmID: VMID, from: String, requested: String)
     case execRequiresRunningVM(vmName: String, vmID: VMID, currentState: VMLifecycleState)
+    case execOutputBufferOverflow(vmID: VMID, streamID: UInt32, queuedBytes: Int, hardLimitBytes: Int)
     case diskImageOperationFailed(path: String, errnoCode: Int32, detail: String)
     case cowCloneFailed(source: String, destination: String, errnoCode: Int32)
     case iso9660BuildFailed(detail: String)
@@ -374,6 +375,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .vmNotFound: return "ERR_VM_NOT_FOUND"
         case .snapshotNotFound: return "ERR_SNAPSHOT_NOT_FOUND"
         case .invalidLifecycleTransition, .execRequiresRunningVM: return "ERR_LIFECYCLE_STATE"
+        case .execOutputBufferOverflow: return "ERR_EXEC_OUTPUT_OVERFLOW"
         case .diskImageOperationFailed: return "ERR_DISK_IO"
         case .cowCloneFailed: return "ERR_APFS_COW_CLONE"
         case .iso9660BuildFailed: return "ERR_ISO9660_BUILD"
@@ -534,6 +536,10 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "虚拟机「\(vmName)」（\(vmID.rawValue)）当前处于「\(currentState.rawValue)」状态（客户机未在运行），无法在客户机中执行命令。请先运行 'agentvm up \(vmName)' 启动虚拟机。"
                 : "Cannot perform 'exec' on VM '\(vmName)' (\(vmID.rawValue)) while in state '\(currentState.rawValue)' (guest is not running). Run 'agentvm up \(vmName)' first."
+        case let .execOutputBufferOverflow(vmID, streamID, queuedBytes, hardLimitBytes):
+            return isZh
+                ? "虚拟机「\(vmID.rawValue)」上的客户机命令输出缓冲队列超过硬上限（流 \(streamID)：积压 \(queuedBytes) 字节 > 上限 \(hardLimitBytes) 字节，客户端未及时读取），已向该流发送 RST 并中止本次 exec。"
+                : "Guest command output queue on VM '\(vmID.rawValue)' exceeded hard limit on stream \(streamID) (\(queuedBytes) bytes queued > \(hardLimitBytes) bytes cap while client was not reading); stream reset with RST."
         case let .diskImageOperationFailed(path, errnoCode, detail):
             return isZh
                 ? "磁盘操作失败「\(path)」（errno=\(errnoCode)）：\(detail)"
@@ -665,6 +671,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
                 return "Resume the VM first with 'agentvm resume \(vmName)'."
             }
             return "Start the VM first with 'agentvm up \(vmName)'."
+        case .execOutputBufferOverflow:
+            return "Drain stdout/stderr from 'agentvm exec' continuously or redirect large outputs to a file inside the guest."
         default:
             return "Inspect the Audit Journal drawer or run 'agentvm doctor' for detailed diagnostics."
         }

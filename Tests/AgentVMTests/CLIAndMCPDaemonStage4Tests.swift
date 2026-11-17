@@ -647,6 +647,336 @@ struct CLIAndMCPDaemonStage4Tests {
         }
     }
 
+    // MARK: - Item 4 (A37 & A49): Per-Exec Bounded Output Queue, Window Backpressure, and >2x Hard Cap RST (Exit 125 + Diagnostic)
+
+    @Test("Item 4 (A37): non-reading exec client pauses window updates at 1 MiB without blocking sibling exec or heartbeats, resumes window updates once drained, and >2x overflow emits RST, exits 125, and records diagnostic")
+    func daemonExecBackpressureDecouplesReadLoopPausesWindowAndResets2xOverflowA37() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s4-i4")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+
+        let (cacheDir, cachedURL, entry) = try await stageBootableCachedImage(in: realBase)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let wsURL = URL(fileURLWithPath: "\(realBase)/ExecBackpressureA37.agentvm", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = [
+            "HOME": isolatedHome,
+            "CFFIXED_USER_HOME": isolatedHome,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+        let forbiddenSpawn = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exit 95"],
+            environment: env
+        )
+
+        #expect(await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "create", "t1", "--image", entry.id],
+            curatedEntriesOverride: [entry],
+            environment: env
+        ).exitCode == 0)
+
+        let chunkSize = 32 * 1024 // 32 KiB
+        let chunkA = Data(repeating: 0x41, count: chunkSize)
+        let chunkB = Data(repeating: 0x42, count: chunkSize)
+
+        let slowPhaseGate = Stage4AsyncStepSignal()
+        let rstRecorder = Stage4InboundFrameRecorder()
+
+        let mockBackend = Stage4ScriptableGuestBackend(
+            frameObserver: { header, _, _ in
+                rstRecorder.record(header)
+            },
+            execHandler: { streamID, req, writer in
+                rstRecorder.recordExecStarted(executable: req.executable, streamID: streamID)
+                switch req.executable {
+                case "fast-uname":
+                    writer.sendOutputChunk(
+                        streamID: streamID,
+                        requestID: req.id,
+                        stream: .stdout,
+                        seq: 1,
+                        data: Data("6.1.0-s4-backpressure\n".utf8)
+                    )
+                    writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+
+                case "emit-heartbeat":
+                    let uptime = Double(req.arguments.first ?? "777") ?? 777.0
+                    _ = writer.sendHeartbeat(hostname: "a37-hb", uptimeSeconds: uptime)
+                    writer.sendOutputChunk(
+                        streamID: streamID,
+                        requestID: req.id,
+                        stream: .stdout,
+                        seq: 1,
+                        data: Data("hb-ok\n".utf8)
+                    )
+                    writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+
+                case "slow-bounded-1536k":
+                    // Push 40 * 32 KiB = 1,280 KiB (> 1 MiB soft limit + Unix socket buffer, < 2 MiB hard cap).
+                    var seq: UInt32 = 0
+                    for _ in 0..<40 {
+                        seq &+= 1
+                        if !writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: seq, data: chunkA) {
+                            return
+                        }
+                    }
+                    slowPhaseGate.signalStep(1)
+                    // Wait until test checks window updates at 1,280 KiB, then push 2 more chunks (+64 KiB = 1,344 KiB).
+                    await slowPhaseGate.waitForStep(2, timeoutSeconds: 3.0)
+                    for _ in 0..<2 {
+                        seq &+= 1
+                        if !writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: seq, data: chunkA) {
+                            return
+                        }
+                    }
+                    slowPhaseGate.signalStep(3)
+                    // Wait until client drains and window updates resume, then send remaining 6 chunks (total 48 * 32 KiB = 1.5 MiB) + FIN.
+                    await slowPhaseGate.waitForStep(4, timeoutSeconds: 3.0)
+                    for _ in 0..<6 {
+                        seq &+= 1
+                        if !writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: seq, data: chunkA) {
+                            return
+                        }
+                    }
+                    writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+
+                case "runaway-over-2mib":
+                    // Simulate v1.0.0 guest script ignoring peer_window (A49): push up to 80 * 32 KiB = 2.5 MiB (> 2x 1 MiB) unless RST arrives.
+                    var seq: UInt32 = 0
+                    for _ in 0..<80 {
+                        if rstRecorder.hasRST(forStreamID: streamID) {
+                            return
+                        }
+                        seq &+= 1
+                        if !writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: seq, data: chunkB) {
+                            return
+                        }
+                    }
+                    if !rstRecorder.hasRST(forStreamID: streamID) {
+                        writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+                    }
+
+                default:
+                    writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+                }
+            }
+        )
+        defer { mockBackend.shutdownAll() }
+
+        try await withStartedDaemonServer(
+            workspaceURL: wsURL,
+            imageCacheDirectoryURL: cacheDir,
+            curatedImageEntries: [entry],
+            hardwareBackendOverride: mockBackend
+        ) { server in
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+
+            let vms = try await server.coordinator.store.listVMs()
+            let vmID = try #require(vms.first?.id)
+
+            // =========================================================================
+            // Part A: Slow client does NOT read from its Unix socket at all while 1.3 MiB arrives:
+            //  - Queue fills past 1 MiB -> host stops sending WINDOW_UPDATE on slowStreamID;
+            //  - Sibling `exec t1 -- fast-uname` and guest heartbeats still complete promptly;
+            //  - Once slow client drains its socket, host resumes WINDOW_UPDATE and stream finishes 0.
+            // =========================================================================
+            let slowConn = try DaemonSocketClient.connectWorkspace(workspaceURL: wsURL)
+            let slowConnClosed = Stage4AtomicFlag()
+            defer {
+                if slowConnClosed.trySet() {
+                    slowConn.close()
+                }
+            }
+            let slowReader = slowConn.makeLineReader()
+            let clientHello = DaemonRPCHello(executablePath: DaemonExecutableLocator.resolveCurrentExecutablePath())
+            try slowConn.writeLineData(try DaemonRPCCodec.encodeHelloLine(clientHello))
+            _ = try slowReader.readLineData() // daemon hello
+            let slowReqEnv = DaemonRPCRequestEnvelope(
+                id: .int(101),
+                call: .exec(DaemonRPCExecParams(vm: vmID.rawValue, executable: "slow-bounded-1536k"))
+            )
+            try slowConn.writeLineData(try DaemonRPCCodec.encodeRequestLine(slowReqEnv))
+
+            let slowStreamID = try await rstRecorder.waitForExecStreamID(executable: "slow-bounded-1536k", timeoutSeconds: 2.0)
+
+            // Wait up to 800 ms for guest to finish pushing initial 40 chunks (on broken A37 HEAD, guest blocks in socketpair write once read loop freezes).
+            _ = await slowPhaseGate.waitForStep(1, timeoutSeconds: 0.8)
+            try await Task.sleep(nanoseconds: 80_000_000)
+            let updatesAt1280KiB = rstRecorder.windowUpdates(forStreamID: slowStreamID).count
+
+            slowPhaseGate.signalStep(2)
+            _ = await slowPhaseGate.waitForStep(3, timeoutSeconds: 0.5)
+            try await Task.sleep(nanoseconds: 80_000_000)
+            let updatesAt1344KiB = rstRecorder.windowUpdates(forStreamID: slowStreamID).count
+            #expect(
+                updatesAt1344KiB == updatesAt1280KiB,
+                "Once per-exec queue >= 1 MiB, host must withhold WINDOW_UPDATE until client drains (before=\(updatesAt1280KiB), after+64KiB=\(updatesAt1344KiB))"
+            )
+
+            // While slowConn has NOT read a single exec.output byte, sibling `exec` and heartbeat must succeed promptly!
+            let fastDone = Stage4AtomicFlag()
+            let fastTask = Task.detached { () -> CLIExecutionOutcome in
+                let res = await cli.execute(
+                    arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "fast-uname"],
+                    curatedEntriesOverride: [entry],
+                    environment: env,
+                    daemonSpawnOverride: forbiddenSpawn
+                )
+                _ = fastDone.trySet()
+                return res
+            }
+
+            let fastDeadline = DispatchTime.now().uptimeNanoseconds &+ 1_000_000_000
+            while DispatchTime.now().uptimeNanoseconds < fastDeadline && !fastDone.isSet {
+                try await Task.sleep(nanoseconds: 15_000_000)
+            }
+            let siblingCompletedWhileSlowStalled = fastDone.isSet
+            #expect(siblingCompletedWhileSlowStalled == true, "Sibling 'exec t1 -- fast-uname' must not be blocked by non-reading slow client (A37)")
+
+            if siblingCompletedWhileSlowStalled {
+                let hbExec = await cli.execute(
+                    arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "emit-heartbeat", "777"],
+                    curatedEntriesOverride: [entry],
+                    environment: env,
+                    daemonSpawnOverride: forbiddenSpawn
+                )
+                #expect(hbExec.exitCode == 0)
+                #expect(hbExec.stdout == "hb-ok\n")
+            }
+
+            // Now start draining slowConn FIRST while the stream is still open: once queued bytes drop below 1 MiB,
+            // host must send WINDOW_UPDATE, waking the guest (step 4) to send the final 6 chunks + FIN!
+            let slowDrainTask = Task.detached { () -> (totalBytes: Int, exitCode: Int32) in
+                var total = 0
+                var finalExit: Int32 = -999
+                while let line = try? slowReader.readLineData() {
+                    guard let frame = try? DaemonRPCCodec.decodeServerFrame(DaemonRPCExecResult.self, from: line) else {
+                        break
+                    }
+                    switch frame {
+                    case let .execOutput(chunk):
+                        total += chunk.data.count
+                    case let .response(resp):
+                        if let res = try? resp.resultOrThrow() {
+                            finalExit = res.exitCode
+                        } else {
+                            finalExit = 125
+                        }
+                        return (total, finalExit)
+                    }
+                }
+                return (total, finalExit)
+            }
+
+            let windowResumeDeadline = DispatchTime.now().uptimeNanoseconds &+ 1_500_000_000
+            while DispatchTime.now().uptimeNanoseconds < windowResumeDeadline {
+                if rstRecorder.windowUpdates(forStreamID: slowStreamID).count > updatesAt1344KiB {
+                    break
+                }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let updatesAfterDrain = rstRecorder.windowUpdates(forStreamID: slowStreamID).count
+            #expect(
+                updatesAfterDrain > updatesAt1344KiB,
+                "Draining slow client below 1 MiB must resume sending WINDOW_UPDATE credits (stalled=\(updatesAt1344KiB), afterDrain=\(updatesAfterDrain))"
+            )
+
+            slowPhaseGate.signalStep(4)
+            let drained = await slowDrainTask.value
+            if slowConnClosed.trySet() {
+                slowConn.close()
+            }
+            let fastOutcome = await fastTask.value
+            #expect(fastOutcome.exitCode == 0)
+            #expect(fastOutcome.stdout == "6.1.0-s4-backpressure\n")
+            #expect(drained.exitCode == 0)
+            #expect(drained.totalBytes == 48 * chunkSize)
+
+            // =========================================================================
+            // Part B: Guest ignores window credits (A49) and floods > 2x limit (> 2 MiB) while client stalls:
+            //  - Host immediately sends AVM1 RST on runawayStreamID;
+            //  - Host writes a diagnostic event to SQLite (`events --vm t1`);
+            //  - Runaway `exec` exits with 125;
+            //  - Sibling `exec` and heartbeats on the same VM remain unaffected.
+            // =========================================================================
+            let stallPipe = Stage4BlockingPipeGate()
+            defer { stallPipe.open() }
+
+            let runawayTask = Task.detached { () -> CLIExecutionOutcome in
+                await cli.execute(
+                    arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "runaway-over-2mib"],
+                    curatedEntriesOverride: [entry],
+                    environment: env,
+                    daemonSpawnOverride: forbiddenSpawn,
+                    liveStdoutDataHandler: { _ in
+                        stallPipe.wait(timeoutMilliseconds: 2_500)
+                    }
+                )
+            }
+
+            let runawayStreamID = try await rstRecorder.waitForExecStreamID(executable: "runaway-over-2mib", timeoutSeconds: 2.0)
+            let rstObservedWhileClientStalled = await rstRecorder.waitForRST(streamID: runawayStreamID, timeoutSeconds: 1.5)
+            #expect(rstObservedWhileClientStalled == true, "Daemon must emit AVM1 RST when per-exec queue exceeds 2x soft limit (> 2 MiB) even before client reads")
+
+            // While client is still stalled (or right after RST), sibling exec and heartbeat must succeed cleanly.
+            let siblingAfterOverflow = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "emit-heartbeat", "888"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(siblingAfterOverflow.exitCode == 0)
+            #expect(siblingAfterOverflow.stdout == "hb-ok\n")
+
+            let siblingUname = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "fast-uname"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(siblingUname.exitCode == 0)
+            #expect(siblingUname.stdout == "6.1.0-s4-backpressure\n")
+
+            // Release stalled client handler and verify runaway `exec` fails with exit code 125.
+            stallPipe.open()
+            let runawayOutcome = await runawayTask.value
+            #expect(runawayOutcome.exitCode == 125, "Runaway >2x queue overflow exec must exit 125, got \(runawayOutcome.exitCode)")
+
+            // Verify diagnostic event was persisted and readable via `agentvm events --vm t1 --json`.
+            let eventsRes = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "events", "--vm", "t1", "--json"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(eventsRes.exitCode == 0)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let events = try decoder.decode([DiagnosticEvent].self, from: Data(eventsRes.stdout.utf8))
+            let overflowDiag = events.first { ev in
+                ev.code.contains("OVERFLOW") || ev.message.lowercased().contains("queue") || ev.message.lowercased().contains("rst")
+            }
+            #expect(overflowDiag != nil, "Expected a diagnostic event recording the >2x exec output queue overflow RST, got codes: \(events.map(\.code))")
+
+            _ = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+        }
+    }
+
     private static func locateBuiltAgentVMExecutable() throws -> URL {
         let bundleDir = Bundle(for: Stage4BundleLocatorToken.self).bundleURL.deletingLastPathComponent()
         let sibling = bundleDir.appendingPathComponent("AgentVM", isDirectory: false)
@@ -1078,5 +1408,119 @@ final class Stage4ScriptableVMHandle: HardwareVMInstanceHandle, @unchecked Senda
 
     func shutdown(gracefulTimeoutNanoseconds: UInt64) async {
         forceClose()
+    }
+}
+
+final class Stage4AtomicFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    var isSet: Bool {
+        lock.withLock { flag }
+    }
+
+    @discardableResult
+    func trySet() -> Bool {
+        lock.withLock {
+            if flag { return false }
+            flag = true
+            return true
+        }
+    }
+}
+
+final class Stage4AsyncStepSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var currentStep: Int = 0
+
+    func signalStep(_ step: Int) {
+        lock.withLock {
+            if step > currentStep {
+                currentStep = step
+            }
+        }
+    }
+
+    @discardableResult
+    func waitForStep(_ target: Int, timeoutSeconds: TimeInterval) async -> Bool {
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ UInt64(max(0.05, timeoutSeconds) * 1_000_000_000)
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if lock.withLock({ currentStep >= target }) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return lock.withLock { currentStep >= target }
+    }
+}
+
+final class Stage4BlockingPipeGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var readFD: Int32 = -1
+    private var writeFD: Int32 = -1
+    private var opened = false
+    private let deadlineUptimeNs: UInt64
+
+    init(maxBlockMilliseconds: UInt64 = 2_200) {
+        self.deadlineUptimeNs = DispatchTime.now().uptimeNanoseconds &+ (maxBlockMilliseconds * 1_000_000)
+        var fds: [Int32] = [-1, -1]
+        if Darwin.pipe(&fds) == 0 {
+            readFD = fds[0]
+            writeFD = fds[1]
+        } else {
+            opened = true
+        }
+    }
+
+    deinit {
+        closeAll()
+    }
+
+    func wait(timeoutMilliseconds: Int32) {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        if nowNs >= deadlineUptimeNs {
+            open()
+            return
+        }
+        let remainingMs = Int32(min(UInt64(timeoutMilliseconds), (deadlineUptimeNs - nowNs) / 1_000_000))
+        guard remainingMs > 0 else {
+            open()
+            return
+        }
+        let rfd = lock.withLock { () -> Int32 in
+            if opened { return -1 }
+            return readFD
+        }
+        guard rfd >= 0 else { return }
+        var pfd = Darwin.pollfd(fd: rfd, events: Int16(POLLIN | POLLHUP), revents: 0)
+        _ = Darwin.poll(&pfd, 1, remainingMs)
+    }
+
+    func open() {
+        let wfd = lock.withLock { () -> Int32 in
+            if opened { return -1 }
+            opened = true
+            let cur = writeFD
+            writeFD = -1
+            return cur
+        }
+        if wfd >= 0 {
+            var byte: UInt8 = 1
+            _ = Darwin.write(wfd, &byte, 1)
+            _ = Darwin.close(wfd)
+        }
+    }
+
+    private func closeAll() {
+        let (r, w) = lock.withLock { () -> (Int32, Int32) in
+            opened = true
+            let cr = readFD
+            let cw = writeFD
+            readFD = -1
+            writeFD = -1
+            return (cr, cw)
+        }
+        if w >= 0 { _ = Darwin.close(w) }
+        if r >= 0 { _ = Darwin.close(r) }
     }
 }

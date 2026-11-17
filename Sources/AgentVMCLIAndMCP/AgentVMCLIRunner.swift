@@ -819,6 +819,8 @@ public struct AgentVMCLIRunner: Sendable {
                     hintLine = "提示：请去掉 '--backend simulation' 在真实虚拟机上运行。"
                 } else if case .vmBusy = err {
                     hintLine = "提示：请等待当前正在使用该虚拟机的进程结束，或创建另一台虚拟机。"
+                } else if case .execOutputBufferOverflow = err {
+                    hintLine = "提示：请持续读取 'agentvm exec' 的标准输出/标准错误，或在客户机内将大输出重定向到文件。"
                 } else if case let .vmLockedForDeferredMilestone(vmName, _, reason) = err {
                     switch reason {
                     case .liveSnapshotBranchRestoreScheduledForM3:

@@ -643,14 +643,14 @@ public actor AgentVMFleetCoordinator {
     }
 
     public static func localizedDiagnosticMessage(for event: DiagnosticEvent, in language: AppLanguage) -> String {
-        if event.code == "VM_RUNTIME_LOST" {
+        if event.code == "VM_RUNTIME_LOST" || event.code == "EXEC_OUTPUT_BUFFER_OVERFLOW" || event.code == "AUTO_CHECKPOINT_SKIPPED_UNTIL_M3" {
             if language == .zhHans, let zh = event.metadata["message_zh"], !zh.isEmpty {
                 return zh
             }
             if language == .en, let en = event.metadata["message_en"], !en.isEmpty {
                 return en
             }
-            if let vmName = event.metadata["vmName"], !vmName.isEmpty {
+            if event.code == "VM_RUNTIME_LOST", let vmName = event.metadata["vmName"], !vmName.isEmpty {
                 return vmRuntimeLostMessage(vmName: vmName, language: language)
             }
         }
@@ -2388,14 +2388,38 @@ public actor AgentVMFleetCoordinator {
                 state: record.telemetry.state.rawValue
             )
         }
-        let execResult = try await session.executeCommandStreaming(
-            request,
-            maxRetainedBytesPerStream: GuestExecResult.maxStoredOutputBytesPerStream,
-            onStreamOpened: onStreamOpened,
-            onChunk: onOutputChunk
-        )
-        try? await store.appendExecResult(execResult)
-        return execResult
+        do {
+            let execResult = try await session.executeCommandStreaming(
+                request,
+                maxRetainedBytesPerStream: GuestExecResult.maxStoredOutputBytesPerStream,
+                onStreamOpened: onStreamOpened,
+                onChunk: onOutputChunk
+            )
+            try? await store.appendExecResult(execResult)
+            return execResult
+        } catch let err as AgentVMError {
+            if case let .execOutputBufferOverflow(_, streamID, queuedBytes, hardLimitBytes) = err {
+                let zhMsg = "虚拟机「\(record.spec.name)」上客户机命令「\(request.commandLineSummary)」输出缓冲队列超过硬上限（流 \(streamID)：积压 \(queuedBytes) 字节 > 上限 \(hardLimitBytes) 字节，客户端未及时读取），已向该流发送 RST 并以 125 结束。"
+                let enMsg = "Exec output queue for '\(request.commandLineSummary)' on VM '\(record.spec.name)' exceeded hard limit on stream \(streamID) (\(queuedBytes) bytes queued > \(hardLimitBytes) bytes cap while client was not reading); reset stream with RST."
+                try? await store.appendDiagnostic(DiagnosticEvent(
+                    severity: .warning,
+                    subsystem: "VsockRPC",
+                    vmID: vmID,
+                    code: "EXEC_OUTPUT_BUFFER_OVERFLOW",
+                    message: (language == .zhHans) ? zhMsg : enMsg,
+                    metadata: [
+                        "vmName": record.spec.name,
+                        "streamID": "\(streamID)",
+                        "commandLine": request.commandLineSummary,
+                        "queuedBytes": "\(queuedBytes)",
+                        "hardLimitBytes": "\(hardLimitBytes)",
+                        "message_zh": zhMsg,
+                        "message_en": enMsg
+                    ]
+                ))
+            }
+            throw err
+        }
     }
 
     /// Cancels a single `.execProcess` stream on a running daemon VM by emitting an `AVM1` `RST` frame.

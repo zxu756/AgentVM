@@ -92,6 +92,158 @@ private final class VsockRPCPromise<Value: Sendable>: @unchecked Sendable {
     }
 }
 
+/// Bounded per-exec output delivery queue decoupling client socket writes from `VsockMultiplexSession`'s
+/// inbound vsock read loop (Fixes A37 & A49):
+/// - Soft limit (`softLimitBytes`, default 1 MiB): while `queuedOutputBytes >= softLimitBytes`, `WINDOW_UPDATE`
+///   credits for that stream are withheld (`withheldWireBytes`) until the client drains below `softLimitBytes`.
+/// - Hard limit (`hardLimitBytes`, default `2 * softLimitBytes`): if a guest ignores window credits and pushes
+///   `queuedOutputBytes > hardLimitBytes`, `enqueue` aborts the queue and returns `.overflowed` so the host
+///   immediately resets only that stream with `RST`.
+private final class ExecOutputDeliveryQueue: @unchecked Sendable {
+    struct QueuedItem: Sendable {
+        let chunk: GuestExecOutputChunk
+        let wirePayloadBytes: Int
+    }
+
+    enum EnqueueOutcome: Sendable {
+        case enqueued(immediateCreditWireBytes: Int)
+        case overflowed(queuedBytes: Int, hardLimitBytes: Int)
+        case ignored
+    }
+
+    private let lock = NSLock()
+    let softLimitBytes: Int
+    let hardLimitBytes: Int
+    private var items: [QueuedItem?] = []
+    private var headIndex: Int = 0
+    private var queuedOutputBytes: Int = 0
+    private var withheldWireBytes: Int = 0
+    private var finished: Bool = false
+    private var aborted: Bool = false
+    private var waitingConsumer: CheckedContinuation<QueuedItem?, Never>?
+
+    init(softLimitBytes: Int, hardLimitBytes: Int) {
+        self.softLimitBytes = max(1, softLimitBytes)
+        self.hardLimitBytes = max(self.softLimitBytes, hardLimitBytes)
+    }
+
+    func enqueue(chunk: GuestExecOutputChunk, wirePayloadBytes: Int) -> EnqueueOutcome {
+        lock.lock()
+        if aborted || finished {
+            lock.unlock()
+            return .ignored
+        }
+
+        let nextQueued = queuedOutputBytes + chunk.data.count
+        if nextQueued > hardLimitBytes {
+            aborted = true
+            items.removeAll(keepingCapacity: false)
+            headIndex = 0
+            let waiter = waitingConsumer
+            waitingConsumer = nil
+            lock.unlock()
+            waiter?.resume(returning: nil)
+            return .overflowed(queuedBytes: nextQueued, hardLimitBytes: hardLimitBytes)
+        }
+
+        queuedOutputBytes = nextQueued
+        let item = QueuedItem(chunk: chunk, wirePayloadBytes: wirePayloadBytes)
+        let immediateCredit: Int
+        if queuedOutputBytes < softLimitBytes {
+            immediateCredit = wirePayloadBytes
+        } else {
+            withheldWireBytes += wirePayloadBytes
+            immediateCredit = 0
+        }
+
+        if let waiter = waitingConsumer {
+            waitingConsumer = nil
+            lock.unlock()
+            waiter.resume(returning: item)
+        } else {
+            items.append(item)
+            lock.unlock()
+        }
+        return .enqueued(immediateCreditWireBytes: immediateCredit)
+    }
+
+    func nextItem() async -> QueuedItem? {
+        await withCheckedContinuation { (cont: CheckedContinuation<QueuedItem?, Never>) in
+            lock.lock()
+            if aborted {
+                lock.unlock()
+                cont.resume(returning: nil)
+                return
+            }
+            if headIndex < items.count {
+                let item = items[headIndex]
+                items[headIndex] = nil
+                headIndex += 1
+                if headIndex == items.count {
+                    items.removeAll(keepingCapacity: true)
+                    headIndex = 0
+                } else if headIndex >= 64 && headIndex * 2 >= items.count {
+                    items.removeFirst(headIndex)
+                    headIndex = 0
+                }
+                lock.unlock()
+                cont.resume(returning: item)
+                return
+            }
+            if finished {
+                lock.unlock()
+                cont.resume(returning: nil)
+                return
+            }
+            waitingConsumer = cont
+            lock.unlock()
+        }
+    }
+
+    func didFinishDelivering(outputBytes: Int) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        if aborted {
+            return 0
+        }
+        queuedOutputBytes = max(0, queuedOutputBytes - max(0, outputBytes))
+        if queuedOutputBytes < softLimitBytes && withheldWireBytes > 0 {
+            let released = withheldWireBytes
+            withheldWireBytes = 0
+            return released
+        }
+        return 0
+    }
+
+    func finish() {
+        lock.lock()
+        if aborted || finished {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let waiter = waitingConsumer
+        waitingConsumer = nil
+        lock.unlock()
+        waiter?.resume(returning: nil)
+    }
+
+    func abort() {
+        lock.lock()
+        if aborted {
+            lock.unlock()
+            return
+        }
+        aborted = true
+        items.removeAll(keepingCapacity: false)
+        headIndex = 0
+        let waiter = waitingConsumer
+        waitingConsumer = nil
+        lock.unlock()
+        waiter?.resume(returning: nil)
+    }
+}
+
 // MARK: - VsockMultiplexSession Actor
 
 /// Multiplexed VirtioSocket (`AVM1`) session manager implementing logical stream framing, credit-based
@@ -113,6 +265,9 @@ public actor VsockMultiplexSession {
         var creditWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     }
 
+    public static let defaultExecOutputQueueSoftLimitBytes: Int = 1_048_576
+    public static let defaultExecOutputQueueHardLimitMultiplier: Int = 2
+
     private struct PendingExecContext {
         let request: GuestExecRequest
         let startedAt: Date
@@ -121,7 +276,8 @@ public actor VsockMultiplexSession {
         var stderrBuffer: Data = Data()
         var stdoutTotalBytes: UInt64 = 0
         var stderrTotalBytes: UInt64 = 0
-        let onChunk: (@Sendable (GuestExecOutputChunk) async -> Void)?
+        let deliveryQueue: ExecOutputDeliveryQueue?
+        let deliveryTask: Task<Void, Never>?
         let promise: VsockRPCPromise<GuestExecResult>
     }
 
@@ -365,6 +521,7 @@ public actor VsockMultiplexSession {
         openStreams.removeAll()
 
         for (_, execCtx) in pendingExecs {
+            execCtx.deliveryQueue?.abort()
             execCtx.promise.reject(closedError)
         }
         pendingExecs.removeAll()
@@ -437,9 +594,17 @@ public actor VsockMultiplexSession {
     }
 
     /// Executes a command inside the guest sandbox while exposing the allocated `AVM1` `streamID` and streaming chunks.
+    ///
+    /// When `onChunk` is provided, outbound chunk delivery to the caller is decoupled from the vsock read loop via a
+    /// bounded per-exec queue (`outputQueueSoftLimitBytes`, default 1 MiB). Once queued bytes reach `outputQueueSoftLimitBytes`,
+    /// `AVM1` `WINDOW_UPDATE` credits for `streamID` are withheld until the caller drains below the soft limit; if a guest
+    /// ignores window credits and queued bytes exceed `outputQueueHardLimitBytes` (default `2 * outputQueueSoftLimitBytes`),
+    /// `streamID` is reset with `RST` and fails with `AgentVMError.execOutputBufferOverflow` without affecting sibling streams.
     public func executeCommandStreaming(
         _ request: GuestExecRequest,
         maxRetainedBytesPerStream: Int? = nil,
+        outputQueueSoftLimitBytes: Int = VsockMultiplexSession.defaultExecOutputQueueSoftLimitBytes,
+        outputQueueHardLimitBytes: Int? = nil,
         onStreamOpened: (@Sendable (UInt32) -> Void)?,
         onChunk: (@Sendable (GuestExecOutputChunk) async -> Void)?
     ) async throws -> GuestExecResult {
@@ -449,11 +614,38 @@ public actor VsockMultiplexSession {
         let promise = VsockRPCPromise<GuestExecResult>()
         let startedAt = Date()
 
+        let softLimit = max(1, outputQueueSoftLimitBytes)
+        let hardLimit = max(softLimit, outputQueueHardLimitBytes ?? (softLimit * Self.defaultExecOutputQueueHardLimitMultiplier))
+
+        let deliveryQueue: ExecOutputDeliveryQueue?
+        let deliveryTask: Task<Void, Never>?
+        if let callback = onChunk {
+            let queue = ExecOutputDeliveryQueue(softLimitBytes: softLimit, hardLimitBytes: hardLimit)
+            deliveryQueue = queue
+            deliveryTask = Task.detached { [weak self] in
+                while let item = await queue.nextItem() {
+                    await callback(item.chunk)
+                    let releasedWireBytes = queue.didFinishDelivering(outputBytes: item.chunk.data.count)
+                    if releasedWireBytes > 0, let self {
+                        try? await self.replenishExecStreamWindowCredit(
+                            streamID: streamID,
+                            byteCount: releasedWireBytes,
+                            forceFlush: true
+                        )
+                    }
+                }
+            }
+        } else {
+            deliveryQueue = nil
+            deliveryTask = nil
+        }
+
         pendingExecs[streamID] = PendingExecContext(
             request: request,
             startedAt: startedAt,
             maxRetainedBytesPerStream: maxRetainedBytesPerStream,
-            onChunk: onChunk,
+            deliveryQueue: deliveryQueue,
+            deliveryTask: deliveryTask,
             promise: promise
         )
         onStreamOpened?(streamID)
@@ -479,8 +671,13 @@ public actor VsockMultiplexSession {
                 payload: encodedRequest,
                 compressIfBeneficial: true
             )
-            return try await promise.wait()
+            let result = try await promise.wait()
+            if let deliveryTask {
+                await deliveryTask.value
+            }
+            return result
         } catch {
+            deliveryQueue?.abort()
             pendingExecs.removeValue(forKey: streamID)
             closeStreamState(streamID: streamID)
             throw error
@@ -489,6 +686,7 @@ public actor VsockMultiplexSession {
 
     private func handleExecWatchdogTimeout(streamID: UInt32) async {
         guard let ctx = pendingExecs.removeValue(forKey: streamID) else { return }
+        ctx.deliveryQueue?.finish()
         try? await sendRawControlFrame(
             channel: .execProcess,
             flags: [.rst, .endOfMessage],
@@ -520,6 +718,7 @@ public actor VsockMultiplexSession {
         reason: String = "Exec cancelled by client disconnect."
     ) async {
         guard let ctx = pendingExecs.removeValue(forKey: streamID) else { return }
+        ctx.deliveryQueue?.abort()
         try? await sendRawControlFrame(
             channel: .execProcess,
             flags: [.rst, .endOfMessage],
@@ -1072,6 +1271,54 @@ public actor VsockMultiplexSession {
         }
     }
 
+    private func deductExecInboundReceiveWindow(streamID: UInt32, byteCount: Int) {
+        guard streamID != 0, byteCount > 0, var stream = openStreams[streamID] else { return }
+        let consumed = UInt32(clamping: byteCount)
+        if stream.localReceiveWindowCredit >= consumed {
+            stream.localReceiveWindowCredit -= consumed
+        } else {
+            stream.localReceiveWindowCredit = 0
+        }
+        openStreams[streamID] = stream
+    }
+
+    private func replenishExecStreamWindowCredit(
+        streamID: UInt32,
+        byteCount: Int,
+        forceFlush: Bool
+    ) async throws {
+        guard streamID != 0, byteCount > 0, var stream = openStreams[streamID] else { return }
+        let credit = UInt32(clamping: byteCount)
+        stream.uncreditedConsumedBytes &+= credit
+
+        if (forceFlush && stream.uncreditedConsumedBytes > 0)
+            || stream.uncreditedConsumedBytes >= Self.windowReplenishThreshold {
+            let replenish = stream.uncreditedConsumedBytes
+            stream.uncreditedConsumedBytes = 0
+            stream.localReceiveWindowCredit = min(
+                VsockWireConstants.defaultWindowCredit,
+                stream.localReceiveWindowCredit &+ replenish
+            )
+            stream.outboundSequence &+= 1
+            let seq = stream.outboundSequence
+            openStreams[streamID] = stream
+
+            let winFrame = try codec.encodeFrame(
+                channel: .execProcess,
+                flags: [.windowUpdate, .ack],
+                streamID: streamID,
+                sequence: seq,
+                windowCredit: replenish,
+                payload: Data(),
+                compressIfBeneficial: false
+            )
+            windowUpdatesSentCount &+= 1
+            try await transmitEncodedFrame(winFrame, wasCompressed: false)
+        } else {
+            openStreams[streamID] = stream
+        }
+    }
+
     private func sendSingleStreamFrame(
         streamID: UInt32,
         channel: VsockChannelKind,
@@ -1158,11 +1405,14 @@ public actor VsockMultiplexSession {
                 stream.inboundSequence = header.sequenceNumber
                 openStreams[streamID] = stream
             }
-            try await accountInboundPayloadWindow(
-                streamID: streamID,
-                channel: header.channel,
-                byteCount: payload.count
-            )
+            let usesExecDeliveryQueue = (!isGuestServerRole && header.channel == .execProcess && pendingExecs[streamID]?.deliveryQueue != nil)
+            if !usesExecDeliveryQueue {
+                try await accountInboundPayloadWindow(
+                    streamID: streamID,
+                    channel: header.channel,
+                    byteCount: payload.count
+                )
+            }
         }
 
         if isGuestServerRole {
@@ -1207,6 +1457,7 @@ public actor VsockMultiplexSession {
 
         if header.flags.contains(.errorFrame) || header.flags.contains(.rst) {
             pendingExecs.removeValue(forKey: streamID)
+            ctx.deliveryQueue?.abort()
             closeStreamState(streamID: streamID)
             let detail = String(decoding: payload, as: UTF8.self)
             ctx.promise.reject(
@@ -1223,9 +1474,11 @@ public actor VsockMultiplexSession {
             do {
                 let completion = try VsockWireJSON.decode(VsockExecCompletionEnvelope.self, from: payload)
                 if let errDetail = completion.errorDetail, !errDetail.isEmpty, completion.exitCode == -1 {
+                    ctx.deliveryQueue?.abort()
                     ctx.promise.reject(AgentVMError.vsockProtocolViolation(detail: errDetail))
                     return
                 }
+                ctx.deliveryQueue?.finish()
                 let result = GuestExecResult(
                     requestID: ctx.request.id,
                     vmID: vmID,
@@ -1241,6 +1494,7 @@ public actor VsockMultiplexSession {
                 )
                 ctx.promise.resolve(result)
             } catch {
+                ctx.deliveryQueue?.abort()
                 ctx.promise.reject(error)
             }
             return
@@ -1270,9 +1524,40 @@ public actor VsockMultiplexSession {
                     ctx.stderrBuffer.append(chunk.data)
                 }
             }
-            pendingExecs[streamID] = ctx
-            if let callback = ctx.onChunk {
-                await callback(chunk)
+            if let queue = ctx.deliveryQueue {
+                deductExecInboundReceiveWindow(streamID: streamID, byteCount: payload.count)
+                switch queue.enqueue(chunk: chunk, wirePayloadBytes: payload.count) {
+                case .ignored:
+                    pendingExecs[streamID] = ctx
+                case let .enqueued(immediateCreditWireBytes):
+                    pendingExecs[streamID] = ctx
+                    if immediateCreditWireBytes > 0 {
+                        try? await replenishExecStreamWindowCredit(
+                            streamID: streamID,
+                            byteCount: immediateCreditWireBytes,
+                            forceFlush: false
+                        )
+                    }
+                case let .overflowed(queuedBytes, hardLimitBytes):
+                    pendingExecs.removeValue(forKey: streamID)
+                    try? await sendRawControlFrame(
+                        channel: .execProcess,
+                        flags: [.rst, .endOfMessage],
+                        streamID: streamID,
+                        payload: Data()
+                    )
+                    closeStreamState(streamID: streamID)
+                    ctx.promise.reject(
+                        AgentVMError.execOutputBufferOverflow(
+                            vmID: vmID,
+                            streamID: streamID,
+                            queuedBytes: queuedBytes,
+                            hardLimitBytes: hardLimitBytes
+                        )
+                    )
+                }
+            } else {
+                pendingExecs[streamID] = ctx
             }
         }
     }

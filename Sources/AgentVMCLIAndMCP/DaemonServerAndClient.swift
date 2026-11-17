@@ -652,6 +652,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
         conn: DaemonSocketConnection
     ) async {
         let disconnectMonitor = DaemonExecClientDisconnectMonitor(fd: conn.fd)
+        let lineWriter = DaemonAbortableSocketLineWriter(fd: conn.fd)
         do {
             let vmID = try await resolveVMID(params.vm)
             let req = GuestExecRequest(
@@ -663,6 +664,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                 timeoutSeconds: params.timeoutSeconds
             )
             disconnectMonitor.start { [coordinator] streamID in
+                lineWriter.abort()
                 Task {
                     await coordinator.cancelDaemonExecStream(
                         vmID: vmID,
@@ -679,7 +681,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                     disconnectMonitor.bindStreamID(streamID)
                 },
                 onOutputChunk: { chunk in
-                    guard !chunk.data.isEmpty, !disconnectMonitor.isDisconnected else { return }
+                    guard !chunk.data.isEmpty, !disconnectMonitor.isDisconnected, !lineWriter.isAborted else { return }
                     let outStream: DaemonRPCExecStream
                     switch chunk.stream {
                     case .stdout:
@@ -690,12 +692,15 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                     let notif = DaemonRPCExecOutputParams(stream: outStream, data: chunk.data)
                     guard let encoded = try? DaemonRPCCodec.encodeExecOutputLine(notif) else { return }
                     do {
-                        try conn.writeLineData(encoded)
+                        try await lineWriter.writeLine(encoded)
                     } catch {
-                        disconnectMonitor.triggerDisconnect()
+                        if !lineWriter.isAborted {
+                            disconnectMonitor.triggerDisconnect()
+                        }
                     }
                 }
             )
+            await lineWriter.waitForIdle()
             await disconnectMonitor.stop()
             if !disconnectMonitor.isDisconnected {
                 let resp = DaemonRPCResponse<DaemonRPCExecResult>.success(
@@ -705,10 +710,15 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                         timedOut: execResult.timedOut
                     )
                 )
-                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+                if let encodedResp = try? DaemonRPCCodec.encodeResponseLine(resp) {
+                    try? await lineWriter.writeLine(encodedResp)
+                }
             }
+            await lineWriter.waitForIdle()
             conn.close()
         } catch let err as AgentVMError {
+            lineWriter.abort()
+            await lineWriter.waitForIdle()
             await disconnectMonitor.stop()
             if !disconnectMonitor.isDisconnected {
                 let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(
@@ -716,21 +726,193 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                     agentVMError: err,
                     language: params.lang
                 )
-                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+                if let encodedResp = try? DaemonRPCCodec.encodeResponseLine(resp) {
+                    if case .execOutputBufferOverflow = err {
+                        if !lineWriter.wrotePartialLine {
+                            _ = lineWriter.tryWriteCompleteLineNonBlocking(encodedResp)
+                        }
+                    } else if !lineWriter.wrotePartialLine {
+                        try? conn.writeLineData(encodedResp)
+                    }
+                }
             }
             conn.close()
         } catch {
+            lineWriter.abort()
+            await lineWriter.waitForIdle()
             await disconnectMonitor.stop()
-            if !disconnectMonitor.isDisconnected {
+            if !disconnectMonitor.isDisconnected && !lineWriter.wrotePartialLine {
                 let rpcErr = DaemonRPCError(
                     code: DaemonRPCError.internalErrorCode,
                     errorCode: "ERR_DAEMON_INTERNAL",
                     message: error.localizedDescription
                 )
                 let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(id: id, error: rpcErr)
-                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+                if let encodedResp = try? DaemonRPCCodec.encodeResponseLine(resp) {
+                    try? conn.writeLineData(encodedResp)
+                }
             }
             conn.close()
+        }
+    }
+}
+
+/// Non-blocking, abortable per-exec socket line writer running on a dedicated serial GCD queue so slow/stalled
+/// `exec` clients never block Swift's cooperative thread pool or `VsockMultiplexSession`, and >2x queue overflow
+/// aborts cleanly in <= 20 ms without closing `fd` under an in-flight write.
+private final class DaemonAbortableSocketLineWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fd: Int32
+    private let queue: DispatchQueue
+    private var aborted = false
+    private var partialLineFlag = false
+    private var activeWrites = 0
+    private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(fd: Int32) {
+        self.fd = fd
+        self.queue = DispatchQueue(label: "io.zxu756.agentvm.daemon.exec-write.\(fd)", qos: .userInitiated)
+    }
+
+    var isAborted: Bool {
+        lock.withLock { aborted }
+    }
+
+    var wrotePartialLine: Bool {
+        lock.withLock { partialLineFlag }
+    }
+
+    func abort() {
+        lock.withLock {
+            aborted = true
+        }
+    }
+
+    func waitForIdle() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let alreadyIdle = lock.withLock { () -> Bool in
+                if activeWrites == 0 {
+                    return true
+                }
+                idleWaiters.append(cont)
+                return false
+            }
+            if alreadyIdle {
+                cont.resume()
+            }
+        }
+    }
+
+    func writeLine(
+        _ lineData: Data,
+        maxLineBytes: Int = DaemonRPCLineFraming.maxLineBytes
+    ) async throws {
+        guard !lineData.contains(0x0A) else {
+            throw DaemonRPCLineFramingError.embeddedNewlineInOutgoingLine
+        }
+        guard lineData.count <= maxLineBytes else {
+            throw DaemonRPCLineFramingError.lineTooLong(limitBytes: maxLineBytes)
+        }
+        let started = lock.withLock { () -> Bool in
+            if aborted || fd < 0 {
+                return false
+            }
+            activeWrites += 1
+            return true
+        }
+        guard started else {
+            throw CancellationError()
+        }
+
+        var framedBuffer = Data()
+        framedBuffer.reserveCapacity(lineData.count + 1)
+        framedBuffer.append(lineData)
+        framedBuffer.append(0x0A)
+        let framed = framedBuffer
+
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                defer { self.finishOneActiveWrite() }
+                let result: Result<Void, Error> = framed.withUnsafeBytes { rawBuf in
+                    guard let base = rawBuf.baseAddress else {
+                        return .success(())
+                    }
+                    var offset = 0
+                    let total = rawBuf.count
+                    while offset < total {
+                        if self.isAborted {
+                            if offset > 0 {
+                                self.lock.withLock { self.partialLineFlag = true }
+                            }
+                            return .failure(CancellationError())
+                        }
+                        let n = Darwin.send(self.fd, base.advanced(by: offset), total - offset, Int32(MSG_DONTWAIT))
+                        if n > 0 {
+                            offset += n
+                        } else if n < 0 {
+                            let code = Darwin.errno
+                            if code == EINTR {
+                                continue
+                            }
+                            if code == EAGAIN || code == EWOULDBLOCK {
+                                var pfd = Darwin.pollfd(fd: self.fd, events: Int16(POLLOUT), revents: 0)
+                                _ = Darwin.poll(&pfd, 1, 20)
+                                continue
+                            }
+                            if offset > 0 {
+                                self.lock.withLock { self.partialLineFlag = true }
+                            }
+                            return .failure(
+                                DaemonRPCLineFramingError.ioError(
+                                    errnoCode: code,
+                                    detail: String(cString: Darwin.strerror(code))
+                                )
+                            )
+                        } else {
+                            if offset > 0 {
+                                self.lock.withLock { self.partialLineFlag = true }
+                            }
+                            return .failure(
+                                DaemonRPCLineFramingError.ioError(
+                                    errnoCode: EPIPE,
+                                    detail: "Zero-byte send on daemon socket."
+                                )
+                            )
+                        }
+                    }
+                    return .success(())
+                }
+                cont.resume(with: result)
+            }
+        }
+    }
+
+    /// Best-effort single-shot non-blocking write used only when a clean line boundary exists on overflow teardown.
+    func tryWriteCompleteLineNonBlocking(_ lineData: Data) -> Bool {
+        guard !lineData.contains(0x0A), fd >= 0 else { return false }
+        var framed = Data()
+        framed.reserveCapacity(lineData.count + 1)
+        framed.append(lineData)
+        framed.append(0x0A)
+        return framed.withUnsafeBytes { rawBuf -> Bool in
+            guard let base = rawBuf.baseAddress else { return false }
+            let n = Darwin.send(fd, base, rawBuf.count, Int32(MSG_DONTWAIT))
+            return n == rawBuf.count
+        }
+    }
+
+    private func finishOneActiveWrite() {
+        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            activeWrites = max(0, activeWrites - 1)
+            if activeWrites == 0 {
+                let copy = idleWaiters
+                idleWaiters.removeAll()
+                return copy
+            }
+            return []
+        }
+        for w in waiters {
+            w.resume()
         }
     }
 }

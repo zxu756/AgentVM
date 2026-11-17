@@ -71,6 +71,7 @@ map_module_to_filters() {
             echo "CLIAndMCPSimulationHonestyTests"
             echo "BilingualLocalizationTests"
             echo "CLIAndMCPDaemonRPCTests"
+            echo "CLIAndMCPDaemonStage2Tests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -82,6 +83,7 @@ map_module_to_filters() {
             echo "CLIAndMCPTests"
             echo "CLIAndMCPSimulationHonestyTests"
             echo "CLIAndMCPDaemonRPCTests"
+            echo "CLIAndMCPDaemonStage2Tests"
             echo "StudioViewsHonestyTests"
             ;;
         *)

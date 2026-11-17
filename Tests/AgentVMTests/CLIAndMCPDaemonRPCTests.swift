@@ -765,7 +765,8 @@ struct CLIAndMCPDaemonRPCTests {
         defer { try? FileManager.default.removeItem(at: tempRoot) }
 
         let darwinTempDir = try DaemonSocketAddressResolver.darwinUserTempDirectoryURL()
-        let fixedOverhead = tempRoot.path.utf8.count + 1 + "/ws.agentvm/run/daemon.sock".utf8.count
+        let canonicalTempRoot = DaemonSocketAddressResolver.canonicalRealPath(of: tempRoot)
+        let fixedOverhead = canonicalTempRoot.utf8.count + 1 + "/ws.agentvm/run/daemon.sock".utf8.count
         #expect(fixedOverhead < 90)
 
         // 1. Exact 103-byte socket path boundary: direct bind/connect, zero symlink in DARWIN_USER_TEMP_DIR.

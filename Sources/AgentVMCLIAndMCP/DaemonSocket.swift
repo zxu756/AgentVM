@@ -6,27 +6,31 @@ import MachO
 // MARK: - Workspace Daemon Paths, Unix Socket Address Rules & Bounds Guards (M2 Stage 1)
 
 public struct DaemonWorkspacePaths: Hashable, Sendable {
+    public let canonicalWorkspacePath: String
     public let workspaceURL: URL
     public let runDirectoryURL: URL
     public let lockFileURL: URL
     public let directSocketFileURL: URL
+    public let directSocketPath: String
     public let logsDirectoryURL: URL
     public let daemonLogFileURL: URL
 
     public init(workspaceURL: URL) {
-        let stdWorkspace = workspaceURL.standardizedFileURL
-        let stdRun = stdWorkspace.appendingPathComponent("run", isDirectory: true).standardizedFileURL
-        let stdLogs = stdWorkspace.appendingPathComponent("logs", isDirectory: true).standardizedFileURL
-        self.workspaceURL = stdWorkspace
-        self.runDirectoryURL = stdRun
-        self.lockFileURL = stdRun.appendingPathComponent("daemon.lock", isDirectory: false).standardizedFileURL
-        self.directSocketFileURL = stdRun.appendingPathComponent("daemon.sock", isDirectory: false).standardizedFileURL
-        self.logsDirectoryURL = stdLogs
-        self.daemonLogFileURL = stdLogs.appendingPathComponent("daemon.log", isDirectory: false).standardizedFileURL
-    }
+        let canonicalWorkspace = DaemonSocketAddressResolver.canonicalRealPath(of: workspaceURL)
+        let canonicalRun = canonicalWorkspace == "/" ? "/run" : "\(canonicalWorkspace)/run"
+        let canonicalLogs = canonicalWorkspace == "/" ? "/logs" : "\(canonicalWorkspace)/logs"
+        let canonicalLock = "\(canonicalRun)/daemon.lock"
+        let canonicalSocket = "\(canonicalRun)/daemon.sock"
+        let canonicalDaemonLog = "\(canonicalLogs)/daemon.log"
 
-    public var directSocketPath: String {
-        directSocketFileURL.path
+        self.canonicalWorkspacePath = canonicalWorkspace
+        self.workspaceURL = URL(fileURLWithPath: canonicalWorkspace, isDirectory: true)
+        self.runDirectoryURL = URL(fileURLWithPath: canonicalRun, isDirectory: true)
+        self.lockFileURL = URL(fileURLWithPath: canonicalLock, isDirectory: false)
+        self.directSocketFileURL = URL(fileURLWithPath: canonicalSocket, isDirectory: false)
+        self.directSocketPath = canonicalSocket
+        self.logsDirectoryURL = URL(fileURLWithPath: canonicalLogs, isDirectory: true)
+        self.daemonLogFileURL = URL(fileURLWithPath: canonicalDaemonLog, isDirectory: false)
     }
 
     public var directSocketPathUTF8ByteCount: Int {

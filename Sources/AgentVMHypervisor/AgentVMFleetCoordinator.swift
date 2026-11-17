@@ -2295,22 +2295,11 @@ public actor AgentVMFleetCoordinator {
         }
 
         // Dispatch JavaScriptCore pre-exec plugins (Secret Leak Veto + Auto Pre-Destructive Checkpoint)
-        var preCheckpointID: SnapshotID?
-        let hookDecision = try await pluginEngine.dispatchBeforeExecHook(request, vmID: vmID)
-        switch hookDecision {
-        case .allow:
-            break
-        case let .requirePreExecSnapshot(reason):
-            let snap = try await captureSnapshot(
-                vmID: vmID,
-                title: reason,
-                kind: .autoPreCommandCheckpoint,
-                triggerCommand: request.commandLineSummary
-            )
-            preCheckpointID = snap.id
-        case let .vetoExecution(reason):
-            throw AgentVMError.firewallBlocked(ruleID: nil, reason: reason)
-        }
+        let preCheckpointID = try await evaluateBeforeExecPlugins(
+            for: record,
+            request: request,
+            language: .en
+        )
 
         guard let session = vsockSessions[vmID] else {
             throw AgentVMError.guestAgentNotConnected(
@@ -2388,13 +2377,19 @@ public actor AgentVMFleetCoordinator {
                 state: record.telemetry.state.rawValue
             )
         }
+        let preCheckpointID = try await evaluateBeforeExecPlugins(
+            for: record,
+            request: request,
+            language: language
+        )
         do {
-            let execResult = try await session.executeCommandStreaming(
+            var execResult = try await session.executeCommandStreaming(
                 request,
                 maxRetainedBytesPerStream: GuestExecResult.maxStoredOutputBytesPerStream,
                 onStreamOpened: onStreamOpened,
                 onChunk: onOutputChunk
             )
+            execResult.preCheckpointSnapshotID = preCheckpointID
             try? await store.appendExecResult(execResult)
             return execResult
         } catch let err as AgentVMError {
@@ -2419,6 +2414,50 @@ public actor AgentVMFleetCoordinator {
                 ))
             }
             throw err
+        }
+    }
+
+    private func evaluateBeforeExecPlugins(
+        for record: VMInstanceRecord,
+        request: GuestExecRequest,
+        language: AppLanguage
+    ) async throws -> SnapshotID? {
+        let hookDecision = try await pluginEngine.dispatchBeforeExecHook(request, vmID: record.id)
+        switch hookDecision {
+        case .allow:
+            return nil
+        case let .vetoExecution(reason):
+            throw AgentVMError.firewallBlocked(ruleID: nil, reason: reason)
+        case let .requirePreExecSnapshot(reason):
+            if isSimulationBackend && !isWorkspaceDaemon {
+                let snap = try await captureSnapshot(
+                    vmID: record.id,
+                    title: reason,
+                    kind: .autoPreCommandCheckpoint,
+                    triggerCommand: request.commandLineSummary
+                )
+                return snap.id
+            }
+            // Decided Item 2 (a) / Fixes A44: on running hardware VMs (daemon-held machines), skip pre-destructive
+            // auto-checkpoint and append a diagnostic explaining consistent live snapshots are scheduled for M3.
+            let zhMsg = "已在运行中的虚拟机「\(record.spec.name)」上跳过破坏性命令前的自动检查点（\(reason)）：运行中做一致快照将在 M3 实现（命令：\(request.commandLineSummary)）。"
+            let enMsg = "Skipped pre-destructive auto-checkpoint (\(reason)) on running VM '\(record.spec.name)': consistent live snapshots while running are scheduled for M3 (command: \(request.commandLineSummary))."
+            try await store.appendDiagnostic(DiagnosticEvent(
+                severity: .notice,
+                subsystem: "PluginHost",
+                vmID: record.id,
+                code: "AUTO_CHECKPOINT_SKIPPED_UNTIL_M3",
+                message: (language == .zhHans) ? zhMsg : enMsg,
+                metadata: [
+                    "vmName": record.spec.name,
+                    "reason": reason,
+                    "commandLine": request.commandLineSummary,
+                    "milestone": "M3",
+                    "message_zh": zhMsg,
+                    "message_en": enMsg
+                ]
+            ))
+            return nil
         }
     }
 

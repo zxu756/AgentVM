@@ -2,7 +2,10 @@
 # AgentVM Milestone M2 Workspace Daemon Acceptance Script.
 #
 # Stage 2 implements non-VM Rows 1-9 against the unsigned `.build/debug/AgentVM` binary
-# (or caller-supplied AGENTVM_BIN) and marks remaining rows "没跑".
+# (or caller-supplied AGENTVM_BIN). Stage 3a adds real-VM lifecycle and lock Rows 10, 22, 23,
+# 25, 26 (except `exec t1 -- true`), and 29 when AGENTVM_REAL_VM=1 and AGENTVM_BIN carries
+# `com.apple.security.virtualization`; rows that require `exec` via daemon (Stage 4) or later
+# stages remain marked "没跑".
 #
 # Hard invariants:
 #   * Never launches the desktop UI (.app, window, or bare executable without a CLI subcommand).
@@ -309,6 +312,46 @@ fi
 
 BASELINE_VZ_PIDS="$(list_host_vz_vm_pids)"
 
+list_extra_vz_pids() {
+    local current_pids
+    current_pids="$(list_host_vz_vm_pids)"
+    /usr/bin/python3 - "$BASELINE_VZ_PIDS" "$current_pids" <<'PY'
+import sys
+
+base = set(int(x.strip()) for x in sys.argv[1].splitlines() if x.strip().isdigit())
+curr = set(int(x.strip()) for x in sys.argv[2].splitlines() if x.strip().isdigit())
+for pid in sorted(curr - base):
+    print(pid)
+PY
+}
+
+count_extra_vz_pids() {
+    local extras
+    extras="$(list_extra_vz_pids)"
+    if [[ -z "$extras" ]]; then
+        echo 0
+    else
+        printf '%s\n' "$extras" | wc -l | tr -d ' '
+    fi
+}
+
+wait_for_extra_vz_count() {
+    local expected_count="$1"
+    local max_wait_sec="${2:-30}"
+    local max_ticks=$(( max_wait_sec * 10 ))
+    local tick=0
+    local current_count=""
+    while (( tick <= max_ticks )); do
+        current_count="$(count_extra_vz_pids)"
+        if [[ "$current_count" == "$expected_count" ]]; then
+            return 0
+        fi
+        sleep 0.1
+        tick=$((tick + 1))
+    done
+    return 1
+}
+
 resolve_pid_comm_realpath() {
     local target_pid="$1"
     /usr/bin/python3 - "$target_pid" <<'PY'
@@ -348,7 +391,7 @@ stop_tracked_workspaces_and_daemons() {
                 /usr/bin/env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
                     HOME="${ISOLATED_HOME:-$REAL_HOME}" \
                     CFFIXED_USER_HOME="${ISOLATED_HOME:-$REAL_HOME}" \
-                    /usr/bin/perl -e 'alarm 15; exec @ARGV' \
+                    /usr/bin/perl -e 'alarm 65; exec @ARGV' \
                     "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$ws" daemon stop >/dev/null 2>&1 || true
             fi
         done
@@ -398,6 +441,10 @@ stop_tracked_workspaces_and_daemons() {
             kill -KILL "$pid" 2>/dev/null || true
         fi
     done
+
+    if [[ "${AGENTVM_REAL_VM:-}" == "1" ]]; then
+        wait_for_extra_vz_count 0 30 || true
+    fi
 }
 
 sweep_own_darwin_temp_symlinks() {
@@ -529,6 +576,10 @@ import os, sys
 print(os.path.realpath(sys.argv[1]))
 PY
         )"
+        if ! has_virtualization_entitlement "$AGENTVM_BIN_RESOLVED"; then
+            emit_err "ERROR: temporary signed binary still lacks com.apple.security.virtualization"
+            exit 1
+        fi
     else
         # Non-VM rows run directly against the unsigned `.build/debug/AgentVM` product.
         AGENTVM_BIN_RESOLVED="$BUILT_DEBUG_BIN"
@@ -539,19 +590,28 @@ export AGENTVM_BIN="$AGENTVM_BIN_RESOLVED"
 PASSED_ROWS=0
 FAILED_ROWS=0
 UNRUN_ROWS=0
+ROW_START_SEC="$(now_sec)"
 
 pass_row() {
     local row="$1"
     shift
+    local now_t elapsed_t
+    now_t="$(now_sec)"
+    elapsed_t="$(diff_sec "$ROW_START_SEC" "$now_t")"
+    ROW_START_SEC="$now_t"
     PASSED_ROWS=$((PASSED_ROWS + 1))
-    emit_out "PASS [Row $row]: $*"
+    emit_out "PASS [Row $row]: (${elapsed_t}s) $*"
 }
 
 fail_row() {
     local row="$1"
     shift
+    local now_t elapsed_t
+    now_t="$(now_sec)"
+    elapsed_t="$(diff_sec "$ROW_START_SEC" "$now_t")"
+    ROW_START_SEC="$now_t"
     FAILED_ROWS=$((FAILED_ROWS + 1))
-    emit_out "FAIL [Row $row]: $*"
+    emit_out "FAIL [Row $row]: (${elapsed_t}s) $*"
 }
 
 unrun_row() {
@@ -581,6 +641,7 @@ ensure_cli_subcommand() {
 
 LAST_RC=0
 LAST_ELAPSED_SEC="0.000"
+LAST_CMD_PID=""
 
 run_cli() {
     local out_file="$1"
@@ -604,6 +665,7 @@ run_cli() {
             "$AGENTVM_BIN_RESOLVED" "$@"
     ) </dev/null >"$out_file" 2>"$err_file" &
     cmd_pid=$!
+    LAST_CMD_PID="$cmd_pid"
     OWN_CLIENT_PIDS+=("$cmd_pid")
 
     (
@@ -1008,26 +1070,403 @@ else
 fi
 
 # ------------------------------------------------------------------
-# Rows 10-39: Real-VM rows (10-34, 36, 38-39) and end-to-end suite rows (35, 37)
-#             marked "没跑" in Stage 2 / without AGENTVM_REAL_VM=1
+# Rows 10-39: Real-VM rows (Stage 3a runs 10, 22, 23, 25, 26 [except exec], 29 when
+#             AGENTVM_REAL_VM=1 and AGENTVM_BIN carries virtualization entitlement;
+#             rows requiring `exec` via daemon [Stage 4] or later stages remain "没跑")
 # ------------------------------------------------------------------
-for row_no in $(seq 10 34); do
-    if [[ "${AGENTVM_REAL_VM:-}" != "1" ]]; then
-        unrun_row "$row_no" "未设置 AGENTVM_REAL_VM=1（真机验收行未执行）"
-    else
-        unrun_row "$row_no" "待 M2 第 3-6 段实现后接入"
-    fi
-done
-
-unrun_row 35 "待第 7 段 milestone 2 收尾脚本串联执行"
-if [[ "${AGENTVM_REAL_VM:-}" != "1" ]]; then
-    unrun_row 36 "未设置 AGENTVM_REAL_VM=1（m1-real-boot.sh 回归行未执行）"
-else
-    unrun_row 36 "待第 7 段更新 m1-real-boot.sh 第 17 行后执行"
+CAN_RUN_REAL_VM=0
+if [[ "${AGENTVM_REAL_VM:-}" == "1" ]] && has_virtualization_entitlement "$AGENTVM_BIN_RESOLVED"; then
+    CAN_RUN_REAL_VM=1
 fi
-unrun_row 37 "待第 7 段全量跑完收尾检查"
-unrun_row 38 "调度方独立变异验收行（第 8 段）"
-unrun_row 39 "调度方独立变异验收行（第 8 段）"
+
+if [[ $CAN_RUN_REAL_VM -ne 1 ]]; then
+    for row_no in $(seq 10 34); do
+        unrun_row "$row_no" "未设置 AGENTVM_REAL_VM=1（真机验收行未执行）"
+    done
+    unrun_row 35 "待第 7 段 milestone 2 收尾脚本串联执行"
+    unrun_row 36 "未设置 AGENTVM_REAL_VM=1（m1-real-boot.sh 回归行未执行）"
+    unrun_row 37 "待第 7 段全量跑完收尾检查"
+    unrun_row 38 "调度方独立变异验收行（第 8 段）"
+    unrun_row 39 "调度方独立变异验收行（第 8 段）"
+else
+    # --------------------------------------------------------------
+    # Row 10: `create t1 --image debian-12-bookworm-arm64`, `up t1`
+    #   Expect: exit 0; `ps --json` has t1 running & guestAgentConnected=true;
+    #           exactly 1 new VirtualMachine process; `up` client process exited.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r10-create.out" "$TMP_ROOT/r10-create.err" --lang en --workspace "$WS" create t1 --image debian-12-bookworm-arm64
+    r10_create_rc=$LAST_RC
+    r10_create_elapsed="$LAST_ELAPSED_SEC"
+
+    run_cli "$TMP_ROOT/r10-up.out" "$TMP_ROOT/r10-up.err" --lang en --workspace "$WS" up t1
+    r10_up_rc=$LAST_RC
+    r10_up_elapsed="$LAST_ELAPSED_SEC"
+    r10_up_pid="$LAST_CMD_PID"
+    r10_up_err="$(cat "$TMP_ROOT/r10-up.err")"
+
+    r10_up_exited=0
+    if [[ -n "$r10_up_pid" ]] && ! is_pid_currently_agentvm_bin "$r10_up_pid"; then
+        r10_up_exited=1
+    fi
+
+    run_cli "$TMP_ROOT/r10-ps.json" "$TMP_ROOT/r10-ps.err" --lang en --workspace "$WS" ps --json
+    r10_ps_rc=$LAST_RC
+
+    T1_ID=""
+    T1_SNAP_ID=""
+    T1_DISK_PATH=""
+    r10_t1_ok=0
+    if [[ $r10_ps_rc -eq 0 ]]; then
+        r10_meta="$(
+            /usr/bin/python3 - "$TMP_ROOT/r10-ps.json" <<'PY'
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t1_list = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1_list) != 1:
+    sys.exit(1)
+t1 = t1_list[0]
+tel = t1.get("telemetry", {})
+if tel.get("state") != "running" or tel.get("guestAgentConnected") is not True or tel.get("simulated") is not False:
+    sys.exit(1)
+vm_id = t1.get("spec", {}).get("id", "")
+snap_id = t1.get("currentHeadSnapshotID", "")
+blocks = t1.get("spec", {}).get("blockDevices", [])
+disk_path = blocks[0].get("imagePath", "") if blocks else ""
+print(vm_id)
+print(snap_id)
+print(disk_path)
+PY
+        )" && r10_t1_ok=1 || r10_t1_ok=0
+        if [[ $r10_t1_ok -eq 1 ]]; then
+            T1_ID="$(printf '%s\n' "$r10_meta" | sed -n '1p')"
+            T1_SNAP_ID="$(printf '%s\n' "$r10_meta" | sed -n '2p')"
+            T1_DISK_PATH="$(printf '%s\n' "$r10_meta" | sed -n '3p')"
+        fi
+    fi
+
+    r10_extra_vz="$(list_extra_vz_pids)"
+    r10_extra_vz_count="$(count_lines_nonempty "$r10_extra_vz")"
+    T1_VZ_PID=""
+    if [[ "$r10_extra_vz_count" == "1" ]]; then
+        T1_VZ_PID="$r10_extra_vz"
+    fi
+
+    if [[ $r10_create_rc -eq 0 && $r10_up_rc -eq 0 && $r10_up_exited -eq 1 \
+        && $r10_ps_rc -eq 0 && $r10_t1_ok -eq 1 && "$r10_extra_vz_count" == "1" ]]; then
+        pass_row 10 "create (${r10_create_elapsed}s) & 'up t1' (${r10_up_elapsed}s) exited 0; ps --json state=running & guestAgentConnected=true; extra VirtualMachine PIDs=1 (pid=$T1_VZ_PID); 'up' client process exited."
+    else
+        fail_row 10 "create_rc=$r10_create_rc, up_rc=$r10_up_rc, up_exited=$r10_up_exited, ps_rc=$r10_ps_rc, t1_ok=$r10_t1_ok, extra_vz_count=$r10_extra_vz_count (pids='${r10_extra_vz//$'\n'/,}'), up_err='$r10_up_err'"
+    fi
+
+    # Rows 11-21 require `exec` via daemon (Stage 4) and/or guest agent v2 & telemetry (Stages 5-6).
+    unrun_row 11 "exec 经守护进程是第 4 段"
+    unrun_row 12 "exec 经守护进程是第 4 段"
+    unrun_row 13 "exec 经守护进程是第 4 段"
+    unrun_row 14 "exec 经守护进程是第 4 段"
+    unrun_row 15 "exec 经守护进程是第 4 段"
+    unrun_row 16 "exec 经守护进程是第 4 段"
+    unrun_row 17 "exec 经守护进程是第 4 段（客户机进程组取消是第 5 段）"
+    unrun_row 18 "exec 经守护进程是第 4 段（遥测映射是第 6 段）"
+    unrun_row 19 "exec 经守护进程是第 4 段（CPU 遥测是第 5-6 段）"
+    unrun_row 20 "exec 经守护进程是第 4 段（内存遥测是第 6 段）"
+    unrun_row 21 "遥测刷新与过期是第 6 段"
+
+    # --------------------------------------------------------------
+    # Row 22: While daemon holds `t1`, `run t1 -- true`
+    #   Expect: exits 125 with ERR_VM_LOCKED; t1 still running (same VirtualMachine PID).
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r22-run.out" "$TMP_ROOT/r22-run.err" --lang en --workspace "$WS" run t1 -- true
+    r22_rc=$LAST_RC
+    r22_out="$(cat "$TMP_ROOT/r22-run.out")"
+    r22_err="$(cat "$TMP_ROOT/r22-run.err")"
+
+    run_cli "$TMP_ROOT/r22-ps.json" "$TMP_ROOT/r22-ps.err" --lang en --workspace "$WS" ps --json
+    r22_ps_rc=$LAST_RC
+    r22_t1_running=0
+    if [[ $r22_ps_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r22-ps.json" <<'PY' && r22_t1_running=1 || r22_t1_running=0
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1) != 1:
+    sys.exit(1)
+tel = t1[0].get("telemetry", {})
+if tel.get("state") != "running" or tel.get("guestAgentConnected") is not True:
+    sys.exit(1)
+PY
+    fi
+
+    r22_extra_vz="$(list_extra_vz_pids)"
+    r22_extra_vz_count="$(count_lines_nonempty "$r22_extra_vz")"
+
+    if [[ $r22_rc -eq 125 && -z "$r22_out" && "$r22_err" == *"ERR_VM_LOCKED"* \
+        && $r22_t1_running -eq 1 && "$r22_extra_vz_count" == "1" \
+        && -n "$T1_VZ_PID" && "$r22_extra_vz" == "$T1_VZ_PID" ]]; then
+        pass_row 22 "'run t1 -- true' exited 125 with ERR_VM_LOCKED; t1 still running on unchanged VirtualMachine pid=$T1_VZ_PID (exec 读 boot_id 待第 4 段)."
+    else
+        fail_row 22 "rc=$r22_rc, out_len=${#r22_out}, t1_running=$r22_t1_running, extra_vz='${r22_extra_vz//$'\n'/,}' (expected '$T1_VZ_PID'), err='$r22_err'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 23: While `t1` is running, `snapshot t1` and `restore <t1 snapshot>`
+    #   Expect: both exit 1 with ERR_VM_LOCKED mentioning M3; t1 root disk inode unchanged; t1 still running.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    r23_ino_before=""
+    if [[ -n "$T1_DISK_PATH" && -f "$T1_DISK_PATH" ]]; then
+        r23_ino_before="$(stat -f '%i' "$T1_DISK_PATH" 2>/dev/null || true)"
+    fi
+
+    run_cli "$TMP_ROOT/r23-snap.out" "$TMP_ROOT/r23-snap.err" --lang en --workspace "$WS" snapshot t1
+    r23_snap_rc=$LAST_RC
+    r23_snap_err="$(cat "$TMP_ROOT/r23-snap.err")"
+
+    r23_restore_rc=99
+    r23_restore_err=""
+    if [[ -n "$T1_SNAP_ID" ]]; then
+        run_cli "$TMP_ROOT/r23-restore.out" "$TMP_ROOT/r23-restore.err" --lang en --workspace "$WS" restore "$T1_SNAP_ID"
+        r23_restore_rc=$LAST_RC
+        r23_restore_err="$(cat "$TMP_ROOT/r23-restore.err")"
+    fi
+
+    r23_ino_after=""
+    if [[ -n "$T1_DISK_PATH" && -f "$T1_DISK_PATH" ]]; then
+        r23_ino_after="$(stat -f '%i' "$T1_DISK_PATH" 2>/dev/null || true)"
+    fi
+
+    run_cli "$TMP_ROOT/r23-ps.json" "$TMP_ROOT/r23-ps.err" --lang en --workspace "$WS" ps --json
+    r23_ps_rc=$LAST_RC
+    r23_t1_running=0
+    if [[ $r23_ps_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r23-ps.json" <<'PY' && r23_t1_running=1 || r23_t1_running=0
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1) != 1:
+    sys.exit(1)
+tel = t1[0].get("telemetry", {})
+if tel.get("state") != "running" or tel.get("guestAgentConnected") is not True:
+    sys.exit(1)
+PY
+    fi
+
+    r23_extra_vz="$(list_extra_vz_pids)"
+
+    if [[ $r23_snap_rc -eq 1 && "$r23_snap_err" == *"ERR_VM_LOCKED"* && "$r23_snap_err" == *"M3"* \
+        && $r23_restore_rc -eq 1 && "$r23_restore_err" == *"ERR_VM_LOCKED"* && "$r23_restore_err" == *"M3"* \
+        && -n "$r23_ino_before" && "$r23_ino_before" == "$r23_ino_after" \
+        && $r23_t1_running -eq 1 && -n "$T1_VZ_PID" && "$r23_extra_vz" == "$T1_VZ_PID" ]]; then
+        pass_row 23 "'snapshot t1' and 'restore $T1_SNAP_ID' both exited 1 with ERR_VM_LOCKED mentioning M3; disk inode unchanged ($r23_ino_after); t1 still running on pid=$T1_VZ_PID (exec 读 boot_id 待第 4 段)."
+    else
+        fail_row 23 "snap_rc=$r23_snap_rc, restore_rc=$r23_restore_rc, ino='$r23_ino_before'->'$r23_ino_after', t1_running=$r23_t1_running, extra_vz='${r23_extra_vz//$'\n'/,}', snap_err='$r23_snap_err', restore_err='$r23_restore_err'"
+    fi
+
+    # Row 24 requires `exec` via daemon (Stage 4) and telemetry expiry (Stage 6).
+    unrun_row 24 "exec 经守护进程是第 4 段"
+
+    # --------------------------------------------------------------
+    # Row 25: `create t2 --image debian-12-bookworm-arm64`; while daemon is running (t1 running),
+    #         `policy airgap` -> `up t2` exits 1 (ERR_AIRGAP_UNSUPPORTED / M5, 0 new VMs);
+    #         `policy strict` -> `up t2` exits 0; then `halt t2`.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r25-dstatus1.json" "$TMP_ROOT/r25-dstatus1.err" --lang en --workspace "$WS" daemon status --json
+    r25_d1_rc=$LAST_RC
+    r25_d1_pid=""
+    if [[ $r25_d1_rc -eq 0 ]]; then
+        r25_d1_pid="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("pid", ""))' "$TMP_ROOT/r25-dstatus1.json" 2>/dev/null || true)"
+    fi
+
+    run_cli "$TMP_ROOT/r25-create.out" "$TMP_ROOT/r25-create.err" --lang en --workspace "$WS" create t2 --image debian-12-bookworm-arm64
+    r25_create_rc=$LAST_RC
+
+    run_cli "$TMP_ROOT/r25-airgap.out" "$TMP_ROOT/r25-airgap.err" --lang en --workspace "$WS" policy airgap
+    r25_airgap_rc=$LAST_RC
+
+    run_cli "$TMP_ROOT/r25-up1.out" "$TMP_ROOT/r25-up1.err" --lang en --workspace "$WS" up t2
+    r25_up1_rc=$LAST_RC
+    r25_up1_err="$(cat "$TMP_ROOT/r25-up1.err")"
+    r25_vz_after_airgap="$(list_extra_vz_pids)"
+    r25_vz_after_airgap_count="$(count_lines_nonempty "$r25_vz_after_airgap")"
+
+    run_cli "$TMP_ROOT/r25-strict.out" "$TMP_ROOT/r25-strict.err" --lang en --workspace "$WS" policy strict
+    r25_strict_rc=$LAST_RC
+
+    run_cli "$TMP_ROOT/r25-up2.out" "$TMP_ROOT/r25-up2.err" --lang en --workspace "$WS" up t2
+    r25_up2_rc=$LAST_RC
+    r25_up2_elapsed="$LAST_ELAPSED_SEC"
+    r25_vz_during_t2="$(count_extra_vz_pids)"
+
+    run_cli "$TMP_ROOT/r25-dstatus2.json" "$TMP_ROOT/r25-dstatus2.err" --lang en --workspace "$WS" daemon status --json
+    r25_d2_rc=$LAST_RC
+    r25_d2_pid=""
+    if [[ $r25_d2_rc -eq 0 ]]; then
+        r25_d2_pid="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("pid", ""))' "$TMP_ROOT/r25-dstatus2.json" 2>/dev/null || true)"
+    fi
+
+    run_cli "$TMP_ROOT/r25-halt.out" "$TMP_ROOT/r25-halt.err" --lang en --workspace "$WS" halt t2
+    r25_halt_rc=$LAST_RC
+    r25_t2_vz_exited=0
+    if wait_for_extra_vz_count 1 30; then
+        r25_t2_vz_exited=1
+    fi
+
+    if [[ $r25_d1_rc -eq 0 && -n "$r25_d1_pid" && $r25_create_rc -eq 0 && $r25_airgap_rc -eq 0 \
+        && $r25_up1_rc -eq 1 && "$r25_up1_err" == *"ERR_AIRGAP_UNSUPPORTED"* && "$r25_up1_err" == *"M5"* \
+        && "$r25_vz_after_airgap_count" == "1" && "$r25_vz_after_airgap" == "$T1_VZ_PID" \
+        && $r25_strict_rc -eq 0 && $r25_up2_rc -eq 0 && "$r25_vz_during_t2" == "2" \
+        && $r25_d2_rc -eq 0 && "$r25_d2_pid" == "$r25_d1_pid" \
+        && $r25_halt_rc -eq 0 && $r25_t2_vz_exited -eq 1 ]]; then
+        pass_row 25 "live daemon (pid=$r25_d1_pid) re-read airgap policy: 'up t2' exited 1 (ERR_AIRGAP_UNSUPPORTED / M5, 0 new VM processes); after 'policy strict', 'up t2' (${r25_up2_elapsed}s) exited 0 (extra VMs=2); 'halt t2' exited 0."
+    else
+        fail_row 25 "create=$r25_create_rc, airgap=$r25_airgap_rc, up1=$r25_up1_rc, vz_airgap='$r25_vz_after_airgap_count', strict=$r25_strict_rc, up2=$r25_up2_rc, vz_t2='$r25_vz_during_t2', pids='$r25_d1_pid'->'$r25_d2_pid', halt=$r25_halt_rc, t2_exited=$r25_t2_vz_exited, up1_err='$r25_up1_err'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 26 (except `exec t1 -- true`): `halt t1`
+    #   Expect: exits 0; within 30s t1's VirtualMachine process exits; `ps --json` is stopped;
+    #           plain `ps` CPU and MEMORY columns are '—'; daemon still running (`daemon status` exits 0).
+    #           (`exec t1 -- true` deferred until Stage 4).
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    r26_t0="$(now_sec)"
+    run_cli "$TMP_ROOT/r26-halt.out" "$TMP_ROOT/r26-halt.err" --lang en --workspace "$WS" halt t1
+    r26_halt_rc=$LAST_RC
+
+    r26_vz_gone=0
+    if wait_for_extra_vz_count 0 30; then
+        r26_vz_gone=1
+    fi
+    r26_t1="$(now_sec)"
+    r26_vz_elapsed="$(diff_sec "$r26_t0" "$r26_t1")"
+
+    run_cli "$TMP_ROOT/r26-ps.json" "$TMP_ROOT/r26-psj.err" --lang en --workspace "$WS" ps --json
+    r26_psj_rc=$LAST_RC
+    r26_psj_ok=0
+    if [[ $r26_psj_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r26-ps.json" <<'PY' && r26_psj_ok=1 || r26_psj_ok=0
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1) != 1:
+    sys.exit(1)
+tel = t1[0].get("telemetry", {})
+if tel.get("state") != "stopped" or tel.get("guestAgentConnected") is not False:
+    sys.exit(1)
+PY
+    fi
+
+    run_cli "$TMP_ROOT/r26-ps.txt" "$TMP_ROOT/r26-pst.err" --lang en --workspace "$WS" ps
+    r26_pst_rc=$LAST_RC
+    r26_pst_ok=0
+    if [[ $r26_pst_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r26-ps.txt" "$T1_ID" <<'PY' && r26_pst_ok=1 || r26_pst_ok=0
+import sys
+
+lines = [ln.rstrip("\r\n") for ln in open(sys.argv[1], encoding="utf-8") if ln.strip()]
+t1_id = sys.argv[2].strip()
+if len(lines) < 2:
+    sys.exit(1)
+header = lines[0]
+for col in ("STATE", "CPU", "MEMORY", "IPV4"):
+    if col not in header:
+        sys.exit(1)
+state_idx = header.index("STATE")
+cpu_idx = header.index("CPU")
+mem_idx = header.index("MEMORY")
+ip_idx = header.index("IPV4")
+
+matched = [ln for ln in lines[1:] if (t1_id and ln.startswith(t1_id + " ")) or (" t1 " in ln)]
+if len(matched) != 1:
+    sys.exit(1)
+row = matched[0]
+state_val = row[state_idx:cpu_idx].strip()
+cpu_val = row[cpu_idx:mem_idx].strip()
+mem_val = row[mem_idx:ip_idx].strip()
+if state_val != "stopped" or cpu_val != "—" or mem_val != "—":
+    sys.exit(1)
+PY
+    fi
+
+    run_cli "$TMP_ROOT/r26-dstatus.out" "$TMP_ROOT/r26-dstatus.err" --lang en --workspace "$WS" daemon status
+    r26_dstatus_rc=$LAST_RC
+    r26_daemon_pids="$(find_workspace_daemon_pids "$WS")"
+    r26_daemon_count="$(count_lines_nonempty "$r26_daemon_pids")"
+
+    if [[ $r26_halt_rc -eq 0 && $r26_vz_gone -eq 1 && $r26_psj_ok -eq 1 \
+        && $r26_pst_ok -eq 1 && $r26_dstatus_rc -eq 0 && "$r26_daemon_count" == "1" ]]; then
+        pass_row 26 "'halt t1' exited 0; t1 VirtualMachine process exited in ${r26_vz_elapsed}s (<30s); ps --json=stopped; plain ps CPU='—' & MEMORY='—'; daemon still alive ('daemon status' exited 0) ['exec t1 -- true' 没跑：exec 经守护进程是第 4 段]."
+    else
+        fail_row 26 "halt_rc=$r26_halt_rc, vz_gone=$r26_vz_gone, psj_ok=$r26_psj_ok, pst_ok=$r26_pst_ok, dstatus_rc=$r26_dstatus_rc, daemon_count=$r26_daemon_count"
+    fi
+
+    # Rows 27-28 require `exec` via daemon (Stage 4) and guest stop observation A33 (Stage 3b).
+    unrun_row 27 "exec 经守护进程是第 4 段"
+    unrun_row 28 "exec 经守护进程是第 4 段（停机观察 A33 是第 3b 段）"
+
+    # --------------------------------------------------------------
+    # Row 29: `up t1`, `up t2`
+    #   Expect: 2 extra VirtualMachine processes; `daemon status --json` lists both t1 and t2.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r29-up1.out" "$TMP_ROOT/r29-up1.err" --lang en --workspace "$WS" up t1
+    r29_up1_rc=$LAST_RC
+    r29_up1_elapsed="$LAST_ELAPSED_SEC"
+
+    run_cli "$TMP_ROOT/r29-up2.out" "$TMP_ROOT/r29-up2.err" --lang en --workspace "$WS" up t2
+    r29_up2_rc=$LAST_RC
+    r29_up2_elapsed="$LAST_ELAPSED_SEC"
+
+    r29_extra_vz="$(list_extra_vz_pids)"
+    r29_extra_vz_count="$(count_lines_nonempty "$r29_extra_vz")"
+
+    run_cli "$TMP_ROOT/r29-dstatus.json" "$TMP_ROOT/r29-dstatus.err" --lang en --workspace "$WS" daemon status --json
+    r29_dstatus_rc=$LAST_RC
+    r29_status_ok=0
+    if [[ $r29_dstatus_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r29-dstatus.json" <<'PY' && r29_status_ok=1 || r29_status_ok=0
+import json, sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("running") is not True:
+    sys.exit(1)
+vms = data.get("vms") or []
+names = sorted(v.get("spec", {}).get("name", "") for v in vms)
+if names != ["t1", "t2"]:
+    sys.exit(1)
+for v in vms:
+    tel = v.get("telemetry", {})
+    if tel.get("state") != "running" or tel.get("guestAgentConnected") is not True:
+        sys.exit(1)
+PY
+    fi
+
+    if [[ $r29_up1_rc -eq 0 && $r29_up2_rc -eq 0 && "$r29_extra_vz_count" == "2" \
+        && $r29_dstatus_rc -eq 0 && $r29_status_ok -eq 1 ]]; then
+        pass_row 29 "'up t1' (${r29_up1_elapsed}s) & 'up t2' (${r29_up2_elapsed}s) exited 0; extra VirtualMachine PIDs=2; 'daemon status --json' lists [t1, t2] running."
+    else
+        fail_row 29 "up1_rc=$r29_up1_rc, up2_rc=$r29_up2_rc, extra_vz_count=$r29_extra_vz_count (pids='${r29_extra_vz//$'\n'/,}'), dstatus_rc=$r29_dstatus_rc, status_ok=$r29_status_ok"
+    fi
+
+    # Rows 30-34 require `exec` via daemon (Stage 4) and Stage 3b stop observation/reconnection.
+    unrun_row 30 "exec 经守护进程是第 4 段（第 30-31 行断电恢复组在第 3b 段）"
+    unrun_row 31 "exec 经守护进程是第 4 段"
+    unrun_row 32 "exec 经守护进程是第 4 段"
+    unrun_row 33 "exec 经守护进程是第 4 段（VM_STOPPED 停机原因与第 34 行 dmesg 核对在第 3b 段）"
+    unrun_row 34 "exec 经守护进程是第 4 段"
+
+    unrun_row 35 "待第 7 段 milestone 2 收尾脚本串联执行"
+    unrun_row 36 "待第 7 段更新 m1-real-boot.sh 第 17 行后执行"
+    unrun_row 37 "待第 7 段全量跑完收尾检查"
+    unrun_row 38 "调度方独立变异验收行（第 8 段）"
+    unrun_row 39 "调度方独立变异验收行（第 8 段）"
+fi
 
 # ------------------------------------------------------------------
 # Post-Run Cleanup & Host-Wide AgentVM Daemon Leak Gate
@@ -1054,6 +1493,14 @@ PY
 emit_out "Host AgentVM daemon count after cleanup: $HOST_DAEMON_COUNT_AFTER (before: $HOST_DAEMON_COUNT_BEFORE)"
 if [[ "$HOST_DAEMON_COUNT_AFTER" -gt "$HOST_DAEMON_COUNT_BEFORE" || -n "$NEW_HOST_DAEMONS" ]]; then
     emit_err "FAIL: leaked AgentVM daemon process(es) detected after cleanup: $NEW_HOST_DAEMONS"
+    FAILED_ROWS=$((FAILED_ROWS + 1))
+fi
+
+EXTRA_VZ_AFTER="$(list_extra_vz_pids)"
+EXTRA_VZ_COUNT_AFTER="$(count_lines_nonempty "$EXTRA_VZ_AFTER")"
+emit_out "Extra VirtualMachine PIDs after cleanup: $EXTRA_VZ_COUNT_AFTER"
+if [[ "$EXTRA_VZ_COUNT_AFTER" != "0" ]]; then
+    emit_err "FAIL: leaked VirtualMachine process(es) detected after cleanup: ${EXTRA_VZ_AFTER//$'\n'/ }"
     FAILED_ROWS=$((FAILED_ROWS + 1))
 fi
 

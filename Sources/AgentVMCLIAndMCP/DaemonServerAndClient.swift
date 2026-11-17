@@ -845,14 +845,375 @@ public enum DaemonClient {
                 }()
                 let procGone: Bool = {
                     guard let pid = targetPID, pid > 0, pid != Darwin.getpid() else { return true }
+                    var reapStatus: Int32 = 0
+                    _ = Darwin.waitpid(pid, &reapStatus, WNOHANG)
                     return Darwin.kill(pid, 0) != 0 && Darwin.errno == ESRCH
                 }()
                 if sockGone && symGone && procGone {
                     break
                 }
-                Darwin.usleep(20_000)
+                    Darwin.usleep(20_000)
+                }
+                return .connected((targetPID, stopRes))
             }
-            return .connected((targetPID, stopRes))
         }
+    }
+
+// MARK: - Detached `posix_spawn` Daemon Launcher (`daemon start` & `up`)
+
+public struct DaemonSpawnCommandOverride: Hashable, Sendable {
+    public var executablePath: String
+    public var arguments: [String]
+    public var environment: [String: String]?
+
+    public init(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String]? = nil
+    ) {
+        self.executablePath = executablePath
+        self.arguments = arguments
+        self.environment = environment
+    }
+}
+
+public enum DaemonLaunchOutcome: Sendable {
+    case started(DaemonRPCStatusResult)
+    case alreadyRunning(DaemonRPCStatusResult)
+
+    public var status: DaemonRPCStatusResult {
+        switch self {
+        case let .started(s), let .alreadyRunning(s):
+            return s
+        }
+    }
+
+    public var wasAlreadyRunning: Bool {
+        if case .alreadyRunning = self {
+            return true
+        }
+        return false
+    }
+}
+
+public enum DaemonLaunchError: Error, LocalizedError, Hashable, Sendable {
+    case posixSpawnFailed(executablePath: String, errnoCode: Int32, detail: String)
+    case childExitedNonZero(pid: Int32, exitCode: Int32?, signal: Int32?, logFilePath: String, logTail: String)
+    case startupTimedOut(timeoutSeconds: TimeInterval, logFilePath: String, logTail: String)
+
+    public var errorCode: String {
+        "ERR_DAEMON_IPC"
+    }
+
+    public var errorDescription: String? {
+        localizedMessage(in: .en)
+    }
+
+    public func localizedMessage(in language: AppLanguage) -> String {
+        let isZh = (language == .zhHans)
+        switch self {
+        case let .posixSpawnFailed(executablePath, errnoCode, detail):
+            return isZh
+                ? "无法通过 posix_spawn 拉起工作区守护进程「\(executablePath)」（errno=\(errnoCode)）：\(detail)"
+                : "Failed spawning workspace daemon '\(executablePath)' via posix_spawn (errno=\(errnoCode)): \(detail)"
+        case let .childExitedNonZero(pid, exitCode, signal, logFilePath, logTail):
+            let statusDesc: String
+            if let exitCode {
+                statusDesc = isZh ? "退出码 \(exitCode)" : "exit code \(exitCode)"
+            } else if let signal {
+                statusDesc = isZh ? "信号 \(signal)" : "signal \(signal)"
+            } else {
+                statusDesc = isZh ? "未知状态" : "unknown status"
+            }
+            var msg = isZh
+                ? "工作区守护进程（PID \(pid)）在就绪前异常退出（\(statusDesc)）。日志「\(logFilePath)」最后 20 行："
+                : "Workspace daemon (PID \(pid)) exited before becoming ready (\(statusDesc)). Last 20 lines of '\(logFilePath)':"
+            if !logTail.isEmpty {
+                msg += "\n" + logTail
+            } else {
+                msg += isZh ? "（日志为空）" : " (log is empty)"
+            }
+            return msg
+        case let .startupTimedOut(timeoutSeconds, logFilePath, logTail):
+            let secs = Int(timeoutSeconds.rounded())
+            var msg = isZh
+                ? "等待工作区守护进程就绪超时（\(secs) 秒）。日志「\(logFilePath)」最后 20 行："
+                : "Timed out after \(secs)s waiting for workspace daemon to become ready. Last 20 lines of '\(logFilePath)':"
+            if !logTail.isEmpty {
+                msg += "\n" + logTail
+            } else {
+                msg += isZh ? "（日志为空）" : " (log is empty)"
+            }
+            return msg
+        }
+    }
+}
+
+public enum DaemonProcessLauncher {
+    private enum DecodedWaitStatus {
+        case running
+        case exited(Int32)
+        case signaled(Int32)
+    }
+
+    private static func decodeWaitStatus(_ status: Int32) -> DecodedWaitStatus {
+        let low7 = status & 0x7f
+        if low7 == 0 {
+            return .exited((status >> 8) & 0xff)
+        }
+        if low7 != 0x7f {
+            return .signaled(low7)
+        }
+        return .running
+    }
+
+    public static func launchOrConnect(
+        workspaceURL: URL,
+        language: AppLanguage,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        spawnOverride: DaemonSpawnCommandOverride? = nil,
+        pollIntervalMilliseconds: UInt64 = 100,
+        timeoutSeconds: TimeInterval = 15.0,
+        userTempDirectoryOverride: URL? = nil
+    ) async throws -> DaemonLaunchOutcome {
+        let paths = DaemonWorkspacePaths(workspaceURL: workspaceURL)
+
+        // 1. If a compatible daemon is already listening on this workspace, return its status immediately.
+        if case let .connected(existingStatus) = try DaemonClient.queryStatus(
+            workspaceURL: paths.workspaceURL,
+            language: language,
+            userTempDirectoryOverride: userTempDirectoryOverride
+        ) {
+            return .alreadyRunning(existingStatus)
+        }
+
+        // 2. Ensure `<workspace>/logs` directory exists before opening `daemon.log` in `posix_spawn_file_actions`.
+        do {
+            try FileManager.default.createDirectory(
+                at: paths.logsDirectoryURL,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw DaemonSocketError.syscallFailed(
+                operation: "mkdir(logs)",
+                path: paths.logsDirectoryURL.path,
+                errnoCode: Darwin.errno,
+                detail: error.localizedDescription
+            )
+        }
+
+        // 3. Resolve executable (`_NSGetExecutablePath` + `realpath`) and construct `daemon run --workspace <abs>`.
+        let execPath = spawnOverride?.executablePath ?? DaemonExecutableLocator.resolveCurrentExecutablePath()
+        let argTail = spawnOverride?.arguments ?? ["daemon", "run", "--workspace", paths.canonicalWorkspacePath]
+        let childEnv = spawnOverride?.environment ?? environment
+
+        let childPID = try spawnDetachedDaemonProcess(
+            executablePath: execPath,
+            arguments: argTail,
+            environment: childEnv,
+            logFilePath: paths.daemonLogFileURL.path
+        )
+
+        // 4. Poll every 100 ms up to 15 s; check `waitpid(WNOHANG)` on each tick.
+        var childReaped = false
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ UInt64(max(0.5, timeoutSeconds) * 1_000_000_000)
+        let intervalNs = max(10, pollIntervalMilliseconds) * 1_000_000
+
+        while true {
+            if case let .connected(status) = try DaemonClient.queryStatus(
+                workspaceURL: paths.workspaceURL,
+                language: language,
+                userTempDirectoryOverride: userTempDirectoryOverride
+            ) {
+                if !childReaped {
+                    var st: Int32 = 0
+                    if Darwin.waitpid(childPID, &st, WNOHANG) == childPID {
+                        childReaped = true
+                    }
+                }
+                if status.pid == childPID {
+                    return .started(status)
+                }
+                return .alreadyRunning(status)
+            }
+
+            if !childReaped {
+                var wstatus: Int32 = 0
+                let wrc = Darwin.waitpid(childPID, &wstatus, WNOHANG)
+                if wrc == childPID {
+                    childReaped = true
+                    switch decodeWaitStatus(wstatus) {
+                    case .exited(0):
+                        // Contender lost `daemon.lock` race and exited 0; continue polling winner.
+                        break
+                    case let .exited(code):
+                        let tail = DaemonLogManager.readTailLines(at: paths.daemonLogFileURL, maxLines: 20)
+                        throw DaemonLaunchError.childExitedNonZero(
+                            pid: childPID,
+                            exitCode: code,
+                            signal: nil,
+                            logFilePath: paths.daemonLogFileURL.path,
+                            logTail: tail
+                        )
+                    case let .signaled(sig):
+                        let tail = DaemonLogManager.readTailLines(at: paths.daemonLogFileURL, maxLines: 20)
+                        throw DaemonLaunchError.childExitedNonZero(
+                            pid: childPID,
+                            exitCode: nil,
+                            signal: sig,
+                            logFilePath: paths.daemonLogFileURL.path,
+                            logTail: tail
+                        )
+                    case .running:
+                        break
+                    }
+                }
+            }
+
+            if DispatchTime.now().uptimeNanoseconds >= deadline {
+                break
+            }
+            try? await Task.sleep(nanoseconds: intervalNs)
+        }
+
+        let tail = DaemonLogManager.readTailLines(at: paths.daemonLogFileURL, maxLines: 20)
+        throw DaemonLaunchError.startupTimedOut(
+            timeoutSeconds: timeoutSeconds,
+            logFilePath: paths.daemonLogFileURL.path,
+            logTail: tail
+        )
+    }
+
+    private static func spawnDetachedDaemonProcess(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String],
+        logFilePath: String
+    ) throws -> pid_t {
+        var attr: posix_spawnattr_t?
+        let attrInitRC = Darwin.posix_spawnattr_init(&attr)
+        guard attrInitRC == 0 else {
+            throw DaemonLaunchError.posixSpawnFailed(
+                executablePath: executablePath,
+                errnoCode: attrInitRC,
+                detail: "posix_spawnattr_init failed: \(String(cString: Darwin.strerror(attrInitRC)))"
+            )
+        }
+        defer { _ = Darwin.posix_spawnattr_destroy(&attr) }
+
+        let spawnFlags = Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK)
+        let setFlagsRC = Darwin.posix_spawnattr_setflags(&attr, spawnFlags)
+        guard setFlagsRC == 0 else {
+            throw DaemonLaunchError.posixSpawnFailed(
+                executablePath: executablePath,
+                errnoCode: setFlagsRC,
+                detail: "posix_spawnattr_setflags failed: \(String(cString: Darwin.strerror(setFlagsRC)))"
+            )
+        }
+
+        var emptyMask = sigset_t()
+        Darwin.sigemptyset(&emptyMask)
+        _ = Darwin.posix_spawnattr_setsigmask(&attr, &emptyMask)
+
+        var fileActions: posix_spawn_file_actions_t?
+        let faInitRC = Darwin.posix_spawn_file_actions_init(&fileActions)
+        guard faInitRC == 0 else {
+            throw DaemonLaunchError.posixSpawnFailed(
+                executablePath: executablePath,
+                errnoCode: faInitRC,
+                detail: "posix_spawn_file_actions_init failed: \(String(cString: Darwin.strerror(faInitRC)))"
+            )
+        }
+        defer { _ = Darwin.posix_spawn_file_actions_destroy(&fileActions) }
+
+        let addStdinRC = Darwin.posix_spawn_file_actions_addopen(
+            &fileActions,
+            STDIN_FILENO,
+            "/dev/null",
+            O_RDONLY,
+            0
+        )
+        guard addStdinRC == 0 else {
+            throw DaemonLaunchError.posixSpawnFailed(
+                executablePath: executablePath,
+                errnoCode: addStdinRC,
+                detail: "posix_spawn_file_actions_addopen(/dev/null) failed: \(String(cString: Darwin.strerror(addStdinRC)))"
+            )
+        }
+
+        let logOpenFlags = O_WRONLY | O_CREAT | O_APPEND
+        let addStdoutRC = Darwin.posix_spawn_file_actions_addopen(
+            &fileActions,
+            STDOUT_FILENO,
+            logFilePath,
+            logOpenFlags,
+            mode_t(0o600)
+        )
+        guard addStdoutRC == 0 else {
+            throw DaemonLaunchError.posixSpawnFailed(
+                executablePath: executablePath,
+                errnoCode: addStdoutRC,
+                detail: "posix_spawn_file_actions_addopen(stdout->daemon.log) failed: \(String(cString: Darwin.strerror(addStdoutRC)))"
+            )
+        }
+
+        let addStderrRC = Darwin.posix_spawn_file_actions_addopen(
+            &fileActions,
+            STDERR_FILENO,
+            logFilePath,
+            logOpenFlags,
+            mode_t(0o600)
+        )
+        guard addStderrRC == 0 else {
+            throw DaemonLaunchError.posixSpawnFailed(
+                executablePath: executablePath,
+                errnoCode: addStderrRC,
+                detail: "posix_spawn_file_actions_addopen(stderr->daemon.log) failed: \(String(cString: Darwin.strerror(addStderrRC)))"
+            )
+        }
+
+        let fullArgv = [executablePath] + arguments
+        var cArgv: [UnsafeMutablePointer<CChar>?] = fullArgv.map { Darwin.strdup($0) }
+        cArgv.append(nil)
+        defer {
+            for ptr in cArgv where ptr != nil {
+                Darwin.free(ptr)
+            }
+        }
+
+        let envStrings = environment.keys.sorted().map { key in
+            "\(key)=\(environment[key] ?? "")"
+        }
+        var cEnvp: [UnsafeMutablePointer<CChar>?] = envStrings.map { Darwin.strdup($0) }
+        cEnvp.append(nil)
+        defer {
+            for ptr in cEnvp where ptr != nil {
+                Darwin.free(ptr)
+            }
+        }
+
+        var spawnedPID: pid_t = 0
+        let spawnRC = executablePath.withCString { cExecPath in
+            cArgv.withUnsafeMutableBufferPointer { argvBuf in
+                cEnvp.withUnsafeMutableBufferPointer { envpBuf in
+                    Darwin.posix_spawn(
+                        &spawnedPID,
+                        cExecPath,
+                        &fileActions,
+                        &attr,
+                        argvBuf.baseAddress,
+                        envpBuf.baseAddress
+                    )
+                }
+            }
+        }
+        guard spawnRC == 0 else {
+            throw DaemonLaunchError.posixSpawnFailed(
+                executablePath: executablePath,
+                errnoCode: spawnRC,
+                detail: String(cString: Darwin.strerror(spawnRC))
+            )
+        }
+        return spawnedPID
     }
 }

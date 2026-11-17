@@ -386,6 +386,413 @@ struct CLIAndMCPDaemonStage2Tests {
         #expect(sigtermHookBox.isSet() == true)
         #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
     }
+
+    // MARK: - Item 2: Detached `posix_spawn` Launcher, `daemon start`, Contender Exit 0, Crash Tail & `up` Preflight
+
+    @Test("Item 2a: DaemonProcessLauncher & 'daemon start' spawn detached session leader (SETSID, CLOEXEC, fd 0/1/2), handle exit-0 contender race, report 20-line daemon.log tail on non-zero exit, and stop cleanly")
+    func daemonStartDetachedPosixSpawnContenderRaceFailureLogTailAndTeardown() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-d2a")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = ["HOME": isolatedHome, "CFFIXED_USER_HOME": isolatedHome]
+        let cli = AgentVMCLIRunner()
+
+        // 1. Offline Python helper speaking the exact single-line DaemonRPC hello + status + stop protocol
+        //    so `swift test` exercises real `posix_spawn` (`SETSID | CLOEXEC_DEFAULT`, fd 0/1/2) without needing
+        //    a pre-built `.build/debug/AgentVM` binary.
+        let helperScriptPath = "\(realBase)/mock_daemon_rpc.py"
+        let pidFilePath = "\(realBase)/mock.pid"
+        let verMajor = SemanticVersion.current.major
+        let verMinor = SemanticVersion.current.minor
+        let verPatch = SemanticVersion.current.patch
+        let currentProto = DaemonRPCHello.currentProtocolVersion
+        let pySource = """
+        import fcntl, json, os, signal, socket, sys, time
+
+        ws = sys.argv[1]
+        pid_file = sys.argv[2]
+        run_dir = os.path.join(ws, "run")
+        os.makedirs(run_dir, mode=0o700, exist_ok=True)
+        os.chmod(run_dir, 0o700)
+        lock_path = os.path.join(run_dir, "daemon.lock")
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.stdout.write("contender lost lock\\n")
+            sys.stdout.flush()
+            os._exit(0)
+
+        pid = os.getpid()
+        with open(pid_file, "w", encoding="utf-8") as pf:
+            pf.write(str(pid))
+        started_at = "2026-11-17T00:00:00Z"
+        exe_path = os.path.realpath(sys.executable)
+        ver_obj = {"major": \(verMajor), "minor": \(verMinor), "patch": \(verPatch)}
+        holder = {
+            "executablePath": exe_path,
+            "pid": pid,
+            "startedAt": started_at,
+            "version": ver_obj
+        }
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, (json.dumps(holder) + "\\n").encode("utf-8"))
+
+        sock_path = os.path.join(run_dir, "daemon.sock")
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.settimeout(10.0)
+        srv.bind(sock_path)
+        os.chmod(sock_path, 0o600)
+        srv.listen(16)
+
+        # Record open fds so test can verify POSIX_SPAWN_CLOEXEC_DEFAULT closed leaked parent descriptors
+        open_fds = []
+        for candidate in range(0, 64):
+            try:
+                os.fstat(candidate)
+                open_fds.append(candidate)
+            except OSError:
+                pass
+        sys.stdout.write(f"ready pid={pid} open_fds={open_fds}\\n")
+        sys.stdout.flush()
+
+        stopping = False
+        def _on_term(signum, frame):
+            global stopping
+            stopping = True
+            try:
+                srv.close()
+            except OSError:
+                pass
+        signal.signal(signal.SIGTERM, _on_term)
+        signal.signal(signal.SIGINT, _on_term)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+        hello_line = (json.dumps({
+            "jsonrpc": "2.0",
+            "method": "hello",
+            "params": {
+                "executablePath": exe_path,
+                "protocolVersion": \(currentProto),
+                "semanticVersion": ver_obj
+            }
+        }) + "\\n").encode("utf-8")
+
+        deadline = time.monotonic() + 10.0
+        while not stopping and time.monotonic() < deadline:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                break
+            with conn:
+                conn.sendall(hello_line)
+                buf = b""
+                lines = []
+                while len(lines) < 2:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\\n" in buf:
+                        line, buf = buf.split(b"\\n", 1)
+                        lines.append(line)
+                if len(lines) < 2:
+                    continue
+                req = json.loads(lines[1].decode("utf-8"))
+                req_id = req.get("id", 1)
+                method = req.get("method", "")
+                if method == "status":
+                    resp = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "executablePath": exe_path,
+                            "pid": pid,
+                            "protocolVersion": \(currentProto),
+                            "semanticVersion": ver_obj,
+                            "socketPath": sock_path,
+                            "startedAt": started_at,
+                            "vms": [],
+                            "workspacePath": ws
+                        }
+                    }
+                    conn.sendall((json.dumps(resp) + "\\n").encode("utf-8"))
+                elif method == "stop":
+                    stopping = True
+                    try:
+                        srv.close()
+                    except OSError:
+                        pass
+                    try:
+                        os.unlink(sock_path)
+                    except FileNotFoundError:
+                        pass
+                    resp = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"stoppedVMIDs": []}
+                    }
+                    conn.sendall((json.dumps(resp) + "\\n").encode("utf-8"))
+                    break
+
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+        os.ftruncate(lock_fd, 0)
+        os.close(lock_fd)
+        """
+        try Data(pySource.utf8).write(to: URL(fileURLWithPath: helperScriptPath))
+
+        // Open an extra pipe in the parent WITHOUT O_CLOEXEC to prove POSIX_SPAWN_CLOEXEC_DEFAULT prevents inheritance!
+        var extraPipe: [Int32] = [-1, -1]
+        #expect(Darwin.pipe(&extraPipe) == 0)
+        defer {
+            if extraPipe[0] >= 0 { _ = Darwin.close(extraPipe[0]) }
+            if extraPipe[1] >= 0 { _ = Darwin.close(extraPipe[1]) }
+        }
+
+        let ws1 = URL(fileURLWithPath: "\(realBase)/Spawn1.agentvm", isDirectory: true)
+        let ws1Paths = DaemonWorkspacePaths(workspaceURL: ws1)
+        let pySpawnOverride = DaemonSpawnCommandOverride(
+            executablePath: "/usr/bin/python3",
+            arguments: ["-I", helperScriptPath, ws1Paths.canonicalWorkspacePath, pidFilePath],
+            environment: env
+        )
+
+        var spawnedPIDToCleanup: pid_t = 0
+        defer {
+            var pids: Set<pid_t> = []
+            if spawnedPIDToCleanup > 0 {
+                pids.insert(spawnedPIDToCleanup)
+            }
+            if let raw = try? String(contentsOfFile: pidFilePath, encoding: .utf8),
+               let parsed = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+               parsed > 0 {
+                pids.insert(parsed)
+            }
+            for p in pids {
+                _ = Darwin.kill(p, SIGTERM)
+                let deadline = DispatchTime.now().uptimeNanoseconds &+ 3_000_000_000
+                while DispatchTime.now().uptimeNanoseconds < deadline {
+                    var reapSt: Int32 = 0
+                    _ = Darwin.waitpid(p, &reapSt, WNOHANG)
+                    if Darwin.kill(p, 0) != 0 && Darwin.errno == ESRCH {
+                        break
+                    }
+                    Darwin.usleep(20_000)
+                }
+                if Darwin.kill(p, 0) == 0 {
+                    _ = Darwin.kill(p, SIGKILL)
+                    var reapSt: Int32 = 0
+                    _ = Darwin.waitpid(p, &reapSt, 0)
+                }
+            }
+        }
+
+        let start1 = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", ws1.path, "daemon", "start", "--json"],
+            environment: env,
+            daemonSpawnOverride: pySpawnOverride
+        )
+        #expect(start1.exitCode == 0, "daemon start failed: \(start1.stderr)")
+        let start1Obj = try #require(
+            try JSONSerialization.jsonObject(with: Data(start1.stdout.utf8)) as? [String: Any]
+        )
+        let childPID = pid_t(try #require(start1Obj["pid"] as? Int))
+        spawnedPIDToCleanup = childPID
+        #expect(childPID > 0 && childPID != Darwin.getpid())
+
+        // Verify SETSID made the child its own process group / session leader (`pgid == pid`).
+        #expect(Darwin.getpgid(childPID) == childPID)
+
+        // Verify daemon.log received child stdout and extraPipe descriptors were NOT inherited.
+        let ws1Log = try String(contentsOf: ws1Paths.daemonLogFileURL, encoding: .utf8)
+        #expect(ws1Log.contains("ready pid=\(childPID)"))
+        #expect(!ws1Log.contains("\(extraPipe[0])"))
+        #expect(!ws1Log.contains("\(extraPipe[1])"))
+
+        // Second `daemon start` returns 0 and reports the exact same PID without spawning another daemon.
+        let start2 = await cli.execute(
+            arguments: ["--lang", "zh", "--workspace", ws1.path, "daemon", "start"],
+            environment: env,
+            daemonSpawnOverride: pySpawnOverride
+        )
+        #expect(start2.exitCode == 0)
+        #expect(start2.stdout.contains("\(childPID)"))
+
+        // Stop the spawned daemon cleanly and verify process + socket are gone.
+        let stop1 = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", ws1.path, "daemon", "stop"],
+            environment: env
+        )
+        #expect(stop1.exitCode == 0)
+        #expect(Darwin.kill(childPID, 0) != 0 && Darwin.errno == ESRCH)
+        spawnedPIDToCleanup = 0
+
+        // 2. Contender exiting 0 (`waitpid(WNOHANG)` exit 0 keeps polling until winner binds).
+        let wsRace = URL(fileURLWithPath: "\(realBase)/Race.agentvm", isDirectory: true)
+        let winnerTask = Task<WorkspaceDaemonServer?, Error> {
+            try await Task.sleep(nanoseconds: 250_000_000)
+            let out = try await WorkspaceDaemonServer.start(workspaceURL: wsRace)
+            if case let .started(srv) = out {
+                return srv
+            }
+            return nil
+        }
+        let contenderOverride = DaemonSpawnCommandOverride(
+            executablePath: "/usr/bin/true",
+            arguments: [],
+            environment: env
+        )
+        let raceStart = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsRace.path, "daemon", "start", "--json"],
+            environment: env,
+            daemonSpawnOverride: contenderOverride
+        )
+        let winnerServer = try await winnerTask.value
+        if let winnerServer {
+            await winnerServer.stopAndCleanup()
+        }
+        #expect(raceStart.exitCode == 0, "Expected contender exit-0 to keep polling winner: \(raceStart.stderr)")
+
+        // 3. Non-zero child exit writes trailing 20 lines of `daemon.log` to stderr and exits 1.
+        let wsCrash = URL(fileURLWithPath: "\(realBase)/Crash.agentvm", isDirectory: true)
+        let crashOverride = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "i=1; while [ $i -le 25 ]; do echo \"crash-line-$i\"; i=$((i+1)); done; exit 17"],
+            environment: env
+        )
+        let crashOut = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsCrash.path, "daemon", "start"],
+            environment: env,
+            daemonSpawnOverride: crashOverride
+        )
+        #expect(crashOut.exitCode == 1)
+        #expect(!crashOut.stderr.contains("crash-line-5\n"))
+        for lineNo in 6...25 {
+            #expect(crashOut.stderr.contains("crash-line-\(lineNo)"))
+        }
+    }
+
+    @Test("Item 2b: 'up' runs local bootable-system (clearing simulated state) and virtualization-entitlement preflight before touching daemon, and returns ERR_DAEMON_REQUIRED in Stage 2 without spawning")
+    func upPreflightChecksBootableSystemClearsSimStateChecksEntitlementAndNeverLaunchesDaemonInStage2() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-d2b")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        let wsURL = URL(fileURLWithPath: "\(realBase)/UpPreflight.agentvm", isDirectory: true)
+        let cacheDir = URL(fileURLWithPath: "\(realBase)/cache", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = [
+            "HOME": isolatedHome,
+            "CFFIXED_USER_HOME": isolatedHome,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+        let paths = DaemonWorkspacePaths(workspaceURL: wsURL)
+
+        // Stage a minimal 4 MiB GPT+ext4 bootable cached image offline.
+        let imageBytes = 4 * 1024 * 1024
+        let stagingURL = URL(fileURLWithPath: "\(realBase)/bootable.raw")
+        try APFSCoWDiskEngine().createSparseRawDisk(at: stagingURL, virtualSizeBytes: UInt64(imageBytes), overwrite: true)
+        let parts = try PartitionAndContainerInspector().writeProtectiveMBRAndGPT(
+            to: stagingURL,
+            partitions: [(name: "RootExt4", typeGUID: GPTWellKnownTypeGUID.linuxRootARM64.rawValue, sizeBytes: 2 * 1024 * 1024)]
+        )
+        var ext4Super = [UInt8](repeating: 0, count: 256)
+        ext4Super[0x38] = 0x53
+        ext4Super[0x39] = 0xEF
+        ext4Super[0x5C] = 0x04
+        ext4Super[0x60] = 0xC0
+        let fh = try FileHandle(forUpdating: stagingURL)
+        try fh.seek(toOffset: parts[0].firstLBA * 512 + 1024)
+        try fh.write(contentsOf: Data(ext4Super))
+        try fh.close()
+
+        let sha512 = try BinaryChecksums.sha512HexFile(at: stagingURL)
+        let imageID = "debian-12-bookworm-arm64"
+        let entry = BaseImageCatalogEntry(
+            id: imageID,
+            displayName: "Debian 12 Test Image",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: "https://offline.agentvm.invalid/debian.raw",
+            expectedSHA512: sha512,
+            expectedSizeBytes: UInt64(imageBytes),
+            defaultVirtualSizeBytes: UInt64(imageBytes)
+        )
+        let seeder = try BaseImageRegistryCatalog(cacheDirectoryURL: cacheDir, curatedEntries: [entry], createIfMissing: true)
+        let staged = try await seeder.stageCachedCuratedImage(id: imageID, from: stagingURL, verifyChecksum: true)
+        try? FileManager.default.removeItem(at: stagingURL)
+        let cachedURL = URL(fileURLWithPath: try #require(staged.cachedLocalPath)).standardizedFileURL
+        #expect(Darwin.chmod(cachedURL.path, 0o444) == 0)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        // Create empty-disk `a` and bootable-disk `t1`.
+        #expect(await cli.execute(arguments: ["--workspace", wsURL.path, "create", "a"], curatedEntriesOverride: [entry], environment: env).exitCode == 0)
+        #expect(await cli.execute(arguments: ["--workspace", wsURL.path, "create", "t1", "--image", imageID], curatedEntriesOverride: [entry], environment: env).exitCode == 0)
+
+        // Put `a` into simulated running state first.
+        #expect(await cli.execute(arguments: ["--backend", "simulation", "--workspace", wsURL.path, "up", "a"], curatedEntriesOverride: [entry], environment: env).exitCode == 0)
+
+        let forbiddenSpawn = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exit 91"],
+            environment: env
+        )
+
+        // 1. Hardware `up a` clears simulated state, fails ERR_NO_BOOTABLE_SYSTEM (exit 1), and never spawns daemon.
+        let upEmpty = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "a"],
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hasEntitlementOverride: true,
+            daemonSpawnOverride: forbiddenSpawn
+        )
+        #expect(upEmpty.exitCode == 1)
+        #expect(upEmpty.stderr.contains("ERR_NO_BOOTABLE_SYSTEM"))
+        #expect(!FileManager.default.fileExists(atPath: paths.lockFileURL.path))
+        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
+
+        let verifyStore = try AgentVMProjectStore(bundleURL: wsURL, createIfMissing: false)
+        let vmsAfterEmptyUp = try await verifyStore.listVMs()
+        let recA = try #require(vmsAfterEmptyUp.first(where: { $0.spec.name == "a" }))
+        #expect(recA.telemetry.state == .stopped && recA.telemetry.simulated == false)
+
+        // 2. Hardware `up t1` without virtualization entitlement fails ERR_VZ_ENTITLEMENT_MISSING (exit 1), never spawns daemon.
+        let upNoEnt = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hasEntitlementOverride: false,
+            daemonSpawnOverride: forbiddenSpawn
+        )
+        #expect(upNoEnt.exitCode == 1)
+        #expect(upNoEnt.stderr.contains("ERR_VZ_ENTITLEMENT_MISSING"))
+        #expect(!FileManager.default.fileExists(atPath: paths.lockFileURL.path))
+        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
+
+        // 3. Hardware `up t1` when both checks pass still returns ERR_DAEMON_REQUIRED in Stage 2 and never spawns daemon.
+        let upEntitled = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+            curatedEntriesOverride: [entry],
+            environment: env,
+            hasEntitlementOverride: true,
+            daemonSpawnOverride: forbiddenSpawn
+        )
+        #expect(upEntitled.exitCode == 1)
+        #expect(upEntitled.stderr.contains("ERR_DAEMON_REQUIRED"))
+        #expect(!FileManager.default.fileExists(atPath: paths.lockFileURL.path))
+        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
+    }
 }
 
 private final class Stage2AtomicFlag: @unchecked Sendable {

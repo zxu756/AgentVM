@@ -332,6 +332,8 @@ public struct AgentVMCLIRunner: Sendable {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         diskEngineOverride: APFSCoWDiskEngine? = nil,
         hardwareBackendOverride: (any HardwareVMLowLevelBackend)? = nil,
+        hasEntitlementOverride: Bool? = nil,
+        daemonSpawnOverride: DaemonSpawnCommandOverride? = nil,
         vsockConnectTimeoutNanosecondsOverride: UInt64? = nil,
         gracefulStopTimeoutNanosecondsOverride: UInt64? = nil,
         daemonRunProcessMode: Bool = false,
@@ -549,7 +551,8 @@ public struct AgentVMCLIRunner: Sendable {
                     parsed: parsed,
                     language: language,
                     environment: environment,
-                    daemonRunProcessMode: daemonRunProcessMode
+                    daemonRunProcessMode: daemonRunProcessMode,
+                    daemonSpawnOverride: daemonSpawnOverride
                 )
             }
 
@@ -650,13 +653,45 @@ public struct AgentVMCLIRunner: Sendable {
                     liveStderrDataHandler: isSimulationFlagged ? nil : liveStderrDataHandler
                 )
             case "up", "boot", "start":
-                rawOutcome = try await runLifecycle(coordinator: coordinator, action: "boot", parsed: parsed, language: language)
+                rawOutcome = try await runLifecycle(
+                    coordinator: coordinator,
+                    action: "boot",
+                    parsed: parsed,
+                    language: language,
+                    isSimulation: isSimulationFlagged,
+                    checkProcessEntitlement: hardwareBackendOverride == nil || hasEntitlementOverride != nil,
+                    hasEntitlementOverride: hasEntitlementOverride
+                )
             case "pause":
-                rawOutcome = try await runLifecycle(coordinator: coordinator, action: "pause", parsed: parsed, language: language)
+                rawOutcome = try await runLifecycle(
+                    coordinator: coordinator,
+                    action: "pause",
+                    parsed: parsed,
+                    language: language,
+                    isSimulation: isSimulationFlagged,
+                    checkProcessEntitlement: false,
+                    hasEntitlementOverride: nil
+                )
             case "resume":
-                rawOutcome = try await runLifecycle(coordinator: coordinator, action: "resume", parsed: parsed, language: language)
+                rawOutcome = try await runLifecycle(
+                    coordinator: coordinator,
+                    action: "resume",
+                    parsed: parsed,
+                    language: language,
+                    isSimulation: isSimulationFlagged,
+                    checkProcessEntitlement: false,
+                    hasEntitlementOverride: nil
+                )
             case "halt", "stop":
-                rawOutcome = try await runLifecycle(coordinator: coordinator, action: "halt", parsed: parsed, language: language)
+                rawOutcome = try await runLifecycle(
+                    coordinator: coordinator,
+                    action: "halt",
+                    parsed: parsed,
+                    language: language,
+                    isSimulation: isSimulationFlagged,
+                    checkProcessEntitlement: false,
+                    hasEntitlementOverride: nil
+                )
             case "branch", "fork":
                 rawOutcome = try await runBranchFork(coordinator: coordinator, parsed: parsed, language: language)
             case "snapshot":
@@ -739,6 +774,15 @@ public struct AgentVMCLIRunner: Sendable {
             )
         } catch let rpcErr as DaemonRPCError {
             let rawStderr = streamedProgressStderr.snapshot() + "[\(rpcErr.errorCode)] \(rpcErr.message)\n"
+            let errorExitCode: Int32 = (subcommand == "run" || subcommand == "exec") ? Self.runInfrastructureErrorExitCode : 1
+            return CLIExecutionOutcome(
+                exitCode: errorExitCode,
+                stdoutData: Data(),
+                stderrData: Data((isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr).utf8)
+            )
+        } catch let launchErr as DaemonLaunchError {
+            let localizedErr = launchErr.localizedMessage(in: language)
+            let rawStderr = streamedProgressStderr.snapshot() + "[\(launchErr.errorCode)] \(localizedErr)\n"
             let errorExitCode: Int32 = (subcommand == "run" || subcommand == "exec") ? Self.runInfrastructureErrorExitCode : 1
             return CLIExecutionOutcome(
                 exitCode: errorExitCode,
@@ -985,7 +1029,15 @@ public struct AgentVMCLIRunner: Sendable {
         return CLIExecutionOutcome(exitCode: 0, stdout: msg)
     }
 
-    private func runLifecycle(coordinator: AgentVMFleetCoordinator, action: String, parsed: ParsedSubcommandArguments, language: AppLanguage) async throws -> CLIExecutionOutcome {
+    private func runLifecycle(
+        coordinator: AgentVMFleetCoordinator,
+        action: String,
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage,
+        isSimulation: Bool,
+        checkProcessEntitlement: Bool,
+        hasEntitlementOverride: Bool?
+    ) async throws -> CLIExecutionOutcome {
         let isZh = (language == .zhHans)
         guard let targetToken = parsed.positionals.first else {
             throw AgentVMError.cliUsageError(
@@ -993,6 +1045,22 @@ public struct AgentVMCLIRunner: Sendable {
             )
         }
         let vmID = try await resolveVMID(targetToken, coordinator: coordinator)
+        if action == "boot" && !isSimulation {
+            let entProvider: (@Sendable () -> Bool)?
+            if let explicitEnt = hasEntitlementOverride {
+                entProvider = { explicitEnt }
+            } else {
+                entProvider = nil
+            }
+            let record = try await coordinator.preflightPersistentBoot(
+                vmID,
+                checkProcessEntitlement: checkProcessEntitlement,
+                hasEntitlementOverride: entProvider
+            )
+            // Stage 2 keeps returning ERR_DAEMON_REQUIRED after passing both local preflight checks
+            // without launching the daemon (real-VM persistent boot via daemon is Stage 3).
+            throw AgentVMError.persistentBootRequiresDaemon(vmName: record.spec.name)
+        }
         let updated: VMInstanceRecord
         switch action {
         case "boot": updated = try await coordinator.bootPersistentVM(vmID)
@@ -1755,6 +1823,18 @@ public struct AgentVMCLIRunner: Sendable {
         var stoppedVMIDs: [String]
     }
 
+    private struct DaemonStartCLIJSON: Codable, Sendable {
+        var running: Bool
+        var alreadyRunning: Bool
+        var pid: Int32
+        var startedAt: Date
+        var socketPath: String
+        var workspacePath: String
+        var executablePath: String
+        var protocolVersion: Int
+        var semanticVersion: SemanticVersion
+    }
+
     private static func validateDaemonSubcommandUsage(
         parsed: ParsedSubcommandArguments,
         explicitWorkspaceRawString: String?,
@@ -1799,7 +1879,8 @@ public struct AgentVMCLIRunner: Sendable {
         parsed: ParsedSubcommandArguments,
         language: AppLanguage,
         environment: [String: String],
-        daemonRunProcessMode: Bool
+        daemonRunProcessMode: Bool,
+        daemonSpawnOverride: DaemonSpawnCommandOverride?
     ) async throws -> CLIExecutionOutcome {
         let isZh = (language == .zhHans)
         let asJSON = parsed.flags.contains("--json")
@@ -1957,10 +2038,39 @@ public struct AgentVMCLIRunner: Sendable {
             }
 
         case "start":
-            throw AgentVMError.ipcDaemonUnavailable(
-                socketPath: paths.directSocketPath,
-                detail: isZh ? "daemon start 尚未接入分离拉起器。" : "daemon start launcher not yet wired."
+            let launchOutcome = try await DaemonProcessLauncher.launchOrConnect(
+                workspaceURL: paths.workspaceURL,
+                language: language,
+                environment: environment,
+                spawnOverride: daemonSpawnOverride
             )
+            let status = launchOutcome.status
+            if asJSON {
+                let payload = DaemonStartCLIJSON(
+                    running: true,
+                    alreadyRunning: launchOutcome.wasAlreadyRunning,
+                    pid: status.pid,
+                    startedAt: status.startedAt,
+                    socketPath: status.socketPath,
+                    workspacePath: status.workspacePath,
+                    executablePath: status.executablePath,
+                    protocolVersion: status.protocolVersion,
+                    semanticVersion: status.semanticVersion
+                )
+                let data = try encoder.encode(payload)
+                return CLIExecutionOutcome(exitCode: 0, stdout: String(decoding: data, as: UTF8.self) + "\n")
+            }
+            let msg: String
+            if launchOutcome.wasAlreadyRunning {
+                msg = isZh
+                    ? "工作区守护进程已在运行（pid=\(status.pid)）。\n"
+                    : "Workspace daemon is already running (pid=\(status.pid)).\n"
+            } else {
+                msg = isZh
+                    ? "已启动工作区守护进程（pid=\(status.pid)）。\n"
+                    : "Started workspace daemon (pid=\(status.pid)).\n"
+            }
+            return CLIExecutionOutcome(exitCode: 0, stdout: msg)
 
         default:
             return CLIExecutionOutcome(exitCode: Self.usageErrorExitCode)

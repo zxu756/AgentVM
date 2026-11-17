@@ -297,11 +297,19 @@ public actor AgentVMFleetCoordinator {
     private let vsockHandshakeTimeoutNanoseconds: UInt64
     private let gracefulStopTimeoutNanoseconds: UInt64
 
+    private struct LiveGuestHeartbeatSample: Sendable {
+        let sessionToken: UUID
+        let payload: GuestHeartbeatPayload
+        let receivedAt: Date
+        let receivedUptimeNanoseconds: UInt64
+    }
+
     private var executionBackend: HypervisorExecutionBackend
     private var vsockSessions: [VMID: VsockMultiplexSession] = [:]
     private var vsockSessionTokens: [VMID: UUID] = [:]
     private var vsockGenerationCounters: [VMID: UInt64] = [:]
     private var negotiatedGuestAgentVersions: [VMID: String] = [:]
+    private var latestGuestHeartbeats: [VMID: LiveGuestHeartbeatSample] = [:]
     private var terminalBuffers: [VMID: VT100ScreenBuffer] = [:]
     private var hardwareBoxes: [VMID: any HardwareVMInstanceHandle] = [:]
     private var hardwareBoxTokens: [VMID: UUID] = [:]
@@ -799,13 +807,24 @@ public actor AgentVMFleetCoordinator {
                     fallback.telemetry.guestAgentConnected = false
                     fallback.telemetry.hasLiveGuestTelemetry = false
                     fallback.telemetry.vsockStreamsOpen = 0
-                    fallback.telemetry.cpuUsagePercent = 0
+                    fallback.telemetry.cpuUsagePercent = nil
                     fallback.telemetry.memoryResidentMB = 0
+                    fallback.telemetry.guestMemTotalBytes = nil
+                    fallback.telemetry.guestMemAvailableBytes = nil
+                    fallback.telemetry.guestAgentVersion = nil
                     stampRuntimeOrigin(&fallback)
                     reconciledList.append(fallback)
                 }
             } else {
-                reconciledList.append(record)
+                var enriched = record
+                if hardwareBoxes[record.id] != nil && enriched.telemetry.state == .running {
+                    enriched.telemetry.guestAgentVersion = negotiatedGuestAgentVersions[record.id]
+                    if let sample = latestGuestHeartbeats[record.id],
+                       vsockSessionTokens[record.id] == sample.sessionToken {
+                        Self.mapHeartbeatPayload(sample.payload, receivedAt: sample.receivedAt, onto: &enriched.telemetry)
+                    }
+                }
+                reconciledList.append(enriched)
             }
         }
         return reconciledList
@@ -990,8 +1009,11 @@ public actor AgentVMFleetCoordinator {
         reset.telemetry.guestAgentConnected = false
         reset.telemetry.hasLiveGuestTelemetry = false
         reset.telemetry.vsockStreamsOpen = 0
-        reset.telemetry.cpuUsagePercent = 0
+        reset.telemetry.cpuUsagePercent = nil
         reset.telemetry.memoryResidentMB = 0
+        reset.telemetry.guestMemTotalBytes = nil
+        reset.telemetry.guestMemAvailableBytes = nil
+        reset.telemetry.guestAgentVersion = nil
         try await store.upsertVM(reset)
         try await store.appendDiagnostic(DiagnosticEvent(
             severity: .notice,
@@ -1622,8 +1644,11 @@ public actor AgentVMFleetCoordinator {
             bootTimestamps[vmID] = Date()
             record.lastBootedAt = Date()
             record.telemetry.state = .running
-            record.telemetry.cpuUsagePercent = 0.0
+            record.telemetry.cpuUsagePercent = nil
             record.telemetry.memoryResidentMB = 0
+            record.telemetry.guestMemTotalBytes = nil
+            record.telemetry.guestMemAvailableBytes = nil
+            record.telemetry.guestAgentVersion = nil
             record.telemetry.hasLiveGuestTelemetry = false
             record.telemetry.guestAgentConnected = true
             record.telemetry.vsockStreamsOpen = await session.openStreamCount()
@@ -1662,6 +1687,7 @@ public actor AgentVMFleetCoordinator {
             vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
             vsockSessionTokens.removeValue(forKey: vmID)
             negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+            latestGuestHeartbeats.removeValue(forKey: vmID)
             if let staleSession = vsockSessions.removeValue(forKey: vmID) {
                 await staleSession.shutdown()
             }
@@ -1681,8 +1707,11 @@ public actor AgentVMFleetCoordinator {
             record.telemetry.guestAgentConnected = false
             record.telemetry.hasLiveGuestTelemetry = false
             record.telemetry.vsockStreamsOpen = 0
-            record.telemetry.cpuUsagePercent = 0
+            record.telemetry.cpuUsagePercent = nil
             record.telemetry.memoryResidentMB = 0
+            record.telemetry.guestMemTotalBytes = nil
+            record.telemetry.guestMemAvailableBytes = nil
+            record.telemetry.guestAgentVersion = nil
             stampRuntimeOrigin(&record)
             try? await store.upsertVM(record)
             if newlyAcquiredLock {
@@ -1818,11 +1847,19 @@ public actor AgentVMFleetCoordinator {
         bootTimestamps[vmID] = Date()
         record.lastBootedAt = Date()
         record.telemetry.state = .running
-        record.telemetry.cpuUsagePercent = 0.0
-        record.telemetry.memoryResidentMB = 0
-        record.telemetry.hasLiveGuestTelemetry = false
         record.telemetry.guestAgentConnected = true
         record.telemetry.vsockStreamsOpen = await session.openStreamCount()
+        record.telemetry.guestAgentVersion = negotiatedGuestAgentVersions[vmID]
+        if let sample = latestGuestHeartbeats[vmID],
+           vsockSessionTokens[vmID] == sample.sessionToken {
+            Self.mapHeartbeatPayload(sample.payload, receivedAt: sample.receivedAt, onto: &record.telemetry)
+        } else {
+            record.telemetry.cpuUsagePercent = nil
+            record.telemetry.memoryResidentMB = 0
+            record.telemetry.guestMemTotalBytes = nil
+            record.telemetry.guestMemAvailableBytes = nil
+            record.telemetry.hasLiveGuestTelemetry = false
+        }
         stampRuntimeOrigin(&record)
         if persistRunningState {
             try await store.upsertVM(record)
@@ -1944,8 +1981,9 @@ public actor AgentVMFleetCoordinator {
             try await box.pause()
         }
 
+        latestGuestHeartbeats.removeValue(forKey: vmID)
         record.telemetry.state = .paused
-        record.telemetry.cpuUsagePercent = 0.0
+        record.telemetry.cpuUsagePercent = nil
         record.telemetry.hasLiveGuestTelemetry = false
         stampRuntimeOrigin(&record)
         try await store.upsertVM(record)
@@ -1998,8 +2036,11 @@ public actor AgentVMFleetCoordinator {
                 record.telemetry.guestAgentConnected = false
                 record.telemetry.hasLiveGuestTelemetry = false
                 record.telemetry.vsockStreamsOpen = 0
-                record.telemetry.cpuUsagePercent = 0
+                record.telemetry.cpuUsagePercent = nil
                 record.telemetry.memoryResidentMB = 0
+                record.telemetry.guestMemTotalBytes = nil
+                record.telemetry.guestMemAvailableBytes = nil
+                record.telemetry.guestAgentVersion = nil
                 stampRuntimeOrigin(&record)
                 try await store.upsertVM(record)
             }
@@ -2073,6 +2114,7 @@ public actor AgentVMFleetCoordinator {
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         vsockSessionTokens.removeValue(forKey: vmID)
         negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+        latestGuestHeartbeats.removeValue(forKey: vmID)
         hardwareBoxTokens.removeValue(forKey: vmID)
         await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
@@ -2089,8 +2131,11 @@ public actor AgentVMFleetCoordinator {
         bootTimestamps.removeValue(forKey: vmID)
 
         record.telemetry.state = .stopped
-        record.telemetry.cpuUsagePercent = 0
+        record.telemetry.cpuUsagePercent = nil
         record.telemetry.memoryResidentMB = 0
+        record.telemetry.guestMemTotalBytes = nil
+        record.telemetry.guestMemAvailableBytes = nil
+        record.telemetry.guestAgentVersion = nil
         record.telemetry.hasLiveGuestTelemetry = false
         record.telemetry.guestAgentConnected = false
         record.telemetry.vsockStreamsOpen = 0
@@ -2144,6 +2189,7 @@ public actor AgentVMFleetCoordinator {
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         vsockSessionTokens.removeValue(forKey: vmID)
         negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+        latestGuestHeartbeats.removeValue(forKey: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
             await session.shutdown()
         }
@@ -2167,6 +2213,7 @@ public actor AgentVMFleetCoordinator {
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         vsockSessionTokens.removeValue(forKey: vmID)
         negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+        latestGuestHeartbeats.removeValue(forKey: vmID)
 
         await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
@@ -2186,8 +2233,11 @@ public actor AgentVMFleetCoordinator {
 
         if var record = try await store.fetchVM(vmID) {
             record.telemetry.state = .stopped
-            record.telemetry.cpuUsagePercent = 0
+            record.telemetry.cpuUsagePercent = nil
             record.telemetry.memoryResidentMB = 0
+            record.telemetry.guestMemTotalBytes = nil
+            record.telemetry.guestMemAvailableBytes = nil
+            record.telemetry.guestAgentVersion = nil
             record.telemetry.hasLiveGuestTelemetry = false
             record.telemetry.guestAgentConnected = false
             record.telemetry.vsockStreamsOpen = 0
@@ -2237,6 +2287,43 @@ public actor AgentVMFleetCoordinator {
 
     // MARK: - Vsock Disconnect Observation, 300-500ms Grace Window & 1s Reconnect Loop (Fixes A34)
 
+    private static func mapHeartbeatPayload(
+        _ heartbeat: GuestHeartbeatPayload,
+        receivedAt: Date,
+        onto telemetry: inout VMLiveTelemetry
+    ) {
+        let usedBytes = heartbeat.memTotalBytes >= heartbeat.memAvailableBytes
+            ? (heartbeat.memTotalBytes - heartbeat.memAvailableBytes)
+            : 0
+        telemetry.memoryResidentMB = usedBytes / 1_048_576
+        telemetry.guestMemTotalBytes = heartbeat.memTotalBytes
+        telemetry.guestMemAvailableBytes = heartbeat.memAvailableBytes
+        telemetry.cpuUsagePercent = heartbeat.cpuUsagePercent
+        telemetry.uptimeSeconds = heartbeat.uptimeSeconds
+        telemetry.sampledAt = receivedAt
+        telemetry.hasLiveGuestTelemetry = true
+    }
+
+    private func recordGuestHeartbeatSample(
+        vmID: VMID,
+        boxToken: UUID,
+        sessionToken: UUID,
+        heartbeat: GuestHeartbeatPayload,
+        receivedAt: Date,
+        receivedUptimeNs: UInt64
+    ) {
+        guard hardwareBoxTokens[vmID] == boxToken,
+              vsockSessionTokens[vmID] == sessionToken else {
+            return
+        }
+        latestGuestHeartbeats[vmID] = LiveGuestHeartbeatSample(
+            sessionToken: sessionToken,
+            payload: heartbeat,
+            receivedAt: receivedAt,
+            receivedUptimeNanoseconds: receivedUptimeNs
+        )
+    }
+
     private func recordNegotiatedGuestAgentVersion(
         vmID: VMID,
         boxToken: UUID,
@@ -2259,6 +2346,11 @@ public actor AgentVMFleetCoordinator {
     ) async throws -> VsockMultiplexSession {
         let sessionToken = UUID()
         let session = VsockMultiplexSession(vmID: vmID)
+        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+        latestGuestHeartbeats.removeValue(forKey: vmID)
+        vsockSessions[vmID] = session
+        vsockSessionTokens[vmID] = sessionToken
+
         await session.setControlPongObserver { [weak self] pong in
             guard let self else { return }
             await self.recordNegotiatedGuestAgentVersion(
@@ -2266,6 +2358,17 @@ public actor AgentVMFleetCoordinator {
                 boxToken: boxToken,
                 sessionToken: sessionToken,
                 version: pong.agentVersion
+            )
+        }
+        await session.setHeartbeatObserver { [weak self] heartbeat, receivedAt, receivedUptimeNs in
+            guard let self else { return }
+            await self.recordGuestHeartbeatSample(
+                vmID: vmID,
+                boxToken: boxToken,
+                sessionToken: sessionToken,
+                heartbeat: heartbeat,
+                receivedAt: receivedAt,
+                receivedUptimeNs: receivedUptimeNs
             )
         }
         do {
@@ -2283,15 +2386,18 @@ public actor AgentVMFleetCoordinator {
                 }
             )
         } catch {
+            if vsockSessionTokens[vmID] == sessionToken {
+                vsockSessionTokens.removeValue(forKey: vmID)
+                vsockSessions.removeValue(forKey: vmID)
+                negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+                latestGuestHeartbeats.removeValue(forKey: vmID)
+            }
             await session.shutdown()
             throw error
         }
 
         let tty = ensureTerminalBuffer(for: vmID)
         await session.attachTerminalScreenBuffer(tty)
-        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
-        vsockSessions[vmID] = session
-        vsockSessionTokens[vmID] = sessionToken
         vsockGenerationCounters[vmID] = (vsockGenerationCounters[vmID] ?? 0) &+ 1
 
         // Perform initial control `ping` handshake on every vsock connection (including Stage 3b reconnects)
@@ -2324,6 +2430,7 @@ public actor AgentVMFleetCoordinator {
         }
         vsockSessionTokens.removeValue(forKey: vmID)
         negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+        latestGuestHeartbeats.removeValue(forKey: vmID)
         if let deadSession = vsockSessions.removeValue(forKey: vmID) {
             await deadSession.shutdown()
         }
@@ -2338,6 +2445,8 @@ public actor AgentVMFleetCoordinator {
            record.telemetry.state == .running || record.telemetry.state == .paused {
             record.telemetry.guestAgentConnected = false
             record.telemetry.hasLiveGuestTelemetry = false
+            record.telemetry.cpuUsagePercent = nil
+            record.telemetry.guestAgentVersion = nil
             record.telemetry.vsockStreamsOpen = 0
             stampRuntimeOrigin(&record)
             try? await store.upsertVM(record)

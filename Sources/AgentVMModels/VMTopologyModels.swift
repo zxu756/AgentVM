@@ -566,8 +566,11 @@ public enum VMLifecycleState: String, Codable, Hashable, Sendable, CaseIterable 
 public struct VMLiveTelemetry: Codable, Hashable, Sendable {
     public var vmID: VMID
     public var state: VMLifecycleState
-    public var cpuUsagePercent: Double
+    public var cpuUsagePercent: Double?
     public var memoryResidentMB: UInt64
+    public var guestMemTotalBytes: UInt64?
+    public var guestMemAvailableBytes: UInt64?
+    public var guestAgentVersion: String?
     public var balloonReclaimedMB: UInt64
     public var diskReadBytesTotal: UInt64
     public var diskWriteBytesTotal: UInt64
@@ -595,8 +598,11 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
     public init(
         vmID: VMID,
         state: VMLifecycleState = .stopped,
-        cpuUsagePercent: Double = 0.0,
+        cpuUsagePercent: Double? = nil,
         memoryResidentMB: UInt64 = 0,
+        guestMemTotalBytes: UInt64? = nil,
+        guestMemAvailableBytes: UInt64? = nil,
+        guestAgentVersion: String? = nil,
         balloonReclaimedMB: UInt64 = 0,
         diskReadBytesTotal: UInt64 = 0,
         diskWriteBytesTotal: UInt64 = 0,
@@ -618,6 +624,9 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         self.state = state
         self.cpuUsagePercent = cpuUsagePercent
         self.memoryResidentMB = memoryResidentMB
+        self.guestMemTotalBytes = guestMemTotalBytes
+        self.guestMemAvailableBytes = guestMemAvailableBytes
+        self.guestAgentVersion = guestAgentVersion
         self.balloonReclaimedMB = balloonReclaimedMB
         self.diskReadBytesTotal = diskReadBytesTotal
         self.diskWriteBytesTotal = diskWriteBytesTotal
@@ -641,6 +650,9 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         case state
         case cpuUsagePercent
         case memoryResidentMB
+        case guestMemTotalBytes
+        case guestMemAvailableBytes
+        case guestAgentVersion
         case balloonReclaimedMB
         case diskReadBytesTotal
         case diskWriteBytesTotal
@@ -663,8 +675,11 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.vmID = try container.decode(VMID.self, forKey: .vmID)
         self.state = try container.decode(VMLifecycleState.self, forKey: .state)
-        self.cpuUsagePercent = try container.decode(Double.self, forKey: .cpuUsagePercent)
+        self.cpuUsagePercent = try container.decodeIfPresent(Double.self, forKey: .cpuUsagePercent)
         self.memoryResidentMB = try container.decode(UInt64.self, forKey: .memoryResidentMB)
+        self.guestMemTotalBytes = try container.decodeIfPresent(UInt64.self, forKey: .guestMemTotalBytes)
+        self.guestMemAvailableBytes = try container.decodeIfPresent(UInt64.self, forKey: .guestMemAvailableBytes)
+        self.guestAgentVersion = try container.decodeIfPresent(String.self, forKey: .guestAgentVersion)
         self.balloonReclaimedMB = try container.decode(UInt64.self, forKey: .balloonReclaimedMB)
         self.diskReadBytesTotal = try container.decode(UInt64.self, forKey: .diskReadBytesTotal)
         self.diskWriteBytesTotal = try container.decode(UInt64.self, forKey: .diskWriteBytesTotal)
@@ -702,22 +717,22 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
     }
 
     public var formattedCPUUsage: String {
-        guard hasLiveGuestTelemetry, state == .running else { return "—" }
+        guard hasLiveGuestTelemetry, state == .running, let cpuUsagePercent else { return "—" }
         return String(format: "%.1f%%", cpuUsagePercent)
     }
 
     public var formattedMemoryResident: String {
-        guard hasLiveGuestTelemetry else { return "—" }
+        guard hasLiveGuestTelemetry, state == .running else { return "—" }
         return "\(memoryResidentMB) MB"
     }
 
     public func formattedMemoryResident(ofTotalMB totalMB: UInt64) -> String {
-        guard hasLiveGuestTelemetry else { return "— / \(totalMB) MB" }
+        guard hasLiveGuestTelemetry, state == .running else { return "— / \(totalMB) MB" }
         return "\(memoryResidentMB) / \(totalMB) MB"
     }
 
     public var formattedBalloonReclaimed: String {
-        guard hasLiveGuestTelemetry else { return "—" }
+        guard hasLiveGuestTelemetry, state == .running else { return "—" }
         return "\(balloonReclaimedMB) MB"
     }
 }

@@ -166,7 +166,11 @@ public struct FleetNavigatorRailView: View {
                 }
 
                 HStack(spacing: 6) {
-                    Text(vm.telemetry.hasLiveGuestTelemetry ? "CPU \(Int(vm.telemetry.cpuUsagePercent.rounded()))%" : "CPU —")
+                    Text(
+                        (vm.telemetry.hasLiveGuestTelemetry && vm.telemetry.state == .running && vm.telemetry.cpuUsagePercent != nil)
+                            ? "CPU \(Int((vm.telemetry.cpuUsagePercent ?? 0).rounded()))%"
+                            : "CPU —"
+                    )
                         .font(RackTheme.monoSmallFont)
                         .monospacedDigit()
                         .foregroundStyle(RackTheme.inkSecondary)

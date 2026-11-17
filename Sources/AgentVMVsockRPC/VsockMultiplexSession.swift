@@ -315,6 +315,7 @@ public actor VsockMultiplexSession {
     private var transportWrite: (@Sendable (Data) async throws -> Void)?
     private var onTransportDisconnect: (@Sendable () async -> Void)?
     private var onControlPong: (@Sendable (VsockControlEnvelope) async -> Void)?
+    private var onHeartbeat: (@Sendable (GuestHeartbeatPayload, Date, UInt64) async -> Void)?
     private var inboundTransportPumpTask: Task<Void, Never>?
     private var inboundTransportContinuation: AsyncStream<Data>.Continuation?
     private var attachedReadSource: DispatchSourceRead?
@@ -1080,6 +1081,12 @@ public actor VsockMultiplexSession {
         self.onControlPong = observer
     }
 
+    /// Registers an optional observer invoked whenever a `.telemetryHeartbeat` frame arrives from the guest,
+    /// passing `(payload, hostReceivedAt, hostReceivedUptimeNanoseconds)` without blocking the inbound read loop.
+    public func setHeartbeatObserver(_ observer: (@Sendable (GuestHeartbeatPayload, Date, UInt64) async -> Void)?) {
+        self.onHeartbeat = observer
+    }
+
     /// Returns the guest daemon's advertised `agentVersion` from the most recent `.pong` handshake, if any.
     public func guestAgentVersion() -> String? {
         cachedGuestAgentVersion
@@ -1811,11 +1818,18 @@ public actor VsockMultiplexSession {
               let heartbeat = try? VsockWireJSON.decode(GuestHeartbeatPayload.self, from: payload) else {
             return
         }
+        let receivedAt = Date()
+        let receivedUptimeNs = DispatchTime.now().uptimeNanoseconds
         cachedHeartbeat = heartbeat
         let waiters = pendingHeartbeatWaiters
         pendingHeartbeatWaiters.removeAll()
         for waiter in waiters {
             waiter.resolve(heartbeat)
+        }
+        if let observer = onHeartbeat {
+            Task {
+                await observer(heartbeat, receivedAt, receivedUptimeNs)
+            }
         }
     }
 

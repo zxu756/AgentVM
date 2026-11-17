@@ -732,8 +732,11 @@ public actor AgentVMProjectStore {
             current.telemetry.guestAgentConnected = false
             current.telemetry.hasLiveGuestTelemetry = false
             current.telemetry.vsockStreamsOpen = 0
-            current.telemetry.cpuUsagePercent = 0
+            current.telemetry.cpuUsagePercent = nil
             current.telemetry.memoryResidentMB = 0
+            current.telemetry.guestMemTotalBytes = nil
+            current.telemetry.guestMemAvailableBytes = nil
+            current.telemetry.guestAgentVersion = nil
             try upsertVM(current)
             try appendDiagnostic(diagnostic)
             return (current, true)

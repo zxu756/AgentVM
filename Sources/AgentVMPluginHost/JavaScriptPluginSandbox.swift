@@ -498,7 +498,7 @@ public actor AgentVMPluginEngine {
                 "vmID": record.id.rawValue,
                 "name": record.spec.name,
                 "state": record.telemetry.state.rawValue,
-                "cpuPercent": record.telemetry.cpuUsagePercent,
+                "cpuPercent": record.telemetry.cpuUsagePercent ?? 0.0,
                 "memoryResidentMB": record.telemetry.memoryResidentMB,
                 "cowDirtyBytes": record.telemetry.cowDirtyBytes,
                 "firewallDroppedPackets": record.telemetry.firewallDroppedPackets,

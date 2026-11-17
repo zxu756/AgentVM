@@ -244,7 +244,7 @@ struct HypervisorCoordinatorTests {
         // Pause VM A -> PAUSED
         let pausedA = try await coordinator.pauseVM(vmA.id, reason: "Unit test checkpoint")
         #expect(pausedA.telemetry.state == .paused)
-        #expect(pausedA.telemetry.cpuUsagePercent == 0.0)
+        #expect(pausedA.telemetry.cpuUsagePercent == nil)
 
         // Resume VM A -> RUNNING
         let resumedA = try await coordinator.resumeVM(vmA.id)
@@ -572,7 +572,7 @@ struct HypervisorCoordinatorTests {
         #expect(afterFailedBoot.telemetry.state == .stopped)
         #expect(afterFailedBoot.telemetry.guestAgentConnected == false)
         #expect(afterFailedBoot.telemetry.hasLiveGuestTelemetry == false)
-        #expect(afterFailedBoot.telemetry.cpuUsagePercent == 0.0)
+        #expect(afterFailedBoot.telemetry.cpuUsagePercent == nil)
         #expect(afterFailedBoot.telemetry.memoryResidentMB == 0)
 
         let ttyText = await coordinator.terminalScreenBuffer(for: vmID).renderPlainText()

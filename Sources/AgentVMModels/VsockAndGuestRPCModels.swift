@@ -302,6 +302,7 @@ public struct GuestHeartbeatPayload: Codable, Hashable, Sendable {
     public var loadAvg15: Double
     public var memTotalBytes: UInt64
     public var memAvailableBytes: UInt64
+    public var cpuUsagePercent: Double?
     public var rootFilesystemUsedBytes: UInt64
     public var rootFilesystemTotalBytes: UInt64
     public var topProcesses: [GuestProcessSample]
@@ -316,6 +317,7 @@ public struct GuestHeartbeatPayload: Codable, Hashable, Sendable {
         loadAvg15: Double,
         memTotalBytes: UInt64,
         memAvailableBytes: UInt64,
+        cpuUsagePercent: Double? = nil,
         rootFilesystemUsedBytes: UInt64,
         rootFilesystemTotalBytes: UInt64,
         topProcesses: [GuestProcessSample] = [],
@@ -329,6 +331,7 @@ public struct GuestHeartbeatPayload: Codable, Hashable, Sendable {
         self.loadAvg15 = loadAvg15
         self.memTotalBytes = memTotalBytes
         self.memAvailableBytes = memAvailableBytes
+        self.cpuUsagePercent = cpuUsagePercent
         self.rootFilesystemUsedBytes = rootFilesystemUsedBytes
         self.rootFilesystemTotalBytes = rootFilesystemTotalBytes
         self.topProcesses = topProcesses

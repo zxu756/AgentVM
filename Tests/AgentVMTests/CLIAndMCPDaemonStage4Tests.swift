@@ -532,6 +532,121 @@ struct CLIAndMCPDaemonStage4Tests {
         }
     }
 
+    // MARK: - Item 3 (A36): Bounded `exec_history` (64 KiB Prefix Per Stream + Total Byte Counts)
+
+    @Test("Item 3 (A36): streaming 'exec' delivers full >64 KiB stdout/stderr to client while exec_history stores only first 64 KiB per stream plus exact total byte counts")
+    func daemonExecBoundedHistoryStores64KiBPrefixAndTotalByteCountsA36() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s4-i3")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+
+        let (cacheDir, cachedURL, entry) = try await stageBootableCachedImage(in: realBase)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let wsURL = URL(fileURLWithPath: "\(realBase)/ExecHistoryA36.agentvm", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = [
+            "HOME": isolatedHome,
+            "CFFIXED_USER_HOME": isolatedHome,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+        let forbiddenSpawn = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exit 95"],
+            environment: env
+        )
+
+        #expect(await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "create", "t1", "--image", entry.id],
+            curatedEntriesOverride: [entry],
+            environment: env
+        ).exitCode == 0)
+
+        let stdoutTotal = 200 * 1024 // 204,800 B (> 64 KiB)
+        let stderrTotal = 150 * 1024 // 153,600 B (> 64 KiB)
+        var outArr = [UInt8](repeating: 0, count: stdoutTotal)
+        for i in 0..<stdoutTotal { outArr[i] = UInt8((i * 31 + 7) & 0xFF) }
+        var errArr = [UInt8](repeating: 0, count: stderrTotal)
+        for i in 0..<stderrTotal { errArr[i] = UInt8((i * 53 + 11) & 0xFF) }
+        let fullStdout = Data(outArr)
+        let fullStderr = Data(errArr)
+
+        let mockBackend = Stage4ScriptableGuestBackend { streamID, req, writer in
+            var seq: UInt32 = 0
+            let step = 32 * 1024
+            var off = 0
+            while off < fullStdout.count {
+                let end = min(fullStdout.count, off + step)
+                seq &+= 1
+                writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: seq, data: Data(fullStdout[off..<end]))
+                off = end
+            }
+            off = 0
+            while off < fullStderr.count {
+                let end = min(fullStderr.count, off + step)
+                seq &+= 1
+                writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stderr, seq: seq, data: Data(fullStderr[off..<end]))
+                off = end
+            }
+            writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+        }
+        defer { mockBackend.shutdownAll() }
+
+        try await withStartedDaemonServer(
+            workspaceURL: wsURL,
+            imageCacheDirectoryURL: cacheDir,
+            curatedImageEntries: [entry],
+            hardwareBackendOverride: mockBackend
+        ) { server in
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+
+            let tracker = Stage4LiveChunkTracker()
+            let res = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "emit-large-streams"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn,
+                liveStdoutDataHandler: { tracker.recordStdout($0, elapsedMs: 0) },
+                liveStderrDataHandler: { tracker.recordStderr($0) }
+            )
+            #expect(res.exitCode == 0)
+            // Unbuffered streaming outcome itself retains 0 bytes in CLIExecutionOutcome while live handlers get 100%.
+            #expect(res.stdoutData.isEmpty)
+            #expect(res.stderrData.isEmpty)
+            let snap = tracker.snapshot()
+            #expect(snap.stdout == fullStdout)
+            #expect(snap.stderr == fullStderr)
+
+            // Verify persisted SQLite `exec_history` row via a fresh store instance:
+            // stdout_data and stderr_data are capped at 65,536 bytes each, while total byte counts are exact.
+            let readerStore = try AgentVMProjectStore(bundleURL: wsURL, createIfMissing: false)
+            let history = try await readerStore.listExecResults(limit: 10)
+            let entryRow = try #require(history.first(where: { $0.commandLine == "emit-large-streams" }))
+            #expect(entryRow.stdoutData.count == 65_536)
+            #expect(entryRow.stderrData.count == 65_536)
+            #expect(entryRow.stdoutData == Data(fullStdout.prefix(65_536)))
+            #expect(entryRow.stderrData == Data(fullStderr.prefix(65_536)))
+            #expect(entryRow.stdoutTotalBytes == UInt64(stdoutTotal))
+            #expect(entryRow.stderrTotalBytes == UInt64(stderrTotal))
+            _ = server
+
+            _ = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+        }
+    }
+
     private static func locateBuiltAgentVMExecutable() throws -> URL {
         let bundleDir = Bundle(for: Stage4BundleLocatorToken.self).bundleURL.deletingLastPathComponent()
         let sibling = bundleDir.appendingPathComponent("AgentVM", isDirectory: false)

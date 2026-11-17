@@ -141,12 +141,16 @@ public struct GuestExecOutputChunk: Codable, Hashable, Sendable {
 }
 
 public struct GuestExecResult: Codable, Hashable, Sendable {
+    public static let maxStoredOutputBytesPerStream: Int = 65_536
+
     public var requestID: UUID
     public var vmID: VMID
     public var commandLine: String
     public var exitCode: Int32
     public var stdoutData: Data
     public var stderrData: Data
+    public var stdoutTotalBytes: UInt64
+    public var stderrTotalBytes: UInt64
     public var durationMilliseconds: Int
     public var timedOut: Bool
     public var preCheckpointSnapshotID: SnapshotID?
@@ -159,6 +163,8 @@ public struct GuestExecResult: Codable, Hashable, Sendable {
         exitCode: Int32,
         stdoutData: Data,
         stderrData: Data,
+        stdoutTotalBytes: UInt64? = nil,
+        stderrTotalBytes: UInt64? = nil,
         durationMilliseconds: Int,
         timedOut: Bool = false,
         preCheckpointSnapshotID: SnapshotID? = nil,
@@ -170,10 +176,57 @@ public struct GuestExecResult: Codable, Hashable, Sendable {
         self.exitCode = exitCode
         self.stdoutData = stdoutData
         self.stderrData = stderrData
+        self.stdoutTotalBytes = max(UInt64(stdoutData.count), stdoutTotalBytes ?? UInt64(stdoutData.count))
+        self.stderrTotalBytes = max(UInt64(stderrData.count), stderrTotalBytes ?? UInt64(stderrData.count))
         self.durationMilliseconds = durationMilliseconds
         self.timedOut = timedOut
         self.preCheckpointSnapshotID = preCheckpointSnapshotID
         self.completedAt = completedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case requestID
+        case vmID
+        case commandLine
+        case exitCode
+        case stdoutData
+        case stderrData
+        case stdoutTotalBytes
+        case stderrTotalBytes
+        case durationMilliseconds
+        case timedOut
+        case preCheckpointSnapshotID
+        case completedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let reqID = try container.decode(UUID.self, forKey: .requestID)
+        let vid = try container.decode(VMID.self, forKey: .vmID)
+        let cmd = try container.decode(String.self, forKey: .commandLine)
+        let code = try container.decode(Int32.self, forKey: .exitCode)
+        let outData = try container.decode(Data.self, forKey: .stdoutData)
+        let errData = try container.decode(Data.self, forKey: .stderrData)
+        let outTotal = try container.decodeIfPresent(UInt64.self, forKey: .stdoutTotalBytes)
+        let errTotal = try container.decodeIfPresent(UInt64.self, forKey: .stderrTotalBytes)
+        let dur = try container.decode(Int.self, forKey: .durationMilliseconds)
+        let timed = try container.decodeIfPresent(Bool.self, forKey: .timedOut) ?? false
+        let snap = try container.decodeIfPresent(SnapshotID.self, forKey: .preCheckpointSnapshotID)
+        let doneAt = try container.decode(Date.self, forKey: .completedAt)
+        self.init(
+            requestID: reqID,
+            vmID: vid,
+            commandLine: cmd,
+            exitCode: code,
+            stdoutData: outData,
+            stderrData: errData,
+            stdoutTotalBytes: outTotal,
+            stderrTotalBytes: errTotal,
+            durationMilliseconds: dur,
+            timedOut: timed,
+            preCheckpointSnapshotID: snap,
+            completedAt: doneAt
+        )
     }
 
     public var stdoutUTF8: String {

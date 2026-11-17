@@ -116,8 +116,11 @@ public actor VsockMultiplexSession {
     private struct PendingExecContext {
         let request: GuestExecRequest
         let startedAt: Date
+        let maxRetainedBytesPerStream: Int?
         var stdoutBuffer: Data = Data()
         var stderrBuffer: Data = Data()
+        var stdoutTotalBytes: UInt64 = 0
+        var stderrTotalBytes: UInt64 = 0
         let onChunk: (@Sendable (GuestExecOutputChunk) async -> Void)?
         let promise: VsockRPCPromise<GuestExecResult>
     }
@@ -436,6 +439,7 @@ public actor VsockMultiplexSession {
     /// Executes a command inside the guest sandbox while exposing the allocated `AVM1` `streamID` and streaming chunks.
     public func executeCommandStreaming(
         _ request: GuestExecRequest,
+        maxRetainedBytesPerStream: Int? = nil,
         onStreamOpened: (@Sendable (UInt32) -> Void)?,
         onChunk: (@Sendable (GuestExecOutputChunk) async -> Void)?
     ) async throws -> GuestExecResult {
@@ -448,6 +452,7 @@ public actor VsockMultiplexSession {
         pendingExecs[streamID] = PendingExecContext(
             request: request,
             startedAt: startedAt,
+            maxRetainedBytesPerStream: maxRetainedBytesPerStream,
             onChunk: onChunk,
             promise: promise
         )
@@ -499,6 +504,8 @@ public actor VsockMultiplexSession {
             exitCode: 124,
             stdoutData: ctx.stdoutBuffer,
             stderrData: ctx.stderrBuffer,
+            stdoutTotalBytes: ctx.stdoutTotalBytes,
+            stderrTotalBytes: ctx.stderrTotalBytes,
             durationMilliseconds: elapsedMs,
             timedOut: true,
             completedAt: Date()
@@ -1226,6 +1233,8 @@ public actor VsockMultiplexSession {
                     exitCode: completion.exitCode,
                     stdoutData: ctx.stdoutBuffer,
                     stderrData: ctx.stderrBuffer,
+                    stdoutTotalBytes: ctx.stdoutTotalBytes,
+                    stderrTotalBytes: ctx.stderrTotalBytes,
                     durationMilliseconds: max(1, completion.durationMilliseconds),
                     timedOut: completion.timedOut,
                     completedAt: Date()
@@ -1241,9 +1250,25 @@ public actor VsockMultiplexSession {
            let chunk = try? VsockWireJSON.decode(GuestExecOutputChunk.self, from: payload) {
             switch chunk.stream {
             case .stdout:
-                ctx.stdoutBuffer.append(chunk.data)
+                ctx.stdoutTotalBytes &+= UInt64(chunk.data.count)
+                if let limit = ctx.maxRetainedBytesPerStream {
+                    let remaining = limit - ctx.stdoutBuffer.count
+                    if remaining > 0 {
+                        ctx.stdoutBuffer.append(chunk.data.prefix(remaining))
+                    }
+                } else {
+                    ctx.stdoutBuffer.append(chunk.data)
+                }
             case .stderr, .systemNotice:
-                ctx.stderrBuffer.append(chunk.data)
+                ctx.stderrTotalBytes &+= UInt64(chunk.data.count)
+                if let limit = ctx.maxRetainedBytesPerStream {
+                    let remaining = limit - ctx.stderrBuffer.count
+                    if remaining > 0 {
+                        ctx.stderrBuffer.append(chunk.data.prefix(remaining))
+                    }
+                } else {
+                    ctx.stderrBuffer.append(chunk.data)
+                }
             }
             pendingExecs[streamID] = ctx
             if let callback = ctx.onChunk {

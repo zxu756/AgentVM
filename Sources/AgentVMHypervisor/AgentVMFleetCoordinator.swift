@@ -2390,6 +2390,7 @@ public actor AgentVMFleetCoordinator {
         }
         let execResult = try await session.executeCommandStreaming(
             request,
+            maxRetainedBytesPerStream: GuestExecResult.maxStoredOutputBytesPerStream,
             onStreamOpened: onStreamOpened,
             onChunk: onOutputChunk
         )

@@ -134,6 +134,30 @@ public actor AgentVMProjectStore {
         }
 
         self.db = try SQLiteWALDatabase(fileURL: dbURL, runMigrations: true)
+        try Self.ensureExecHistoryByteCountColumns(in: self.db)
+    }
+
+    private static func ensureExecHistoryByteCountColumns(in db: SQLiteWALDatabase) throws {
+        let cols = try db.query("PRAGMA table_info(exec_history);")
+        let names = Set(try cols.map { try $0.string("name").lowercased() })
+        if !names.contains("stdout_total_bytes") {
+            do {
+                try db.execute("ALTER TABLE exec_history ADD COLUMN stdout_total_bytes INTEGER;")
+            } catch let err as AgentVMError {
+                if !err.localizedMessage(in: .en).localizedCaseInsensitiveContains("duplicate column") {
+                    throw err
+                }
+            }
+        }
+        if !names.contains("stderr_total_bytes") {
+            do {
+                try db.execute("ALTER TABLE exec_history ADD COLUMN stderr_total_bytes INTEGER;")
+            } catch let err as AgentVMError {
+                if !err.localizedMessage(in: .en).localizedCaseInsensitiveContains("duplicate column") {
+                    throw err
+                }
+            }
+        }
     }
 
     public func databaseJournalAndBusyTimeout() throws -> (journalMode: String, busyTimeoutMilliseconds: Int64) {
@@ -745,12 +769,19 @@ public actor AgentVMProjectStore {
     // MARK: - Guest Exec History Ledger (v2: exec_history)
 
     public func appendExecResult(_ result: GuestExecResult) throws {
+        let cap = GuestExecResult.maxStoredOutputBytesPerStream
+        let cappedStdout = result.stdoutData.count > cap ? Data(result.stdoutData.prefix(cap)) : result.stdoutData
+        let cappedStderr = result.stderrData.count > cap ? Data(result.stderrData.prefix(cap)) : result.stderrData
+        let stdoutTotal = max(UInt64(result.stdoutData.count), result.stdoutTotalBytes)
+        let stderrTotal = max(UInt64(result.stderrData.count), result.stderrTotalBytes)
+
         try db.execute(
             """
             INSERT INTO exec_history (
                 request_id, vm_id, timestamp, command_line, exit_code,
-                stdout_data, stderr_data, duration_ms, timed_out, pre_checkpoint_snapshot_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stdout_data, stderr_data, stdout_total_bytes, stderr_total_bytes,
+                duration_ms, timed_out, pre_checkpoint_snapshot_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(request_id) DO UPDATE SET
                 vm_id = excluded.vm_id,
                 timestamp = excluded.timestamp,
@@ -758,6 +789,8 @@ public actor AgentVMProjectStore {
                 exit_code = excluded.exit_code,
                 stdout_data = excluded.stdout_data,
                 stderr_data = excluded.stderr_data,
+                stdout_total_bytes = excluded.stdout_total_bytes,
+                stderr_total_bytes = excluded.stderr_total_bytes,
                 duration_ms = excluded.duration_ms,
                 timed_out = excluded.timed_out,
                 pre_checkpoint_snapshot_id = excluded.pre_checkpoint_snapshot_id;
@@ -768,8 +801,10 @@ public actor AgentVMProjectStore {
                 result.completedAt.sqliteValue,
                 result.commandLine.sqliteValue,
                 result.exitCode.sqliteValue,
-                result.stdoutData.sqliteValue,
-                result.stderrData.sqliteValue,
+                cappedStdout.sqliteValue,
+                cappedStderr.sqliteValue,
+                stdoutTotal.sqliteValue,
+                stderrTotal.sqliteValue,
                 result.durationMilliseconds.sqliteValue,
                 result.timedOut.sqliteValue,
                 result.preCheckpointSnapshotID.sqliteValue
@@ -786,7 +821,8 @@ public actor AgentVMProjectStore {
                 """
                 SELECT
                     request_id, vm_id, timestamp, command_line, exit_code,
-                    stdout_data, stderr_data, duration_ms, timed_out, pre_checkpoint_snapshot_id
+                    stdout_data, stderr_data, stdout_total_bytes, stderr_total_bytes,
+                    duration_ms, timed_out, pre_checkpoint_snapshot_id
                 FROM exec_history
                 WHERE vm_id = ?
                 ORDER BY timestamp DESC, request_id ASC
@@ -799,7 +835,8 @@ public actor AgentVMProjectStore {
                 """
                 SELECT
                     request_id, vm_id, timestamp, command_line, exit_code,
-                    stdout_data, stderr_data, duration_ms, timed_out, pre_checkpoint_snapshot_id
+                    stdout_data, stderr_data, stdout_total_bytes, stderr_total_bytes,
+                    duration_ms, timed_out, pre_checkpoint_snapshot_id
                 FROM exec_history
                 ORDER BY timestamp DESC, request_id ASC
                 LIMIT ?;
@@ -811,13 +848,19 @@ public actor AgentVMProjectStore {
     }
 
     private func decodeExecResultRow(_ row: SQLiteRow) throws -> GuestExecResult {
-        GuestExecResult(
+        let outData = try row.data("stdout_data")
+        let errData = try row.data("stderr_data")
+        let outTotal = try row.optionalUInt64("stdout_total_bytes") ?? UInt64(outData.count)
+        let errTotal = try row.optionalUInt64("stderr_total_bytes") ?? UInt64(errData.count)
+        return GuestExecResult(
             requestID: try row.uuid("request_id"),
             vmID: VMID(try row.string("vm_id")),
             commandLine: try row.string("command_line"),
             exitCode: try row.int32("exit_code"),
-            stdoutData: try row.data("stdout_data"),
-            stderrData: try row.data("stderr_data"),
+            stdoutData: outData,
+            stderrData: errData,
+            stdoutTotalBytes: outTotal,
+            stderrTotalBytes: errTotal,
             durationMilliseconds: try row.int("duration_ms"),
             timedOut: try row.bool("timed_out"),
             preCheckpointSnapshotID: try row.optionalString("pre_checkpoint_snapshot_id").map { SnapshotID($0) },

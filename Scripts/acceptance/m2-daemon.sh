@@ -2,9 +2,9 @@
 # AgentVM Milestone M2 Workspace Daemon Acceptance Script.
 #
 # Stage 2 implements non-VM Rows 1-9 against the unsigned `.build/debug/AgentVM` binary
-# (or caller-supplied AGENTVM_BIN). Stages 3a, 4, 3b, and 5 run real-VM Rows 10-17 and 22-34
+# (or caller-supplied AGENTVM_BIN). Stages 3a, 4, 3b, 5, and 6 run real-VM Rows 10-34
 # when AGENTVM_REAL_VM=1 and AGENTVM_BIN carries `com.apple.security.virtualization`; rows
-# scheduled for Stage 6 (18-21) or Stages 7-8 (35-39) remain marked "没跑".
+# scheduled for Stages 7-8 (35-39) remain marked "没跑".
 #
 # Hard invariants:
 #   * Never launches the desktop UI (.app, window, or bare executable without a CLI subcommand).
@@ -1579,11 +1579,389 @@ PY
         fail_row 17 "int=[started=$r17_int_started,rc=$r17_int_rc,elapsed=${r17_int_elapsed}s,clean=$r17_int_clean,probe_rc=$r17_int_probe_rc], term=[started=$r17_term_started,rc=$r17_term_rc,elapsed=${r17_term_elapsed}s,clean=$r17_term_clean,probe_rc=$r17_term_probe_rc], t1_running=$r17_t1_running, boot_id='$r17_boot_id' (expected '$R11_BOOT_ID')"
     fi
 
-    # Rows 18-21 require telemetry mapping & expiration (Stage 6).
-    unrun_row 18 "遥测映射（guestMemTotalBytes）是第 6 段"
-    unrun_row 19 "客户机 CPU 占用率遥测是第 5-6 段"
-    unrun_row 20 "客户机内存驻留遥测是第 6 段"
-    unrun_row 21 "遥测刷新与过期是第 6 段"
+    # --------------------------------------------------------------
+    # Row 18: `ps --json` t1 `telemetry.guestMemTotalBytes` vs
+    #         `exec t1 -- awk '/^MemTotal:/{print $2*1024}' /proc/meminfo`
+    #   Expect: equal; and within 90%..100% of `spec.compute.memoryMB * 1048576`.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r18-ps.json" "$TMP_ROOT/r18-ps.err" --lang en --workspace "$WS" ps --json
+    r18_ps_rc=$LAST_RC
+
+    run_cli "$TMP_ROOT/r18-mem.out" "$TMP_ROOT/r18-mem.err" --lang en --workspace "$WS" exec t1 -- awk '/^MemTotal:/{print $2*1024}' /proc/meminfo
+    r18_awk_rc=$LAST_RC
+    r18_awk_raw="$(tr -d '[:space:]' < "$TMP_ROOT/r18-mem.out" 2>/dev/null || true)"
+
+    r18_ok=0
+    r18_summary=""
+    if [[ $r18_ps_rc -eq 0 && $r18_awk_rc -eq 0 ]]; then
+        r18_summary="$(
+            /usr/bin/python3 - "$TMP_ROOT/r18-ps.json" "$r18_awk_raw" <<'PY'
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+awk_raw = sys.argv[2].strip()
+t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1) != 1:
+    print(f"FAIL:t1_count={len(t1)}")
+    sys.exit(1)
+
+rec = t1[0]
+mem_mb = rec.get("spec", {}).get("compute", {}).get("memoryMB")
+tel = rec.get("telemetry", {})
+guest_total = tel.get("guestMemTotalBytes")
+guest_avail = tel.get("guestMemAvailableBytes")
+guest_ver = tel.get("guestAgentVersion")
+live = tel.get("hasLiveGuestTelemetry")
+
+if not awk_raw.isdigit():
+    print(f"FAIL:invalid_awk='{awk_raw}'")
+    sys.exit(1)
+proc_total = int(awk_raw)
+
+if not isinstance(mem_mb, int) or isinstance(mem_mb, bool) or mem_mb <= 0:
+    print(f"FAIL:invalid_memoryMB={mem_mb!r}")
+    sys.exit(1)
+cfg_bytes = mem_mb * 1048576
+
+if not isinstance(guest_total, int) or isinstance(guest_total, bool):
+    print(f"FAIL:guestMemTotalBytes={guest_total!r},procMemTotalBytes={proc_total},cfgBytes={cfg_bytes},live={live!r},ver={guest_ver!r}")
+    sys.exit(1)
+
+ratio_pct = (guest_total * 100.0) / cfg_bytes
+in_range = (guest_total * 100 >= cfg_bytes * 90) and (guest_total <= cfg_bytes)
+if guest_total != proc_total or not in_range or live is not True:
+    print(f"FAIL:guestMemTotalBytes={guest_total},procMemTotalBytes={proc_total},cfgBytes={cfg_bytes},ratio={ratio_pct:.2f}%,live={live!r},ver={guest_ver!r}")
+    sys.exit(1)
+
+print(f"OK:guestMemTotalBytes={guest_total},procMemTotalBytes={proc_total},configuredBytes={cfg_bytes}({ratio_pct:.2f}%),guestMemAvailableBytes={guest_avail},guestAgentVersion={guest_ver!r}")
+PY
+        )" && r18_ok=1 || r18_ok=0
+    fi
+
+    if [[ $r18_ok -eq 1 && "$r18_summary" == OK:* ]]; then
+        pass_row 18 "${r18_summary#OK:}"
+    else
+        fail_row 18 "ps_rc=$r18_ps_rc, awk_rc=$r18_awk_rc, summary='$r18_summary', awk_err='$(cat "$TMP_ROOT/r18-mem.err" 2>/dev/null)'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 19: Background `exec t1 -- sh -c 'timeout 20 sh -c "while :; do :; done"'`;
+    #         poll `ps --json` every 1s for 15s (plus plain `ps`); wait for busy loop to end,
+    #         then sleep 15s and check `ps --json` again.
+    #   Expect: peak `cpuUsagePercent >= 30`; 15s after end `cpuUsagePercent <= 15`;
+    #           while busy, plain `ps` CPU column is numeric (not '—').
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    ensure_cli_subcommand --lang en --workspace "$WS" exec t1 -- sh -c 'true'
+    : >"$TMP_ROOT/r19-bg.out"; : >"$TMP_ROOT/r19-bg.err"
+
+    (
+        exec /usr/bin/env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
+            HOME="$ISOLATED_HOME" \
+            CFFIXED_USER_HOME="$ISOLATED_HOME" \
+            AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+            /usr/bin/perl -e 'alarm $ARGV[0]; shift @ARGV; exec @ARGV' \
+            "$CMD_TIMEOUT_SEC" \
+            "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" exec t1 -- sh -c 'timeout 20 sh -c "while :; do :; done"'
+    ) </dev/null >"$TMP_ROOT/r19-bg.out" 2>"$TMP_ROOT/r19-bg.err" &
+    r19_bg_pid=$!
+    OWN_CLIENT_PIDS+=("$r19_bg_pid")
+
+    r19_poll_all_ok=1
+    for r19_idx in $(seq 1 15); do
+        sleep 1
+        run_cli "$TMP_ROOT/r19-ps-${r19_idx}.json" "$TMP_ROOT/r19-ps-${r19_idx}.err" --lang en --workspace "$WS" ps --json
+        if [[ $LAST_RC -ne 0 ]]; then
+            r19_poll_all_ok=0
+        fi
+        run_cli "$TMP_ROOT/r19-ps-${r19_idx}.txt" "$TMP_ROOT/r19-pst-${r19_idx}.err" --lang en --workspace "$WS" ps
+        if [[ $LAST_RC -ne 0 ]]; then
+            r19_poll_all_ok=0
+        fi
+    done
+
+    r19_bg_rc=0
+    wait "$r19_bg_pid" 2>/dev/null || r19_bg_rc=$?
+
+    sleep 15.5
+
+    run_cli "$TMP_ROOT/r19-ps-after.json" "$TMP_ROOT/r19-ps-after.err" --lang en --workspace "$WS" ps --json
+    r19_after_rc=$LAST_RC
+    run_cli "$TMP_ROOT/r19-ps-after.txt" "$TMP_ROOT/r19-pst-after.err" --lang en --workspace "$WS" ps
+    r19_after_txt_rc=$LAST_RC
+
+    r19_ok=0
+    r19_summary=""
+    if [[ $r19_poll_all_ok -eq 1 && $r19_after_rc -eq 0 && $r19_after_txt_rc -eq 0 ]]; then
+        r19_summary="$(
+            /usr/bin/python3 - "$TMP_ROOT" "$T1_ID" <<'PY'
+import json, os, re, sys
+
+tmp_root = sys.argv[1]
+t1_id = sys.argv[2].strip()
+
+def extract_t1_tel(path):
+    vms = json.load(open(path, encoding="utf-8"))
+    t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+    if len(t1) != 1:
+        return None
+    return t1[0].get("telemetry", {})
+
+def extract_ps_cols(path):
+    lines = [ln.rstrip("\r\n") for ln in open(path, encoding="utf-8") if ln.strip()]
+    if len(lines) < 2:
+        return None
+    header = lines[0]
+    for col in ("STATE", "CPU", "MEMORY", "IPV4"):
+        if col not in header:
+            return None
+    s_i = header.index("STATE")
+    c_i = header.index("CPU")
+    m_i = header.index("MEMORY")
+    ip_i = header.index("IPV4")
+    matched = [ln for ln in lines[1:] if (t1_id and ln.startswith(t1_id + " ")) or (" t1 " in ln)]
+    if len(matched) != 1:
+        return None
+    row = matched[0]
+    return (
+        row[s_i:c_i].strip(),
+        row[c_i:m_i].strip(),
+        row[m_i:ip_i].strip(),
+    )
+
+cpu_num_re = re.compile(r"^[0-9]+(\.[0-9]+)?%$")
+mem_num_re = re.compile(r"^[0-9]+ MB$")
+
+busy_cpus = []
+busy_ps_samples = []
+numeric_ps_seen = False
+sample_ps_cpu = ""
+sample_ps_mem = ""
+
+for idx in range(1, 16):
+    tel = extract_t1_tel(os.path.join(tmp_root, f"r19-ps-{idx}.json"))
+    cols = extract_ps_cols(os.path.join(tmp_root, f"r19-ps-{idx}.txt"))
+    if tel is not None and tel.get("hasLiveGuestTelemetry") is True:
+        val = tel.get("cpuUsagePercent")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            busy_cpus.append(float(val))
+    if cols is not None:
+        _, cpu_col, mem_col = cols
+        busy_ps_samples.append(cpu_col)
+        if cpu_col != "—" and cpu_num_re.match(cpu_col) and mem_num_re.match(mem_col):
+            numeric_ps_seen = True
+            sample_ps_cpu = cpu_col
+            sample_ps_mem = mem_col
+
+tel_after = extract_t1_tel(os.path.join(tmp_root, "r19-ps-after.json"))
+after_live = tel_after.get("hasLiveGuestTelemetry") if tel_after else None
+after_raw = tel_after.get("cpuUsagePercent") if tel_after else None
+after_cpu = float(after_raw) if (isinstance(after_raw, (int, float)) and not isinstance(after_raw, bool)) else None
+peak_cpu = max(busy_cpus) if busy_cpus else None
+
+if (
+    peak_cpu is None
+    or peak_cpu < 30.0
+    or after_live is not True
+    or after_cpu is None
+    or after_cpu > 15.0
+    or not numeric_ps_seen
+):
+    print(f"FAIL:peak_cpu={peak_cpu!r},after_cpu={after_cpu!r},after_live={after_live!r},numeric_ps={numeric_ps_seen},ps_cols={busy_ps_samples[:6]!r}")
+    sys.exit(1)
+
+print(f"OK:peak_cpu={peak_cpu:.2f}% (>=30),after_cpu={after_cpu:.2f}% (<=15),busy_ps_cpu='{sample_ps_cpu}',busy_ps_mem='{sample_ps_mem}'")
+PY
+        )" && r19_ok=1 || r19_ok=0
+    fi
+
+    if [[ $r19_ok -eq 1 && "$r19_summary" == OK:* ]]; then
+        pass_row 19 "${r19_summary#OK:}, bg_rc=$r19_bg_rc."
+    else
+        fail_row 19 "poll_ok=$r19_poll_all_ok, bg_rc=$r19_bg_rc, after_rc=$r19_after_rc, summary='$r19_summary', bg_err='$(cat "$TMP_ROOT/r19-bg.err" 2>/dev/null)'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 20: `exec t1 -- python3 -c 'b=bytearray(512<<20); import time; time.sleep(15)'`
+    #         inspect `ps --json` while running, and 15s after completion.
+    #   Expect: while running `memoryResidentMB - before >= 400`;
+    #           15s after completion `abs(after - before) < 100`.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r20-ps-before.json" "$TMP_ROOT/r20-ps-before.err" --lang en --workspace "$WS" ps --json
+    r20_before_rc=$LAST_RC
+
+    ensure_cli_subcommand --lang en --workspace "$WS" exec t1 -- python3 -c 'true'
+    : >"$TMP_ROOT/r20-bg.out"; : >"$TMP_ROOT/r20-bg.err"
+
+    (
+        exec /usr/bin/env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
+            HOME="$ISOLATED_HOME" \
+            CFFIXED_USER_HOME="$ISOLATED_HOME" \
+            AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+            /usr/bin/perl -e 'alarm $ARGV[0]; shift @ARGV; exec @ARGV' \
+            "$CMD_TIMEOUT_SEC" \
+            "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" exec t1 -- python3 -c 'b=bytearray(512<<20); import time; time.sleep(15)'
+    ) </dev/null >"$TMP_ROOT/r20-bg.out" 2>"$TMP_ROOT/r20-bg.err" &
+    r20_bg_pid=$!
+    OWN_CLIENT_PIDS+=("$r20_bg_pid")
+
+    r20_during_count=0
+    for r20_idx in $(seq 1 13); do
+        sleep 1
+        if ! kill -0 "$r20_bg_pid" 2>/dev/null; then
+            break
+        fi
+        run_cli "$TMP_ROOT/r20-ps-during-${r20_idx}.json" "$TMP_ROOT/r20-ps-during-${r20_idx}.err" --lang en --workspace "$WS" ps --json
+        if [[ $LAST_RC -eq 0 ]] && kill -0 "$r20_bg_pid" 2>/dev/null; then
+            r20_during_count=$((r20_during_count + 1))
+        else
+            rm -f "$TMP_ROOT/r20-ps-during-${r20_idx}.json"
+        fi
+    done
+
+    r20_bg_rc=0
+    wait "$r20_bg_pid" 2>/dev/null || r20_bg_rc=$?
+
+    sleep 15.5
+
+    run_cli "$TMP_ROOT/r20-ps-after.json" "$TMP_ROOT/r20-ps-after.err" --lang en --workspace "$WS" ps --json
+    r20_after_rc=$LAST_RC
+
+    r20_ok=0
+    r20_summary=""
+    if [[ $r20_before_rc -eq 0 && $r20_bg_rc -eq 0 && $r20_during_count -gt 0 && $r20_after_rc -eq 0 ]]; then
+        r20_summary="$(
+            /usr/bin/python3 - "$TMP_ROOT" <<'PY'
+import glob, json, os, sys
+
+tmp_root = sys.argv[1]
+
+def get_t1_mem(path):
+    vms = json.load(open(path, encoding="utf-8"))
+    t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+    if len(t1) != 1:
+        return (False, None)
+    tel = t1[0].get("telemetry", {})
+    live = (tel.get("hasLiveGuestTelemetry") is True)
+    mem = tel.get("memoryResidentMB")
+    if not isinstance(mem, int) or isinstance(mem, bool):
+        return (live, None)
+    return (live, mem)
+
+before_live, mem_before = get_t1_mem(os.path.join(tmp_root, "r20-ps-before.json"))
+after_live, mem_after = get_t1_mem(os.path.join(tmp_root, "r20-ps-after.json"))
+
+during_mems = []
+for p in sorted(glob.glob(os.path.join(tmp_root, "r20-ps-during-*.json"))):
+    lv, m = get_t1_mem(p)
+    if lv and m is not None:
+        during_mems.append(m)
+
+mem_during = max(during_mems) if during_mems else None
+if not before_live or mem_before is None or mem_during is None or not after_live or mem_after is None:
+    print(f"FAIL:before=({before_live},{mem_before}),during={mem_during},after=({after_live},{mem_after})")
+    sys.exit(1)
+
+delta_during = mem_during - mem_before
+diff_after = abs(mem_after - mem_before)
+if delta_during < 400 or diff_after >= 100:
+    print(f"FAIL:mem_before={mem_before}MB,mem_during={mem_during}MB(delta={delta_during:+d}MB),mem_after={mem_after}MB(diff={diff_after}MB)")
+    sys.exit(1)
+
+print(f"OK:mem_before={mem_before}MB,mem_during={mem_during}MB(delta=+{delta_during}MB >=400),mem_after={mem_after}MB(diff={diff_after}MB <100)")
+PY
+        )" && r20_ok=1 || r20_ok=0
+    fi
+
+    if [[ $r20_ok -eq 1 && "$r20_summary" == OK:* ]]; then
+        pass_row 20 "${r20_summary#OK:}."
+    else
+        fail_row 20 "before_rc=$r20_before_rc, bg_rc=$r20_bg_rc, during_count=$r20_during_count, after_rc=$r20_after_rc, summary='$r20_summary', bg_err='$(cat "$TMP_ROOT/r20-bg.err" 2>/dev/null)'"
+    fi
+
+    # --------------------------------------------------------------
+    # Row 21: Two `ps --json` calls separated by 12 seconds
+    #   Expect: `sampledAt` differs; `uptimeSeconds` increases by at least 8.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r21-ps1.json" "$TMP_ROOT/r21-ps1.err" --lang en --workspace "$WS" ps --json
+    r21_ps1_rc=$LAST_RC
+
+    sleep 12
+
+    run_cli "$TMP_ROOT/r21-ps2.json" "$TMP_ROOT/r21-ps2.err" --lang en --workspace "$WS" ps --json
+    r21_ps2_rc=$LAST_RC
+
+    r21_ok=0
+    r21_summary=""
+    if [[ $r21_ps1_rc -eq 0 && $r21_ps2_rc -eq 0 ]]; then
+        r21_summary="$(
+            /usr/bin/python3 - "$TMP_ROOT/r21-ps1.json" "$TMP_ROOT/r21-ps2.json" <<'PY'
+from datetime import datetime
+import json, sys
+
+def parse_t1(path):
+    vms = json.load(open(path, encoding="utf-8"))
+    t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+    if len(t1) != 1:
+        return None
+    return t1[0].get("telemetry", {})
+
+def parse_iso(s):
+    if not isinstance(s, str) or not s:
+        return None
+    norm = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        return datetime.fromisoformat(norm)
+    except ValueError:
+        return None
+
+tel1 = parse_t1(sys.argv[1])
+tel2 = parse_t1(sys.argv[2])
+if tel1 is None or tel2 is None:
+    print("FAIL:missing_t1")
+    sys.exit(1)
+
+live1 = tel1.get("hasLiveGuestTelemetry")
+live2 = tel2.get("hasLiveGuestTelemetry")
+s1 = tel1.get("sampledAt")
+s2 = tel2.get("sampledAt")
+u1 = tel1.get("uptimeSeconds")
+u2 = tel2.get("uptimeSeconds")
+
+dt1 = parse_iso(s1)
+dt2 = parse_iso(s2)
+valid_up = (
+    isinstance(u1, (int, float)) and not isinstance(u1, bool)
+    and isinstance(u2, (int, float)) and not isinstance(u2, bool)
+)
+delta_up = (float(u2) - float(u1)) if valid_up else None
+
+if (
+    live1 is not True
+    or live2 is not True
+    or dt1 is None
+    or dt2 is None
+    or s1 == s2
+    or dt2 <= dt1
+    or delta_up is None
+    or delta_up < 8.0
+):
+    print(f"FAIL:live=({live1!r},{live2!r}),sampledAt=('{s1}','{s2}'),uptime=({u1!r},{u2!r},delta={delta_up!r})")
+    sys.exit(1)
+
+print(f"OK:sampledAt1={s1},sampledAt2={s2},uptime1={float(u1):.2f}s,uptime2={float(u2):.2f}s(delta=+{delta_up:.2f}s >=8)")
+PY
+        )" && r21_ok=1 || r21_ok=0
+    fi
+
+    if [[ $r21_ok -eq 1 && "$r21_summary" == OK:* ]]; then
+        pass_row 21 "${r21_summary#OK:}."
+    else
+        fail_row 21 "ps1_rc=$r21_ps1_rc, ps2_rc=$r21_ps2_rc, summary='$r21_summary'"
+    fi
 
     # --------------------------------------------------------------
     # Row 22: While daemon holds `t1`, `run t1 -- true`

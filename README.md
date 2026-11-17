@@ -75,7 +75,7 @@ agentvm --lang en --workspace ./demo-check.agentvm export-hcl
 agentvm --lang en --workspace ./demo-check.agentvm up sandbox-a
 # -> exits non-zero: [ERR_NO_BOOTABLE_SYSTEM] VM 'sandbox-a' has no bootable guest OS or kernel on its disk...
 agentvm --lang en --workspace ./demo-check.agentvm exec sandbox-a -- uname -a
-# -> exits non-zero: [ERR_NO_BOOTABLE_SYSTEM] VM 'sandbox-a' has no bootable guest OS or kernel on its disk...
+# -> exits non-zero: [ERR_LIFECYCLE_STATE] Cannot perform 'exec' on VM 'sandbox-a' (...) while in state 'stopped' (guest is not running). Run 'agentvm up sandbox-a' first.
 
 # 6. Explicit host-side simulation requires --backend simulation and prefixes every line with SIMULATED:
 #    (the simulator answers with a fixed hostname, "agent-sandbox", whatever the VM is called)

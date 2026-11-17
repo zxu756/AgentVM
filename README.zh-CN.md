@@ -75,7 +75,7 @@ agentvm --lang zh --workspace ./demo-check.agentvm export-hcl
 agentvm --lang zh --workspace ./demo-check.agentvm up sandbox-a
 # -> 非零退出码：[ERR_NO_BOOTABLE_SYSTEM] 虚拟机「sandbox-a」磁盘上没有可引导的客户机系统（内核或根文件系统缺失）...
 agentvm --lang zh --workspace ./demo-check.agentvm exec sandbox-a -- uname -a
-# -> 非零退出码：[ERR_NO_BOOTABLE_SYSTEM] 虚拟机「sandbox-a」磁盘上没有可引导的客户机系统（内核或根文件系统缺失）...
+# -> 非零退出码：[ERR_LIFECYCLE_STATE] 虚拟机「sandbox-a」（...）当前处于「stopped」状态（客户机未在运行），无法在客户机中执行命令。请先运行 'agentvm up sandbox-a' 启动虚拟机。
 
 # 6. 仅当显式指定 --backend simulation 时才运行主机侧模拟，且输出强制带 SIMULATED: 前缀
 #    （不管虚拟机叫什么，模拟器回的主机名都是固定的 "agent-sandbox"）

@@ -235,6 +235,7 @@ private final class StreamedBinaryOutputCollector: @unchecked Sendable {
 public struct AgentVMCLIRunner: Sendable {
     public static let cliSubcommands: Set<String> = [
         "doctor", "init", "ps", "list", "image", "create", "run",
+        "daemon",
         "up", "boot", "start", "pause", "resume", "halt", "stop",
         "branch", "fork", "snapshot", "restore",
         "exec", "pcap", "policy", "plugin",
@@ -333,6 +334,7 @@ public struct AgentVMCLIRunner: Sendable {
         hardwareBackendOverride: (any HardwareVMLowLevelBackend)? = nil,
         vsockConnectTimeoutNanosecondsOverride: UInt64? = nil,
         gracefulStopTimeoutNanosecondsOverride: UInt64? = nil,
+        daemonRunProcessMode: Bool = false,
         signalController: OneShotRunSignalController? = nil,
         liveStderrHandler: (@Sendable (String) -> Void)? = nil,
         liveStdoutDataHandler: (@Sendable (Data) -> Void)? = nil,
@@ -353,6 +355,7 @@ public struct AgentVMCLIRunner: Sendable {
 
         var args = AppLanguage.strippingLanguageArguments(from: arguments)
         var resolvedBundleURL = bundleURLOverride ?? Self.defaultWorkspaceBundleURL(environment: environment)
+        var explicitWorkspaceRawString: String?
         var executionBackend: HypervisorExecutionBackend = .strictHardwareVZ
         var isSimulationFlagged = false
 
@@ -366,12 +369,15 @@ public struct AgentVMCLIRunner: Sendable {
                 break
             }
             if (token == "--workspace" || token == "-w"), idx + 1 < args.count {
-                resolvedBundleURL = URL(fileURLWithPath: args[idx + 1], isDirectory: true)
+                let rawPath = args[idx + 1]
+                explicitWorkspaceRawString = rawPath
+                resolvedBundleURL = URL(fileURLWithPath: rawPath, isDirectory: true)
                 idx += 2
                 continue
             }
             if token.hasPrefix("--workspace=") {
                 let rawPath = String(token.dropFirst("--workspace=".count))
+                explicitWorkspaceRawString = rawPath
                 resolvedBundleURL = URL(fileURLWithPath: rawPath, isDirectory: true)
                 idx += 1
                 continue
@@ -487,6 +493,20 @@ public struct AgentVMCLIRunner: Sendable {
                 )
             }
         }
+        if subcommand == "daemon" {
+            if let usageErr = Self.validateDaemonSubcommandUsage(
+                parsed: parsed,
+                explicitWorkspaceRawString: explicitWorkspaceRawString,
+                bundleURLOverride: bundleURLOverride,
+                language: language
+            ) {
+                let rawStderr = usageErr + "\n"
+                return CLIExecutionOutcome(
+                    exitCode: Self.usageErrorExitCode,
+                    stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                )
+            }
+        }
         var parsedRun: ParsedRunArguments?
         if subcommand == "run" {
             switch Self.parseRunArguments(rest, language: language) {
@@ -510,6 +530,28 @@ public struct AgentVMCLIRunner: Sendable {
             let rawOutcome: CLIExecutionOutcome
             // How this subcommand's stdout can carry the simulation marker without breaking its format.
             var stdoutFormat: SimulationMarkedFormat = .textLines
+
+            if subcommand == "daemon" {
+                let asJSON = parsed.flags.contains("--json")
+                if asJSON { stdoutFormat = .json }
+                if isSimulationFlagged {
+                    let simMsg = isZh
+                        ? "[ERR_SIMULATION_UNSUPPORTED] 守护进程仅管理真实硬件虚拟化，不在 '--backend simulation' 下运行。\n"
+                        : "[ERR_SIMULATION_UNSUPPORTED] The workspace daemon only runs the hardware hypervisor backend and does not run under '--backend simulation'.\n"
+                    return Self.markSimulatedOutcome(
+                        CLIExecutionOutcome(exitCode: 1, stderr: simMsg),
+                        stdoutFormat: stdoutFormat,
+                        language: language
+                    )
+                }
+                return try await runDaemon(
+                    workspaceURL: resolvedBundleURL,
+                    parsed: parsed,
+                    language: language,
+                    environment: environment,
+                    daemonRunProcessMode: daemonRunProcessMode
+                )
+            }
 
             if subcommand == "image" {
                 let asJSON = parsed.flags.contains("--json")
@@ -681,6 +723,32 @@ public struct AgentVMCLIRunner: Sendable {
             }
             let rawStderr = streamedProgressStderr.snapshot() + "[\(err.errorCode)] \(localizedErr)\n\(hintLine)\n"
             let errorExitCode: Int32 = (subcommand == "run") ? Self.runInfrastructureErrorExitCode : 1
+            return CLIExecutionOutcome(
+                exitCode: errorExitCode,
+                stdoutData: Data(),
+                stderrData: Data((isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr).utf8)
+            )
+        } catch let protoErr as DaemonRPCProtocolError {
+            let localizedErr = protoErr.localizedMessage(in: language)
+            let rawStderr = streamedProgressStderr.snapshot() + "[\(protoErr.errorCode)] \(localizedErr)\n"
+            let errorExitCode: Int32 = (subcommand == "run" || subcommand == "exec") ? Self.runInfrastructureErrorExitCode : 1
+            return CLIExecutionOutcome(
+                exitCode: errorExitCode,
+                stdoutData: Data(),
+                stderrData: Data((isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr).utf8)
+            )
+        } catch let rpcErr as DaemonRPCError {
+            let rawStderr = streamedProgressStderr.snapshot() + "[\(rpcErr.errorCode)] \(rpcErr.message)\n"
+            let errorExitCode: Int32 = (subcommand == "run" || subcommand == "exec") ? Self.runInfrastructureErrorExitCode : 1
+            return CLIExecutionOutcome(
+                exitCode: errorExitCode,
+                stdoutData: Data(),
+                stderrData: Data((isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr).utf8)
+            )
+        } catch let sockErr as DaemonSocketError {
+            let localizedErr = sockErr.localizedMessage(in: language)
+            let rawStderr = streamedProgressStderr.snapshot() + "[\(sockErr.errorCode)] \(localizedErr)\n"
+            let errorExitCode: Int32 = (subcommand == "run" || subcommand == "exec") ? Self.runInfrastructureErrorExitCode : 1
             return CLIExecutionOutcome(
                 exitCode: errorExitCode,
                 stdoutData: Data(),
@@ -1664,6 +1732,241 @@ public struct AgentVMCLIRunner: Sendable {
         }
     }
 
+    // MARK: - Workspace Daemon Subcommands (`agentvm daemon run | start | status | stop`)
+
+    public static let daemonNotRunningExitCode: Int32 = 3
+
+    private struct DaemonStatusCLIJSON: Codable, Sendable {
+        var running: Bool
+        var pid: Int32?
+        var startedAt: Date?
+        var socketPath: String?
+        var workspacePath: String
+        var executablePath: String?
+        var protocolVersion: Int?
+        var semanticVersion: SemanticVersion?
+        var vms: [VMInstanceRecord]?
+    }
+
+    private struct DaemonStopCLIJSON: Codable, Sendable {
+        var running: Bool
+        var stopped: Bool
+        var pid: Int32?
+        var stoppedVMIDs: [String]
+    }
+
+    private static func validateDaemonSubcommandUsage(
+        parsed: ParsedSubcommandArguments,
+        explicitWorkspaceRawString: String?,
+        bundleURLOverride: URL?,
+        language: AppLanguage
+    ) -> String? {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+
+        guard let action = parsed.positionals.first else {
+            return isZh
+                ? "子命令「daemon」缺少操作（可选：run、start、status、stop）。\(helpHintZh)"
+                : "Missing action for 'daemon' (expected one of: run, start, status, stop). \(helpHintEn)"
+        }
+
+        if action == "run" {
+            if parsed.flags.contains("--json") {
+                return isZh
+                    ? "选项「--json」不支持「daemon run」。\(helpHintZh)"
+                    : "Option '--json' is not supported for 'daemon run'. \(helpHintEn)"
+            }
+            let effectiveRawPath: String?
+            if let explicitWorkspaceRawString {
+                effectiveRawPath = explicitWorkspaceRawString.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if let bundleURLOverride {
+                effectiveRawPath = bundleURLOverride.path
+            } else {
+                effectiveRawPath = nil
+            }
+            guard let rawPath = effectiveRawPath, rawPath.hasPrefix("/") else {
+                return isZh
+                    ? "「daemon run」必须显式传入「--workspace <绝对路径>」。\(helpHintZh)"
+                    : "'daemon run' requires an explicit '--workspace <absolute-path>'. \(helpHintEn)"
+            }
+        }
+        return nil
+    }
+
+    private func runDaemon(
+        workspaceURL: URL,
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage,
+        environment: [String: String],
+        daemonRunProcessMode: Bool
+    ) async throws -> CLIExecutionOutcome {
+        let isZh = (language == .zhHans)
+        let asJSON = parsed.flags.contains("--json")
+        let action = parsed.positionals[0]
+        let paths = DaemonWorkspacePaths(workspaceURL: workspaceURL)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+
+        switch action {
+        case "status":
+            let statusResult = try DaemonClient.queryStatus(
+                workspaceURL: paths.workspaceURL,
+                language: language
+            )
+            switch statusResult {
+            case .daemonNotRunning:
+                if asJSON {
+                    let payload = DaemonStatusCLIJSON(
+                        running: false,
+                        workspacePath: paths.canonicalWorkspacePath
+                    )
+                    let data = try encoder.encode(payload)
+                    return CLIExecutionOutcome(
+                        exitCode: Self.daemonNotRunningExitCode,
+                        stdout: String(decoding: data, as: UTF8.self) + "\n"
+                    )
+                }
+                let scrubbedWS = Self.scrubPath(paths.canonicalWorkspacePath, environment: environment)
+                let msg = isZh
+                    ? "守护进程未运行（工作区：\(scrubbedWS)）。\n"
+                    : "Daemon is not running (workspace: \(scrubbedWS)).\n"
+                return CLIExecutionOutcome(exitCode: Self.daemonNotRunningExitCode, stdout: msg)
+
+            case let .connected(status):
+                if asJSON {
+                    let payload = DaemonStatusCLIJSON(
+                        running: true,
+                        pid: status.pid,
+                        startedAt: status.startedAt,
+                        socketPath: status.socketPath,
+                        workspacePath: status.workspacePath,
+                        executablePath: status.executablePath,
+                        protocolVersion: status.protocolVersion,
+                        semanticVersion: status.semanticVersion,
+                        vms: status.vms
+                    )
+                    let data = try encoder.encode(payload)
+                    return CLIExecutionOutcome(exitCode: 0, stdout: String(decoding: data, as: UTF8.self) + "\n")
+                }
+                let iso = ISO8601DateFormatter()
+                let startedStr = iso.string(from: status.startedAt)
+                let scrubbedWS = Self.scrubPath(status.workspacePath, environment: environment)
+                let scrubbedSock = Self.scrubPath(status.socketPath, environment: environment)
+                let scrubbedExe = Self.scrubPath(status.executablePath, environment: environment)
+                let vmSummary: String
+                if status.vms.isEmpty {
+                    vmSummary = isZh ? "0 台" : "0"
+                } else {
+                    let names = status.vms.map { "\($0.spec.name) (\($0.id.rawValue))" }.joined(separator: ", ")
+                    vmSummary = "\(status.vms.count) [\(names)]"
+                }
+                let out: String
+                if isZh {
+                    out = """
+                    守护进程状态      : 运行中
+                    PID               : \(status.pid)
+                    启动时间          : \(startedStr)
+                    版本              : v\(status.semanticVersion.description)（协议 \(status.protocolVersion)）
+                    套接字路径        : \(scrubbedSock)
+                    工作区路径        : \(scrubbedWS)
+                    可执行文件        : \(scrubbedExe)
+                    持有虚拟机        : \(vmSummary)
+                    """ + "\n"
+                } else {
+                    out = """
+                    Daemon Status     : RUNNING
+                    PID               : \(status.pid)
+                    Started At        : \(startedStr)
+                    Version           : v\(status.semanticVersion.description) (protocol \(status.protocolVersion))
+                    Socket Path       : \(scrubbedSock)
+                    Workspace         : \(scrubbedWS)
+                    Executable        : \(scrubbedExe)
+                    Held VMs          : \(vmSummary)
+                    """ + "\n"
+                }
+                return CLIExecutionOutcome(exitCode: 0, stdout: out)
+            }
+
+        case "stop":
+            let stopOutcome = try DaemonClient.stopDaemon(
+                workspaceURL: paths.workspaceURL,
+                language: language
+            )
+            switch stopOutcome {
+            case .daemonNotRunning:
+                if asJSON {
+                    let payload = DaemonStopCLIJSON(
+                        running: false,
+                        stopped: false,
+                        pid: nil,
+                        stoppedVMIDs: []
+                    )
+                    let data = try encoder.encode(payload)
+                    return CLIExecutionOutcome(exitCode: 0, stdout: String(decoding: data, as: UTF8.self) + "\n")
+                }
+                let msg = isZh
+                    ? "守护进程未运行，无需停止。\n"
+                    : "Daemon is not running; nothing to stop.\n"
+                return CLIExecutionOutcome(exitCode: 0, stdout: msg)
+
+            case let .connected((pid, res)):
+                if asJSON {
+                    let payload = DaemonStopCLIJSON(
+                        running: false,
+                        stopped: true,
+                        pid: pid,
+                        stoppedVMIDs: res.stoppedVMIDs.map(\.rawValue)
+                    )
+                    let data = try encoder.encode(payload)
+                    return CLIExecutionOutcome(exitCode: 0, stdout: String(decoding: data, as: UTF8.self) + "\n")
+                }
+                let pidNoteZh = pid.map { "（PID \($0)）" } ?? ""
+                let pidNoteEn = pid.map { " (PID \($0))" } ?? ""
+                let msg = isZh
+                    ? "已停止守护进程\(pidNoteZh)，已关闭 \(res.stoppedVMIDs.count) 台持有的虚拟机。\n"
+                    : "Stopped daemon\(pidNoteEn); shut down \(res.stoppedVMIDs.count) held VM(s).\n"
+                return CLIExecutionOutcome(exitCode: 0, stdout: msg)
+            }
+
+        case "run":
+            if daemonRunProcessMode {
+                try DaemonLogManager.redirectProcessStandardStreams(toLogURL: paths.daemonLogFileURL)
+            }
+            let startOutcome = try await WorkspaceDaemonServer.start(workspaceURL: paths.workspaceURL)
+            switch startOutcome {
+            case let .alreadyRunning(holder):
+                let pidStr = holder.map { " (pid=\($0.pid))" } ?? ""
+                let msg = isZh
+                    ? "该工作区已有守护进程在运行\(pidStr)，本进程以退出码 0 退出。\n"
+                    : "A daemon is already running for this workspace\(pidStr); exiting 0.\n"
+                return CLIExecutionOutcome(exitCode: 0, stdout: msg)
+
+            case let .started(server):
+                let signalSources: [any DispatchSourceSignal]
+                if daemonRunProcessMode {
+                    signalSources = WorkspaceDaemonServer.installProcessSignalHandlers(for: server)
+                } else {
+                    signalSources = []
+                }
+                await server.waitUntilStopped()
+                withExtendedLifetime(signalSources) {}
+                return CLIExecutionOutcome(exitCode: 0)
+            }
+
+        case "start":
+            throw AgentVMError.ipcDaemonUnavailable(
+                socketPath: paths.directSocketPath,
+                detail: isZh ? "daemon start 尚未接入分离拉起器。" : "daemon start launcher not yet wired."
+            )
+
+        default:
+            return CLIExecutionOutcome(exitCode: Self.usageErrorExitCode)
+        }
+    }
+
     // MARK: - Formatting & Resolution Helpers
 
     private func resolveVMID(_ token: String, coordinator: AgentVMFleetCoordinator) async throws -> VMID {
@@ -1717,6 +2020,11 @@ public struct AgentVMCLIRunner: Sendable {
                 flags: ["--json"],
                 maxPositionals: 2,
                 allowedFirstPositional: ["list", "pull", "verify"]
+            ),
+            "daemon": SubcommandGrammar(
+                flags: ["--json"],
+                maxPositionals: 1,
+                allowedFirstPositional: ["run", "start", "status", "stop"]
             ),
             "create": SubcommandGrammar(
                 valueOptions: ["--owner", "--cpus", "--memory-mb", "--image", "--disk-size"],

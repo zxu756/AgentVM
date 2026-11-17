@@ -1,0 +1,858 @@
+import AgentVMHypervisor
+import AgentVMModels
+import AgentVMStore
+import Darwin
+import Foundation
+
+// MARK: - Daemon Log File Manager (`<workspace>/logs/daemon.log`)
+
+public final class DaemonLogManager: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rawFD: Int32
+    public let logFileURL: URL
+
+    public init(logFileURL: URL) throws {
+        let parentDir = logFileURL.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        } catch {
+            throw DaemonSocketError.syscallFailed(
+                operation: "mkdir(logs)",
+                path: parentDir.path,
+                errnoCode: Darwin.errno,
+                detail: error.localizedDescription
+            )
+        }
+        let fd = Darwin.open(logFileURL.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "open(daemon.log)",
+                path: logFileURL.path,
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+        self.rawFD = fd
+        self.logFileURL = logFileURL
+    }
+
+    deinit {
+        close()
+    }
+
+    public func appendLine(_ message: String) {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let timestamp = formatter.string(from: Date())
+        let clean = message.replacingOccurrences(of: "\n", with: " ")
+        let framed = Data("[\(timestamp)] \(clean)\n".utf8)
+        lock.withLock {
+            guard rawFD >= 0 else { return }
+            framed.withUnsafeBytes { rawBuf in
+                guard let base = rawBuf.baseAddress else { return }
+                var offset = 0
+                while offset < rawBuf.count {
+                    let n = Darwin.write(rawFD, base.advanced(by: offset), rawBuf.count - offset)
+                    if n > 0 {
+                        offset += n
+                    } else if n < 0 && Darwin.errno == EINTR {
+                        continue
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    public func close() {
+        let fd = lock.withLock { () -> Int32 in
+            let current = rawFD
+            rawFD = -1
+            return current
+        }
+        if fd >= 0 {
+            _ = Darwin.close(fd)
+        }
+    }
+
+    /// Redirects standard input (fd 0) to `/dev/null` and standard output/error (fds 1, 2) to `daemon.log` (`O_APPEND`).
+    public static func redirectProcessStandardStreams(toLogURL logURL: URL) throws {
+        let parentDir = logURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+
+        let devNullFD = Darwin.open("/dev/null", O_RDONLY)
+        guard devNullFD >= 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "open(/dev/null)",
+                path: "/dev/null",
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+        defer {
+            if devNullFD > STDERR_FILENO {
+                _ = Darwin.close(devNullFD)
+            }
+        }
+
+        let logFD = Darwin.open(logURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+        guard logFD >= 0 else {
+            let code = Darwin.errno
+            throw DaemonSocketError.syscallFailed(
+                operation: "open(daemon.log)",
+                path: logURL.path,
+                errnoCode: code,
+                detail: String(cString: Darwin.strerror(code))
+            )
+        }
+        defer {
+            if logFD > STDERR_FILENO {
+                _ = Darwin.close(logFD)
+            }
+        }
+
+        _ = Darwin.dup2(devNullFD, STDIN_FILENO)
+        _ = Darwin.dup2(logFD, STDOUT_FILENO)
+        _ = Darwin.dup2(logFD, STDERR_FILENO)
+    }
+
+    /// Reads the trailing `maxLines` lines of `daemon.log` (up to the last 64 KiB).
+    public static func readTailLines(at logURL: URL, maxLines: Int = 20) -> String {
+        guard maxLines > 0 else { return "" }
+        let fd = Darwin.open(logURL.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { return "" }
+        defer { _ = Darwin.close(fd) }
+
+        let endOffset = Darwin.lseek(fd, 0, SEEK_END)
+        guard endOffset > 0 else { return "" }
+        let maxWindow: off_t = 64 * 1024
+        let startOffset = max(0, endOffset - maxWindow)
+        let readLen = Int(endOffset - startOffset)
+        var buf = [UInt8](repeating: 0, count: readLen)
+        let n = Darwin.pread(fd, &buf, readLen, startOffset)
+        guard n > 0 else { return "" }
+
+        let text = String(decoding: buf.prefix(n), as: UTF8.self)
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if lines.last == "" {
+            lines.removeLast()
+        }
+        let tail = lines.suffix(maxLines)
+        return tail.joined(separator: "\n")
+    }
+}
+
+// MARK: - Lifecycle Error Formatting Helpers Shared Between Daemon & Disconnected CLI Fallback
+
+public enum DaemonLifecycleErrorFormatter {
+    public static func execNotRunningRPCError(
+        vmName: String,
+        vmID: VMID,
+        state: VMLifecycleState,
+        language: AppLanguage
+    ) -> DaemonRPCError {
+        let isZh = (language == .zhHans)
+        let msg: String
+        if state == .paused {
+            msg = isZh
+                ? "虚拟机「\(vmName)」（\(vmID.rawValue)）当前处于「paused」状态（客户机已暂停），无法在客户机中执行命令。请先运行 'agentvm resume \(vmName)' 恢复运行。"
+                : "Cannot perform 'exec' on VM '\(vmName)' (\(vmID.rawValue)) while in state 'paused' (guest is paused). Run 'agentvm resume \(vmName)' first."
+        } else {
+            msg = isZh
+                ? "虚拟机「\(vmName)」（\(vmID.rawValue)）当前处于「\(state.rawValue)」状态（客户机未在运行），无法在客户机中执行命令。请先运行 'agentvm up \(vmName)' 启动虚拟机。"
+                : "Cannot perform 'exec' on VM '\(vmName)' (\(vmID.rawValue)) while in state '\(state.rawValue)' (guest is not running). Run 'agentvm up \(vmName)' first."
+        }
+        return DaemonRPCError(
+            code: DaemonRPCError.applicationErrorCode,
+            errorCode: "ERR_LIFECYCLE_STATE",
+            message: msg
+        )
+    }
+
+    public static func formatExecRPCErrorStderr(_ err: DaemonRPCError, vmName: String?, language: AppLanguage) -> String {
+        let isZh = (language == .zhHans)
+        if err.errorCode == "ERR_LIFECYCLE_STATE" {
+            if err.message.contains("agentvm up") || err.message.contains("agentvm resume") {
+                return "[\(err.errorCode)] \(err.message)\n"
+            }
+            let target = vmName ?? "<vm>"
+            let hint = isZh
+                ? "提示：请先运行 'agentvm up \(target)' 启动虚拟机。"
+                : "Hint: Start the VM first with 'agentvm up \(target)'."
+            return "[\(err.errorCode)] \(err.message)\n\(hint)\n"
+        }
+        return "[\(err.errorCode)] \(err.message)\n"
+    }
+}
+
+// MARK: - Workspace Daemon Server (`agentvm daemon run --workspace <abs-path>`)
+
+public enum WorkspaceDaemonStartOutcome: Sendable {
+    case started(WorkspaceDaemonServer)
+    case alreadyRunning(holder: DaemonLockHolderInfo?)
+}
+
+public final class WorkspaceDaemonServer: @unchecked Sendable {
+    public let paths: DaemonWorkspacePaths
+    public let coordinator: AgentVMFleetCoordinator
+    public let singletonLock: DaemonSingletonLock
+    public let listener: DaemonSocketListener
+    public let logManager: DaemonLogManager
+    public let protocolVersion: Int
+    public let semanticVersion: SemanticVersion
+    public let executablePath: String
+    public let recordedStartupSteps: [String]
+
+    private let onShutdownAllMachines: (@Sendable () async -> Void)?
+    private let stopGate = DaemonAsyncStopGate()
+    private let stateLock = NSLock()
+    private var isStoppingFlag = false
+    private var stopWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    private init(
+        paths: DaemonWorkspacePaths,
+        coordinator: AgentVMFleetCoordinator,
+        singletonLock: DaemonSingletonLock,
+        listener: DaemonSocketListener,
+        logManager: DaemonLogManager,
+        protocolVersion: Int,
+        semanticVersion: SemanticVersion,
+        executablePath: String,
+        recordedStartupSteps: [String],
+        onShutdownAllMachines: (@Sendable () async -> Void)?
+    ) {
+        self.paths = paths
+        self.coordinator = coordinator
+        self.singletonLock = singletonLock
+        self.listener = listener
+        self.logManager = logManager
+        self.protocolVersion = protocolVersion
+        self.semanticVersion = semanticVersion
+        self.executablePath = executablePath
+        self.recordedStartupSteps = recordedStartupSteps
+        self.onShutdownAllMachines = onShutdownAllMachines
+    }
+
+    public var holderInfo: DaemonLockHolderInfo {
+        singletonLock.holderInfo
+    }
+
+    public var address: DaemonResolvedSocketAddress {
+        listener.address
+    }
+
+    /// Starts the workspace daemon following the exact M2 Item 1 sequence:
+    /// 1. Acquire non-blocking `flock` on `<workspace>/run/daemon.lock` (`alreadyRunning` exits 0).
+    /// 2. Unlink stale `<workspace>/run/daemon.sock`.
+    /// 3. Reconcile any crashed hardware `running` VMs in SQLite (`VM_RUNTIME_LOST`).
+    /// 4. Bind (`0600`) & listen on the Unix domain socket (`0700` `run/`).
+    /// 5. Write `ready` line to `<workspace>/logs/daemon.log`.
+    public static func start(
+        workspaceURL: URL,
+        pid: Int32 = Darwin.getpid(),
+        protocolVersion: Int = DaemonRPCHello.currentProtocolVersion,
+        semanticVersion: SemanticVersion = .current,
+        executablePath: String = DaemonExecutableLocator.resolveCurrentExecutablePath(),
+        startedAt: Date = Date(),
+        backlog: Int32 = 32,
+        userTempDirectoryOverride: URL? = nil,
+        onShutdownAllMachines: (@Sendable () async -> Void)? = nil
+    ) async throws -> WorkspaceDaemonStartOutcome {
+        let paths = DaemonWorkspacePaths(workspaceURL: workspaceURL)
+        let logManager = try DaemonLogManager(logFileURL: paths.daemonLogFileURL)
+        var steps: [String] = []
+
+        // Step 1: Acquire singleton flock on `<workspace>/run/daemon.lock`.
+        let lockOutcome: DaemonSingletonLockAcquireOutcome
+        do {
+            lockOutcome = try DaemonSingletonLock.tryAcquire(
+                workspaceURL: paths.workspaceURL,
+                pid: pid,
+                version: semanticVersion,
+                executablePath: executablePath,
+                startedAt: startedAt
+            )
+        } catch {
+            logManager.appendLine("fatal: failed acquiring daemon.lock: \(error.localizedDescription)")
+            logManager.close()
+            throw error
+        }
+
+        let acquiredLock: DaemonSingletonLock
+        switch lockOutcome {
+        case let .alreadyHeld(holder):
+            let holderDesc = holder.map { "pid=\($0.pid)" } ?? "unknown-holder"
+            logManager.appendLine("contender exiting 0: daemon.lock already held (\(holderDesc))")
+            logManager.close()
+            return .alreadyRunning(holder: holder)
+        case let .acquired(lock):
+            acquiredLock = lock
+            steps.append("lock")
+        }
+
+        var preparedAddress: DaemonResolvedSocketAddress?
+        do {
+            // Step 2: Remove stale `<workspace>/run/daemon.sock` only after holding singleton lock.
+            if Darwin.unlink(paths.directSocketPath) != 0 {
+                let code = Darwin.errno
+                if code != ENOENT {
+                    throw DaemonSocketError.syscallFailed(
+                        operation: "unlink(stale daemon.sock)",
+                        path: paths.directSocketPath,
+                        errnoCode: code,
+                        detail: String(cString: Darwin.strerror(code))
+                    )
+                }
+            }
+            steps.append("unlink")
+
+            // Step 3: Reconcile crashed `running` VMs -> `stopped` + `VM_RUNTIME_LOST` BEFORE bind/listen.
+            let coordinator = try AgentVMFleetCoordinator(
+                bundleURL: paths.workspaceURL,
+                executionBackend: .strictHardwareVZ
+            )
+            _ = try await coordinator.reconcileStaleRunningVMs()
+            steps.append("reconcile")
+
+            // Step 4: Bind & listen Unix domain socket.
+            let (address, sockAddr) = try DaemonSocketAddressResolver.prepareForBind(
+                workspaceURL: paths.workspaceURL,
+                userTempDirectoryOverride: userTempDirectoryOverride
+            )
+            preparedAddress = address
+            let listener = try DaemonSocketListener.bindResolved(
+                address: address,
+                sockAddr: sockAddr,
+                runDirectoryURL: paths.runDirectoryURL,
+                backlog: backlog
+            )
+            steps.append("bind")
+
+            // Step 5: Write `ready` line to `<workspace>/logs/daemon.log`.
+            logManager.appendLine(
+                "ready pid=\(acquiredLock.holderInfo.pid) version=\(semanticVersion.description) socket=\(address.connectSocketPath) workspace=\(paths.canonicalWorkspacePath)"
+            )
+            steps.append("ready")
+
+            let server = WorkspaceDaemonServer(
+                paths: paths,
+                coordinator: coordinator,
+                singletonLock: acquiredLock,
+                listener: listener,
+                logManager: logManager,
+                protocolVersion: protocolVersion,
+                semanticVersion: semanticVersion,
+                executablePath: executablePath,
+                recordedStartupSteps: steps,
+                onShutdownAllMachines: onShutdownAllMachines
+            )
+            server.startAcceptLoop()
+            return .started(server)
+        } catch {
+            logManager.appendLine("fatal startup error: \(error.localizedDescription)")
+            if let addr = preparedAddress {
+                DaemonSocketAddressResolver.removeSymlinkIfPresent(for: addr)
+            }
+            acquiredLock.release(clearFile: true)
+            logManager.close()
+            throw error
+        }
+    }
+
+    public func handleTerminationSignal(_ signalNumber: Int32) async {
+        await stopAndCleanup(reason: "signal-\(signalNumber)")
+    }
+
+    public func stopAndCleanup(reason: String = "manual-stop") async {
+        _ = await stopGate.runOnce { [self] in
+            markStopping()
+            logManager.appendLine("stopping (\(reason)): shutting down held machines...")
+            if let onShutdownAllMachines {
+                await onShutdownAllMachines()
+            }
+            let stoppedIDs = await coordinator.shutdownAllDaemonHeldVMs()
+            listener.close(unlinkSocket: true, removeSymlink: true)
+            singletonLock.release(clearFile: true)
+            logManager.appendLine("stopped (\(reason), stoppedVMs=\(stoppedIDs.count))")
+            logManager.close()
+            resumeStopWaiters()
+            return stoppedIDs
+        }
+    }
+
+    public func waitUntilStopped() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let id = UUID()
+            let alreadyStopped = stateLock.withLock { () -> Bool in
+                if isStoppingFlag && singletonLockFDIsReleased {
+                    return true
+                }
+                stopWaiters[id] = cont
+                return false
+            }
+            if alreadyStopped {
+                cont.resume()
+            }
+        }
+    }
+
+    /// Installs process-level signal dispositions required for `agentvm daemon run`:
+    /// ignores `SIGHUP` and `SIGPIPE`, and routes `SIGTERM` and `SIGINT` to graceful `daemon stop`.
+    public static func installProcessSignalHandlers(for server: WorkspaceDaemonServer) -> [any DispatchSourceSignal] {
+        Darwin.signal(SIGHUP, SIG_IGN)
+        Darwin.signal(SIGPIPE, SIG_IGN)
+        Darwin.signal(SIGTERM, SIG_IGN)
+        Darwin.signal(SIGINT, SIG_IGN)
+
+        let queue = DispatchQueue(label: "io.zxu756.agentvm.daemon.signals")
+        let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: queue)
+        termSource.setEventHandler { [weak server] in
+            guard let server else { return }
+            Task { await server.handleTerminationSignal(SIGTERM) }
+        }
+        termSource.resume()
+
+        let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: queue)
+        intSource.setEventHandler { [weak server] in
+            guard let server else { return }
+            Task { await server.handleTerminationSignal(SIGINT) }
+        }
+        intSource.resume()
+
+        return [termSource, intSource]
+    }
+
+    // MARK: - Private Accept & Single-Request-Per-Connection Dispatch
+
+    private var singletonLockFDIsReleased: Bool {
+        listener.listenFD < 0
+    }
+
+    private func markStopping() {
+        stateLock.withLock {
+            isStoppingFlag = true
+        }
+    }
+
+    private var isStopping: Bool {
+        stateLock.withLock { isStoppingFlag }
+    }
+
+    private func resumeStopWaiters() {
+        let waiters = stateLock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            let all = Array(stopWaiters.values)
+            stopWaiters.removeAll()
+            return all
+        }
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func startAcceptLoop() {
+        let acceptQueue = DispatchQueue(label: "io.zxu756.agentvm.daemon.accept", qos: .userInitiated)
+        acceptQueue.async { [weak self] in
+            while let self, !self.isStopping {
+                do {
+                    let conn = try self.listener.acceptConnection()
+                    Task.detached { [weak self] in
+                        guard let self else {
+                            conn.close()
+                            return
+                        }
+                        await self.serveConnection(conn)
+                    }
+                } catch let sockErr as DaemonSocketError {
+                    if case .unauthorizedPeerUID = sockErr {
+                        self.logManager.appendLine("rejected unauthorized peer connection: \(sockErr.localizedDescription)")
+                        continue
+                    }
+                    if self.isStopping || self.listener.listenFD < 0 {
+                        break
+                    }
+                    self.logManager.appendLine("accept loop error: \(sockErr.localizedDescription)")
+                    break
+                } catch {
+                    if self.isStopping || self.listener.listenFD < 0 {
+                        break
+                    }
+                    self.logManager.appendLine("accept loop error: \(error.localizedDescription)")
+                    break
+                }
+            }
+        }
+    }
+
+    private func serveConnection(_ conn: DaemonSocketConnection) async {
+        let reader = conn.makeLineReader()
+        let daemonHello = DaemonRPCHello(
+            protocolVersion: protocolVersion,
+            semanticVersion: semanticVersion,
+            executablePath: executablePath
+        )
+
+        do {
+            try conn.writeLineData(try DaemonRPCCodec.encodeHelloLine(daemonHello))
+            guard let clientHelloData = try reader.readLineData() else {
+                conn.close()
+                return
+            }
+            _ = try DaemonRPCCodec.decodeHelloLine(clientHelloData)
+
+            guard let reqLineData = try reader.readLineData() else {
+                // Client disconnected after inspecting hello (e.g., version mismatch).
+                conn.close()
+                return
+            }
+
+            let envelope: DaemonRPCRequestEnvelope
+            do {
+                envelope = try DaemonRPCCodec.decodeRequestLine(reqLineData)
+            } catch let decodeErr as DaemonRPCRequestDecodeError {
+                let errResp = DaemonRPCResponse<DaemonRPCStopResult>.failure(
+                    id: decodeErr.requestID,
+                    error: decodeErr.rpcError
+                )
+                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(errResp))
+                conn.close()
+                return
+            }
+
+            switch envelope.call {
+            case .status:
+                let heldVMs = try await coordinator.daemonHeldVMs()
+                let payload = DaemonRPCStatusResult(
+                    pid: holderInfo.pid,
+                    startedAt: holderInfo.startedAt,
+                    socketPath: address.connectSocketPath,
+                    workspacePath: paths.canonicalWorkspacePath,
+                    executablePath: executablePath,
+                    protocolVersion: protocolVersion,
+                    semanticVersion: semanticVersion,
+                    vms: heldVMs
+                )
+                let resp = DaemonRPCResponse<DaemonRPCStatusResult>.success(id: envelope.id, result: payload)
+                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+                conn.close()
+
+            case .stop:
+                // Run shutdown once, unlink socket & symlink before replying so the filesystem is already clean
+                // when the `daemon stop` client receives its response, then release daemon.lock and finish!
+                let stoppedIDs = await stopGate.runOnce { [self] in
+                    markStopping()
+                    logManager.appendLine("stopping (rpc-stop): shutting down held machines...")
+                    if let onShutdownAllMachines {
+                        await onShutdownAllMachines()
+                    }
+                    let halted = await coordinator.shutdownAllDaemonHeldVMs()
+                    listener.close(unlinkSocket: true, removeSymlink: true)
+                    return halted
+                }
+                let resp = DaemonRPCResponse<DaemonRPCStopResult>.success(
+                    id: envelope.id,
+                    result: DaemonRPCStopResult(stoppedVMIDs: stoppedIDs)
+                )
+                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+                conn.close()
+                singletonLock.release(clearFile: true)
+                logManager.appendLine("stopped (rpc-stop, stoppedVMs=\(stoppedIDs.count))")
+                logManager.close()
+                resumeStopWaiters()
+
+            case let .list(params):
+                let vms = try await coordinator.listVMsForReporting(language: params.lang)
+                let resp = DaemonRPCResponse<DaemonRPCListResult>.success(
+                    id: envelope.id,
+                    result: DaemonRPCListResult(vms: vms)
+                )
+                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+                conn.close()
+
+            case let .up(params):
+                let resp = DaemonRPCResponse<DaemonRPCVMLifecycleResult>.failure(
+                    id: envelope.id,
+                    agentVMError: .persistentBootRequiresDaemon(vmName: params.vm),
+                    language: params.lang
+                )
+                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+                conn.close()
+
+            case let .halt(params):
+                await handleLifecycleCall(id: envelope.id, action: "halt", params: params, conn: conn)
+
+            case let .pause(params):
+                await handleLifecycleCall(id: envelope.id, action: "pause", params: params, conn: conn)
+
+            case let .resume(params):
+                await handleLifecycleCall(id: envelope.id, action: "resume", params: params, conn: conn)
+
+            case let .exec(params):
+                await handleExecCall(id: envelope.id, params: params, conn: conn)
+            }
+        } catch {
+            conn.close()
+        }
+    }
+
+    private func resolveVMID(_ token: String) async throws -> VMID {
+        let vms = try await coordinator.store.listVMs()
+        if let exact = vms.first(where: { $0.id.rawValue == token }) {
+            return exact.id
+        }
+        if let byName = vms.first(where: { $0.spec.name.caseInsensitiveCompare(token) == .orderedSame }) {
+            return byName.id
+        }
+        throw AgentVMError.vmNotFound(VMID(token))
+    }
+
+    private func handleLifecycleCall(
+        id: DaemonRPCID,
+        action: String,
+        params: DaemonRPCVMLifecycleParams,
+        conn: DaemonSocketConnection
+    ) async {
+        defer { conn.close() }
+        do {
+            let vmID = try await resolveVMID(params.vm)
+            let updated: VMInstanceRecord
+            switch action {
+            case "halt":
+                _ = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: params.lang)
+                updated = try await coordinator.haltVM(vmID)
+            case "pause":
+                _ = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: params.lang)
+                updated = try await coordinator.pauseVM(vmID)
+            default:
+                _ = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: params.lang)
+                updated = try await coordinator.resumeVM(vmID)
+            }
+            let resp = DaemonRPCResponse<DaemonRPCVMLifecycleResult>.success(
+                id: id,
+                result: DaemonRPCVMLifecycleResult(vm: updated)
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch let err as AgentVMError {
+            let resp = DaemonRPCResponse<DaemonRPCVMLifecycleResult>.failure(
+                id: id,
+                agentVMError: err,
+                language: params.lang
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch {
+            let rpcErr = DaemonRPCError(
+                code: DaemonRPCError.internalErrorCode,
+                errorCode: "ERR_DAEMON_INTERNAL",
+                message: error.localizedDescription
+            )
+            let resp = DaemonRPCResponse<DaemonRPCVMLifecycleResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        }
+    }
+
+    private func handleExecCall(
+        id: DaemonRPCID,
+        params: DaemonRPCExecParams,
+        conn: DaemonSocketConnection
+    ) async {
+        defer { conn.close() }
+        do {
+            let vmID = try await resolveVMID(params.vm)
+            let rec = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: params.lang)
+            let rpcErr = DaemonLifecycleErrorFormatter.execNotRunningRPCError(
+                vmName: rec.spec.name,
+                vmID: rec.id,
+                state: rec.telemetry.state,
+                language: params.lang
+            )
+            let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch let err as AgentVMError {
+            let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(
+                id: id,
+                agentVMError: err,
+                language: params.lang
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch {
+            let rpcErr = DaemonRPCError(
+                code: DaemonRPCError.internalErrorCode,
+                errorCode: "ERR_DAEMON_INTERNAL",
+                message: error.localizedDescription
+            )
+            let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        }
+    }
+}
+
+private actor DaemonAsyncStopGate {
+    private var completedResult: [VMID]?
+    private var inFlightTask: Task<[VMID], Never>?
+
+    func runOnce(_ operation: @Sendable @escaping () async -> [VMID]) async -> [VMID] {
+        if let completedResult {
+            return completedResult
+        }
+        if let inFlightTask {
+            return await inFlightTask.value
+        }
+        let task = Task {
+            await operation()
+        }
+        inFlightTask = task
+        let result = await task.value
+        completedResult = result
+        inFlightTask = nil
+        return result
+    }
+}
+
+// MARK: - Daemon Unix Socket RPC Client (Connect-Only & Handshake Verification)
+
+public enum DaemonClientConnectionResult<Payload: Sendable>: Sendable {
+    case connected(Payload)
+    case daemonNotRunning
+}
+
+public enum DaemonClient {
+    private static func isDaemonAbsentSocketError(_ error: DaemonSocketError) -> Bool {
+        if case let .syscallFailed(op, _, errnoCode, _) = error {
+            if op == "connect" && (errnoCode == ENOENT || errnoCode == ECONNREFUSED || errnoCode == ECONNRESET) {
+                return true
+            }
+        }
+        return false
+    }
+
+    public static func performUnaryCall<ResultPayload: Codable & Sendable>(
+        workspaceURL: URL,
+        call: DaemonRPCCall,
+        resultType: ResultPayload.Type = ResultPayload.self,
+        enforceVersionMatch: Bool = true,
+        clientHelloOverride: DaemonRPCHello? = nil,
+        userTempDirectoryOverride: URL? = nil
+    ) throws -> DaemonClientConnectionResult<(daemonHello: DaemonRPCHello, result: ResultPayload)> {
+        _ = resultType
+        let conn: DaemonSocketConnection
+        do {
+            conn = try DaemonSocketClient.connectWorkspace(
+                workspaceURL: workspaceURL,
+                userTempDirectoryOverride: userTempDirectoryOverride
+            )
+        } catch let sockErr as DaemonSocketError {
+            if isDaemonAbsentSocketError(sockErr) {
+                return .daemonNotRunning
+            }
+            throw sockErr
+        }
+        defer { conn.close() }
+
+        let clientHello = clientHelloOverride ?? DaemonRPCHello(
+            executablePath: DaemonExecutableLocator.resolveCurrentExecutablePath()
+        )
+        let reader = conn.makeLineReader()
+
+        do {
+            try conn.writeLineData(try DaemonRPCCodec.encodeHelloLine(clientHello))
+            guard let daemonHelloLine = try reader.readLineData() else {
+                return .daemonNotRunning
+            }
+            let daemonHello = try DaemonRPCCodec.decodeHelloLine(daemonHelloLine)
+            if enforceVersionMatch {
+                try clientHello.verifyCompatibility(withDaemon: daemonHello, language: call.language)
+            }
+
+            let envelope = DaemonRPCRequestEnvelope(id: .int(1), call: call)
+            try conn.writeLineData(try DaemonRPCCodec.encodeRequestLine(envelope))
+
+            guard let respLine = try reader.readLineData() else {
+                throw DaemonSocketError.syscallFailed(
+                    operation: "read(response)",
+                    path: DaemonWorkspacePaths(workspaceURL: workspaceURL).directSocketPath,
+                    errnoCode: ECONNRESET,
+                    detail: "Daemon closed connection before sending JSON-RPC response."
+                )
+            }
+            let decoded = try DaemonRPCCodec.decodeResponseLine(ResultPayload.self, from: respLine)
+            let payload = try decoded.resultOrThrow()
+            return .connected((daemonHello, payload))
+        } catch let framingErr as DaemonRPCLineFramingError {
+            if case let .ioError(code, _) = framingErr, code == ECONNRESET || code == EPIPE {
+                return .daemonNotRunning
+            }
+            throw framingErr
+        }
+    }
+
+    public static func queryStatus(
+        workspaceURL: URL,
+        language: AppLanguage,
+        clientHelloOverride: DaemonRPCHello? = nil,
+        userTempDirectoryOverride: URL? = nil
+    ) throws -> DaemonClientConnectionResult<DaemonRPCStatusResult> {
+        let outcome = try performUnaryCall(
+            workspaceURL: workspaceURL,
+            call: .status(DaemonRPCStatusParams(lang: language)),
+            resultType: DaemonRPCStatusResult.self,
+            enforceVersionMatch: true,
+            clientHelloOverride: clientHelloOverride,
+            userTempDirectoryOverride: userTempDirectoryOverride
+        )
+        switch outcome {
+        case .daemonNotRunning:
+            return .daemonNotRunning
+        case let .connected((_, status)):
+            return .connected(status)
+        }
+    }
+
+    public static func stopDaemon(
+        workspaceURL: URL,
+        language: AppLanguage,
+        userTempDirectoryOverride: URL? = nil,
+        waitTimeoutSeconds: TimeInterval = 10.0
+    ) throws -> DaemonClientConnectionResult<(pid: Int32?, result: DaemonRPCStopResult)> {
+        let paths = DaemonWorkspacePaths(workspaceURL: workspaceURL)
+        let lockHolderBefore = DaemonSingletonLock.readHolderInfo(at: paths.lockFileURL)
+        let plan = try? DaemonSocketAddressResolver.computePlan(
+            for: workspaceURL,
+            userTempDirectoryOverride: userTempDirectoryOverride
+        )
+
+        let outcome = try performUnaryCall(
+            workspaceURL: workspaceURL,
+            call: .stop(DaemonRPCStopParams(lang: language)),
+            resultType: DaemonRPCStopResult.self,
+            enforceVersionMatch: false,
+            userTempDirectoryOverride: userTempDirectoryOverride
+        )
+
+        switch outcome {
+        case .daemonNotRunning:
+            return .daemonNotRunning
+        case let .connected((_, stopRes)):
+            let targetPID = lockHolderBefore?.pid
+            let deadline = DispatchTime.now().uptimeNanoseconds &+ UInt64(max(0.1, waitTimeoutSeconds) * 1_000_000_000)
+            while DispatchTime.now().uptimeNanoseconds < deadline {
+                var st = Darwin.stat()
+                let sockGone = (Darwin.lstat(paths.directSocketPath, &st) != 0 && Darwin.errno == ENOENT)
+                let symGone: Bool = {
+                    guard let symURL = plan?.symlinkURL else { return true }
+                    return Darwin.lstat(symURL.path, &st) != 0 && Darwin.errno == ENOENT
+                }()
+                let procGone: Bool = {
+                    guard let pid = targetPID, pid > 0, pid != Darwin.getpid() else { return true }
+                    return Darwin.kill(pid, 0) != 0 && Darwin.errno == ESRCH
+                }()
+                if sockGone && symGone && procGone {
+                    break
+                }
+                Darwin.usleep(20_000)
+            }
+            return .connected((targetPID, stopRes))
+        }
+    }
+}

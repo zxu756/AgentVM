@@ -220,6 +220,172 @@ struct CLIAndMCPDaemonStage2Tests {
             .filter { $0.code == "VM_RUNTIME_LOST" }
         #expect(lostEventsAfterSecond.count == 2)
     }
+
+    // MARK: - Item 1: Daemon Skeleton (`daemon run|status|stop`, Startup Order, Ready Log, Signals, Version Mismatch)
+
+    @Test("Item 1: WorkspaceDaemonServer enforces lock->unlink->reconcile->bind->ready order, serves status/stop (--json & text, exit 3 when absent), handles SIGTERM like stop with machine-shutdown hook, and rejects hello version mismatch")
+    func daemonServerStartupOrderStatusStopSignalsAndVersionMismatch() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-d1")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        let wsURL = URL(fileURLWithPath: "\(realBase)/Daemon1.agentvm", isDirectory: true)
+        let cli = AgentVMCLIRunner()
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = ["HOME": isolatedHome, "CFFIXED_USER_HOME": isolatedHome]
+
+        // 1. `daemon run` without absolute --workspace is rejected with usage error (exit 2).
+        let badRelRun = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", "./relative.agentvm", "daemon", "run"],
+            environment: env
+        )
+        #expect(badRelRun.exitCode == AgentVMCLIRunner.usageErrorExitCode)
+
+        // 2. When no daemon is running: `daemon status` (en, zh, --json) exits 3; `daemon stop` exits 0 without creating daemon.sock.
+        let statusAbsentEn = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status"],
+            environment: env
+        )
+        #expect(statusAbsentEn.exitCode == 3)
+        #expect(statusAbsentEn.stdout.lowercased().contains("not running"))
+
+        let statusAbsentZh = await cli.execute(
+            arguments: ["--lang", "zh", "--workspace", wsURL.path, "daemon", "status"],
+            environment: env
+        )
+        #expect(statusAbsentZh.exitCode == 3)
+        #expect(statusAbsentZh.stdout.contains("守护进程未运行"))
+
+        let statusAbsentJSON = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status", "--json"],
+            environment: env
+        )
+        #expect(statusAbsentJSON.exitCode == 3)
+        let absentObj = try #require(
+            try JSONSerialization.jsonObject(with: Data(statusAbsentJSON.stdout.utf8)) as? [String: Any]
+        )
+        #expect(absentObj["running"] as? Bool == false)
+
+        let stopAbsent = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "stop", "--json"],
+            environment: env
+        )
+        #expect(stopAbsent.exitCode == 0)
+        #expect(!FileManager.default.fileExists(atPath: DaemonWorkspacePaths(workspaceURL: wsURL).directSocketPath))
+
+        // 3. Seed a crashed hardware `running` VM and a stale daemon.sock, then start WorkspaceDaemonServer
+        //    and verify exact order: lock -> unlink -> reconcile -> bind -> ready.
+        let seedCoord = try AgentVMFleetCoordinator(bundleURL: wsURL, executionBackend: .strictHardwareVZ)
+        let crashedVM = try await seedCoord.createSandboxVM(name: "stale-vm").vmRecord
+        var staleRunning = crashedVM
+        staleRunning.telemetry.state = .running
+        staleRunning.telemetry.simulated = false
+        try await seedCoord.store.upsertVM(staleRunning)
+
+        let paths = DaemonWorkspacePaths(workspaceURL: wsURL)
+        do {
+            let staleListener = try DaemonSocketListener.bindDirect(paths: paths)
+            staleListener.close(unlinkSocket: false)
+        }
+        #expect(FileManager.default.fileExists(atPath: paths.directSocketPath))
+
+        let shutdownHookBox = Stage2AtomicFlag()
+        let startOutcome = try await WorkspaceDaemonServer.start(
+            workspaceURL: wsURL,
+            onShutdownAllMachines: {
+                shutdownHookBox.set()
+            }
+        )
+        guard case let .started(server) = startOutcome else {
+            Issue.record("Expected WorkspaceDaemonServer.start to win singleton lock")
+            return
+        }
+        defer {
+            Task { await server.stopAndCleanup() }
+        }
+
+        #expect(server.recordedStartupSteps == ["lock", "unlink", "reconcile", "bind", "ready"])
+
+        // Verify daemon.log contains `ready` line and VM_RUNTIME_LOST was recorded before bind.
+        let logText = try String(contentsOf: paths.daemonLogFileURL, encoding: .utf8)
+        #expect(logText.contains("ready"))
+        let diagEvents = try await seedCoord.store.listDiagnostics(vmID: crashedVM.id, limit: 20)
+        #expect(diagEvents.filter { $0.code == "VM_RUNTIME_LOST" }.count == 1)
+
+        // Second contender starting on same workspace loses lock cleanly (.alreadyRunning).
+        let secondStart = try await WorkspaceDaemonServer.start(workspaceURL: wsURL)
+        if case .started(let unexpected) = secondStart {
+            await unexpected.stopAndCleanup()
+            Issue.record("Second WorkspaceDaemonServer must report alreadyRunning")
+        }
+
+        // 4. `daemon status` and `daemon status --json` exit 0 and report live daemon metadata.
+        let liveStatusText = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status"],
+            environment: env
+        )
+        #expect(liveStatusText.exitCode == 0)
+        #expect(liveStatusText.stdout.contains("\(Darwin.getpid())"))
+
+        let liveStatusJSON = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status", "--json"],
+            environment: env
+        )
+        #expect(liveStatusJSON.exitCode == 0)
+        let liveObj = try #require(
+            try JSONSerialization.jsonObject(with: Data(liveStatusJSON.stdout.utf8)) as? [String: Any]
+        )
+        #expect(liveObj["running"] as? Bool == true)
+        #expect((liveObj["pid"] as? Int) == Int(Darwin.getpid()))
+
+        // 5. `daemon stop` invokes the "shut down all machines" hook, removes socket, clears lock, and exits 0.
+        let stopLive = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "stop", "--json"],
+            environment: env
+        )
+        #expect(stopLive.exitCode == 0)
+        await server.waitUntilStopped()
+        #expect(shutdownHookBox.isSet() == true)
+        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
+
+        // 6. Start a daemon advertising an older SemanticVersion (1.2.0) -> client `daemon status` fails with
+        //    ERR_DAEMON_VERSION_MISMATCH hinting `agentvm daemon stop`, and SIGTERM stops it cleanly.
+        let sigtermHookBox = Stage2AtomicFlag()
+        guard case let .started(oldVerServer) = try await WorkspaceDaemonServer.start(
+            workspaceURL: wsURL,
+            semanticVersion: SemanticVersion(major: 1, minor: 2, patch: 0),
+            onShutdownAllMachines: {
+                sigtermHookBox.set()
+            }
+        ) else {
+            Issue.record("Expected second daemon server to start after stop")
+            return
+        }
+        defer {
+            Task { await oldVerServer.stopAndCleanup() }
+        }
+
+        let mismatchEn = await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "daemon", "status"],
+            environment: env
+        )
+        #expect(mismatchEn.exitCode == 1)
+        #expect(mismatchEn.stderr.contains("ERR_DAEMON_VERSION_MISMATCH"))
+        #expect(mismatchEn.stderr.contains("agentvm daemon stop"))
+
+        let mismatchZh = await cli.execute(
+            arguments: ["--lang", "zh", "--workspace", wsURL.path, "daemon", "status"],
+            environment: env
+        )
+        #expect(mismatchZh.exitCode == 1)
+        #expect(mismatchZh.stderr.contains("ERR_DAEMON_VERSION_MISMATCH"))
+        #expect(mismatchZh.stderr.contains("agentvm daemon stop"))
+
+        // Deliver SIGTERM handler -> executes same graceful stop as `daemon stop`.
+        await oldVerServer.handleTerminationSignal(SIGTERM)
+        await oldVerServer.waitUntilStopped()
+        #expect(sigtermHookBox.isSet() == true)
+        #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
+    }
 }
 
 private final class Stage2AtomicFlag: @unchecked Sendable {

@@ -58,7 +58,8 @@ enum AgentVMEntryPoint {
             var signalController: OneShotRunSignalController?
             var signalSources: [any DispatchSourceSignal] = []
 
-            if extractCLISubcommand(rawArgs) == "run" {
+            let subcmd = extractCLISubcommand(rawArgs)
+            if subcmd == "run" {
                 let controller = OneShotRunSignalController()
                 signalController = controller
                 signalSources = controller.installPOSIXSignalSources()
@@ -66,6 +67,7 @@ enum AgentVMEntryPoint {
 
             let outcome = await runner.execute(
                 arguments: rawArgs,
+                daemonRunProcessMode: subcmd == "daemon",
                 signalController: signalController,
                 liveStderrHandler: { forwarder.writeProgress($0) },
                 liveStdoutDataHandler: { forwarder.writeStdoutChunk($0) },

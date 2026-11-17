@@ -1165,8 +1165,7 @@ struct CLIAndMCPDaemonStage2Tests {
             .filter { !$0.hasPrefix("#") }
             .joined(separator: "\n")
         #expect(!codeLines.contains("pkill -f"))
-        #expect(!codeLines.contains("pgrep -f 'daemon run'"))
-        #expect(!codeLines.contains("pgrep -f \"daemon run\""))
+        #expect(!codeLines.contains("pgrep -f"))
     }
 
     @Test("Cleanup on failure: throwing mid-test stops both in-process WorkspaceDaemonServer and detached posix_spawn daemon and removes DARWIN_USER_TEMP_DIR avm-* symlinks")

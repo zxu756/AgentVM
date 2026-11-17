@@ -14,6 +14,7 @@
 #   * Scrubs host home-directory paths from all output.
 set -euo pipefail
 
+CALLER_PWD="$(pwd)"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -134,14 +135,45 @@ sys.exit(1)
 PY
 }
 
-# Enumerate all host processes running `<AgentVM-executable> daemon run --workspace <abs-path>`
-# strictly via `ps -axww -o pid=,command=` + `ps -p <pid> -o comm=` (never fuzzy pgrep/pkill).
-list_all_host_agentvm_daemons() {
+# Enumerate Virtualization.framework guest processes via `ps -axww -o pid=,comm=` (never fuzzy pgrep).
+list_host_vz_vm_pids() {
     /usr/bin/python3 - <<'PY'
+import os
+import subprocess
+import sys
+
+proc = subprocess.run(["ps", "-axww", "-o", "pid=,comm="], capture_output=True, text=True)
+if proc.returncode != 0:
+    sys.exit(0)
+
+pids = []
+for raw_line in proc.stdout.splitlines():
+    line = raw_line.strip()
+    if not line:
+        continue
+    parts = line.split(None, 1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        continue
+    comm_val = parts[1].strip()
+    if os.path.basename(comm_val) == "com.apple.Virtualization.VirtualMachine":
+        pids.append(int(parts[0]))
+
+for pid in sorted(set(pids)):
+    print(pid)
+PY
+}
+
+# Enumerate all host processes running `<AgentVM-executable> daemon run --workspace <abs-path>`
+# strictly via `ps -axww -o pid=,command=` + `ps -ww -p <pid> -o comm=` realpath check (never fuzzy pgrep/pkill).
+list_all_host_agentvm_daemons() {
+    /usr/bin/python3 - "${AGENTVM_BIN_RESOLVED:-}" <<'PY'
 import os
 import shlex
 import subprocess
 import sys
+
+expected_bin_raw = sys.argv[1].strip()
+expected_bin = os.path.realpath(expected_bin_raw) if expected_bin_raw else ""
 
 proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
 if proc.returncode != 0:
@@ -164,23 +196,27 @@ for raw_line in proc.stdout.splitlines():
         tokens = shlex.split(cmd_str)
     except ValueError:
         tokens = cmd_str.split()
-    if len(tokens) < 5:
+    if len(tokens) != 5:
         continue
     if tokens[1:4] != ["daemon", "run", "--workspace"] or not tokens[4].startswith("/"):
         continue
-    comm_proc = subprocess.run(["ps", "-p", pid_str, "-o", "comm="], capture_output=True, text=True)
+    comm_proc = subprocess.run(["ps", "-ww", "-p", pid_str, "-o", "comm="], capture_output=True, text=True)
     if comm_proc.returncode != 0:
         continue
     comm_val = comm_proc.stdout.strip()
-    if os.path.basename(comm_val).lower() == "agentvm":
-        found.append(f"{pid_str}\t{comm_val}\t{tokens[4]}")
+    if not comm_val:
+        continue
+    comm_real = os.path.realpath(comm_val)
+    if os.path.basename(comm_real).lower() == "agentvm" or (expected_bin and comm_real == expected_bin):
+        ws_real = os.path.realpath(tokens[4])
+        found.append(f"{pid_str}\t{comm_real}\t{ws_real}")
 
 for item in sorted(found):
     print(item)
 PY
 }
 
-# Find daemon PID(s) for one specific workspace whose `ps -p <pid> -o comm=` matches AGENTVM_BIN_RESOLVED.
+# Find daemon PID(s) for one specific workspace whose `ps -ww -p <pid> -o comm=` realpath equals AGENTVM_BIN_RESOLVED.
 find_workspace_daemon_pids() {
     local target_ws="$1"
     if [[ -z "$AGENTVM_BIN_RESOLVED" || -z "$target_ws" ]]; then
@@ -218,19 +254,19 @@ for raw_line in proc.stdout.splitlines():
         tokens = cmd_str.split()
     if len(tokens) != 5:
         continue
-    if tokens[1:4] != ["daemon", "run", "--workspace"]:
+    if tokens[1:4] != ["daemon", "run", "--workspace"] or not tokens[4].startswith("/"):
         continue
-    ws_arg = os.path.realpath(tokens[4]) if os.path.exists(tokens[4]) else os.path.abspath(tokens[4])
+    ws_arg = os.path.realpath(tokens[4])
     if ws_arg != target_ws:
         continue
-    comm_proc = subprocess.run(["ps", "-p", pid_str, "-o", "comm="], capture_output=True, text=True)
+    comm_proc = subprocess.run(["ps", "-ww", "-p", pid_str, "-o", "comm="], capture_output=True, text=True)
     if comm_proc.returncode != 0:
         continue
     comm_val = comm_proc.stdout.strip()
     if not comm_val:
         continue
-    comm_real = os.path.realpath(comm_val) if os.path.exists(comm_val) else comm_val
-    if comm_val == expected_bin or comm_real == expected_bin:
+    comm_real = os.path.realpath(comm_val)
+    if comm_real == expected_bin:
         matches.append(int(pid_str))
 
 for pid in sorted(set(matches)):
@@ -238,22 +274,20 @@ for pid in sorted(set(matches)):
 PY
 }
 
-# Record host-wide AgentVM daemon baseline BEFORE touching anything.
-HOST_DAEMONS_BEFORE="$(list_all_host_agentvm_daemons)"
-HOST_DAEMON_COUNT_BEFORE=0
-if [[ -n "$HOST_DAEMONS_BEFORE" ]]; then
-    HOST_DAEMON_COUNT_BEFORE="$(printf '%s\n' "$HOST_DAEMONS_BEFORE" | wc -l | tr -d ' ')"
-fi
-
-BASELINE_VZ_PIDS="$(pgrep -f 'com.apple.Virtualization.VirtualMachine' || true)"
-
 USER_SUPPLIED_BIN=0
 if [[ -n "${AGENTVM_BIN:-}" ]]; then
     USER_SUPPLIED_BIN=1
     AGENTVM_BIN_RESOLVED="$(
-        /usr/bin/python3 - "${AGENTVM_BIN}" <<'PY'
+        /usr/bin/python3 - "$CALLER_PWD" "$ROOT_DIR" "${AGENTVM_BIN}" <<'PY'
 import os, sys
-print(os.path.realpath(sys.argv[1]))
+
+caller_pwd, root_dir, raw_bin = sys.argv[1], sys.argv[2], sys.argv[3]
+if os.path.isabs(raw_bin):
+    candidate = raw_bin
+else:
+    from_caller = os.path.join(caller_pwd, raw_bin)
+    candidate = from_caller if os.path.exists(from_caller) else os.path.join(root_dir, raw_bin)
+print(os.path.realpath(candidate))
 PY
     )"
     if [[ ! -f "$AGENTVM_BIN_RESOLVED" || ! -x "$AGENTVM_BIN_RESOLVED" ]]; then
@@ -266,6 +300,32 @@ PY
     fi
 fi
 
+# Record host-wide AgentVM daemon baseline BEFORE touching anything.
+HOST_DAEMONS_BEFORE="$(list_all_host_agentvm_daemons)"
+HOST_DAEMON_COUNT_BEFORE=0
+if [[ -n "$HOST_DAEMONS_BEFORE" ]]; then
+    HOST_DAEMON_COUNT_BEFORE="$(printf '%s\n' "$HOST_DAEMONS_BEFORE" | wc -l | tr -d ' ')"
+fi
+
+BASELINE_VZ_PIDS="$(list_host_vz_vm_pids)"
+
+resolve_pid_comm_realpath() {
+    local target_pid="$1"
+    /usr/bin/python3 - "$target_pid" <<'PY'
+import os, subprocess, sys
+
+pid_str = sys.argv[1].strip()
+if not pid_str.isdigit():
+    sys.exit(0)
+proc = subprocess.run(["ps", "-ww", "-p", pid_str, "-o", "comm="], capture_output=True, text=True)
+if proc.returncode != 0:
+    sys.exit(0)
+comm_val = proc.stdout.strip()
+if comm_val:
+    print(os.path.realpath(comm_val))
+PY
+}
+
 is_pid_currently_agentvm_bin() {
     local target_pid="$1"
     if [[ -z "$AGENTVM_BIN_RESOLVED" || -z "$target_pid" ]]; then
@@ -274,9 +334,9 @@ is_pid_currently_agentvm_bin() {
     if ! kill -0 "$target_pid" 2>/dev/null; then
         return 1
     fi
-    local comm_out
-    comm_out="$(ps -p "$target_pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
-    [[ "$comm_out" == "$AGENTVM_BIN_RESOLVED" ]]
+    local comm_real
+    comm_real="$(resolve_pid_comm_realpath "$target_pid")"
+    [[ -n "$comm_real" && "$comm_real" == "$AGENTVM_BIN_RESOLVED" ]]
 }
 
 stop_tracked_workspaces_and_daemons() {
@@ -340,12 +400,60 @@ stop_tracked_workspaces_and_daemons() {
     done
 }
 
+sweep_own_darwin_temp_symlinks() {
+    if [[ -z "$TMP_ROOT" && -z "$RAW_TMP_ROOT" ]]; then
+        return 0
+    fi
+    local user_tmp_dir
+    user_tmp_dir="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+    if [[ -z "$user_tmp_dir" ]]; then
+        return 0
+    fi
+    /usr/bin/python3 - "$user_tmp_dir" "$TMP_ROOT" "$RAW_TMP_ROOT" <<'PY'
+import os, sys
+
+user_tmp = os.path.realpath(sys.argv[1])
+roots = []
+for r in sys.argv[2:]:
+    r = r.strip()
+    if r:
+        roots.append(r.rstrip("/"))
+        roots.append(os.path.realpath(r).rstrip("/"))
+roots = sorted(set(x for x in roots if x))
+
+if roots and os.path.isdir(user_tmp):
+    for name in os.listdir(user_tmp):
+        if not name.startswith("avm-"):
+            continue
+        full = os.path.join(user_tmp, name)
+        if not os.path.islink(full):
+            continue
+        try:
+            raw_target = os.readlink(full)
+        except OSError:
+            continue
+        resolved = os.path.realpath(os.path.join(user_tmp, raw_target))
+        if any(
+            raw_target == root
+            or raw_target.startswith(root + "/")
+            or resolved == root
+            or resolved.startswith(root + "/")
+            for root in roots
+        ):
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+PY
+}
+
 cleanup() {
     if [[ $CLEANUP_DONE -eq 1 ]]; then
         return 0
     fi
     CLEANUP_DONE=1
     stop_tracked_workspaces_and_daemons
+    sweep_own_darwin_temp_symlinks
     if [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" ]]; then
         rm -rf "$TMP_ROOT"
     fi
@@ -639,8 +747,9 @@ fi
 
 # ------------------------------------------------------------------
 # Row 4: `out=$(agentvm daemon start)` -> exits 0 in < 5s; `daemon status --json` gives pid;
-#        `ps -o ppid=,pgid=,comm= -p <pid>` shows ppid=1, pgid==pid, comm==AGENTVM_BIN
+#        `ps -o ppid=,pgid=,comm= -p <pid>` shows ppid=1, pgid==pid, realpath(comm)==AGENTVM_BIN
 # ------------------------------------------------------------------
+ensure_cli_subcommand --lang en --workspace "$WS" daemon start
 r4_t0="$(now_sec)"
 r4_rc=0
 r4_sub_out="$(
@@ -648,7 +757,8 @@ r4_sub_out="$(
         HOME="$ISOLATED_HOME" \
         CFFIXED_USER_HOME="$ISOLATED_HOME" \
         AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
-        /usr/bin/perl -e 'alarm 15; exec @ARGV' \
+        /usr/bin/perl -e 'alarm $ARGV[0]; shift @ARGV; exec @ARGV' \
+        "$CMD_TIMEOUT_SEC" \
         "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" daemon start
 )" || r4_rc=$?
 r4_t1="$(now_sec)"
@@ -670,20 +780,20 @@ fi
 
 r4_ppid=""
 r4_pgid=""
-r4_comm=""
+r4_comm_real=""
 if [[ -n "$r4_pid" ]] && kill -0 "$r4_pid" 2>/dev/null; then
     r4_ps_line="$(ps -ww -o ppid=,pgid=,comm= -p "$r4_pid" 2>/dev/null || true)"
     r4_ppid="$(printf '%s\n' "$r4_ps_line" | awk '{print $1}')"
     r4_pgid="$(printf '%s\n' "$r4_ps_line" | awk '{print $2}')"
-    r4_comm="$(ps -p "$r4_pid" -o comm= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+    r4_comm_real="$(resolve_pid_comm_realpath "$r4_pid")"
 fi
 
 if [[ $r4_rc -eq 0 && $r4_under_5s -eq 1 && $r4_status_rc -eq 0 \
     && -n "$r4_pid" && "$r4_ppid" == "1" && "$r4_pgid" == "$r4_pid" \
-    && "$r4_comm" == "$AGENTVM_BIN_RESOLVED" ]]; then
-    pass_row 4 "command substitution returned in ${r4_elapsed}s (<5s); pid=$r4_pid has ppid=1, pgid=$r4_pgid, comm==AGENTVM_BIN."
+    && "$r4_comm_real" == "$AGENTVM_BIN_RESOLVED" ]]; then
+    pass_row 4 "command substitution returned in ${r4_elapsed}s (<5s); pid=$r4_pid has ppid=1, pgid=$r4_pgid, realpath(comm)==AGENTVM_BIN."
 else
-    fail_row 4 "rc=$r4_rc, elapsed=${r4_elapsed}s, status_rc=$r4_status_rc, pid='$r4_pid', ppid='$r4_ppid', pgid='$r4_pgid', comm='$r4_comm', expected='$AGENTVM_BIN_RESOLVED', out='$r4_sub_out'"
+    fail_row 4 "rc=$r4_rc, elapsed=${r4_elapsed}s, status_rc=$r4_status_rc, pid='$r4_pid', ppid='$r4_ppid', pgid='$r4_pgid', comm_real='$r4_comm_real', expected='$AGENTVM_BIN_RESOLVED', out='$r4_sub_out'"
 fi
 
 # ------------------------------------------------------------------
@@ -705,6 +815,7 @@ fi
 run_cli "$TMP_ROOT/r6-prestop.out" "$TMP_ROOT/r6-prestop.err" --lang en --workspace "$WS" daemon stop
 r6_prestop_rc=$LAST_RC
 
+ensure_cli_subcommand --lang en --workspace "$WS" daemon start --json
 r6_bg_pids=()
 for k in 1 2 3 4 5; do
     (
@@ -712,7 +823,8 @@ for k in 1 2 3 4 5; do
             HOME="$ISOLATED_HOME" \
             CFFIXED_USER_HOME="$ISOLATED_HOME" \
             AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
-            /usr/bin/perl -e 'alarm 25; exec @ARGV' \
+            /usr/bin/perl -e 'alarm $ARGV[0]; shift @ARGV; exec @ARGV' \
+            "$CMD_TIMEOUT_SEC" \
             "$AGENTVM_BIN_RESOLVED" --lang en --workspace "$WS" daemon start --json \
             >"$TMP_ROOT/r6-$k.json" 2>"$TMP_ROOT/r6-$k.err"
     ) &

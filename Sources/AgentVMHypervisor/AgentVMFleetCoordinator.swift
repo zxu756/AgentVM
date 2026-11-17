@@ -309,6 +309,8 @@ public actor AgentVMFleetCoordinator {
     private var executionBackend: HypervisorExecutionBackend
     private var vsockSessions: [VMID: VsockMultiplexSession] = [:]
     private var vsockSessionTokens: [VMID: UUID] = [:]
+    private var inFlightVsockAttachTokens: [VMID: UUID] = [:]
+    private var disconnectedInFlightVsockTokens: Set<UUID> = []
     private var vsockGenerationCounters: [VMID: UInt64] = [:]
     private var negotiatedGuestAgentVersions: [VMID: String] = [:]
     private var latestGuestHeartbeats: [VMID: LiveGuestHeartbeatSample] = [:]
@@ -1718,6 +1720,7 @@ public actor AgentVMFleetCoordinator {
         func rollbackFailedBootAndReleaseLockIfNeeded(vmFD: Int32?) async {
             vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
             heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+            inFlightVsockAttachTokens.removeValue(forKey: vmID)
             vsockSessionTokens.removeValue(forKey: vmID)
             negotiatedGuestAgentVersions.removeValue(forKey: vmID)
             latestGuestHeartbeats.removeValue(forKey: vmID)
@@ -1857,9 +1860,10 @@ public actor AgentVMFleetCoordinator {
         }
 
         let session: VsockMultiplexSession
+        let sessionToken: UUID
         do {
             vsockGenerationCounters[vmID] = 0
-            session = try await attachManagedVsockSession(
+            (session, sessionToken) = try await attachManagedVsockSession(
                 vmID: vmID,
                 boxToken: boxToken,
                 descriptor: connectedDescriptor,
@@ -1873,6 +1877,10 @@ public actor AgentVMFleetCoordinator {
 
         hardwareBoxes[vmID] = box
         hardwareBoxTokens[vmID] = boxToken
+        inFlightVsockAttachTokens.removeValue(forKey: vmID)
+        vsockSessions[vmID] = session
+        vsockSessionTokens[vmID] = sessionToken
+        vsockGenerationCounters[vmID] = (vsockGenerationCounters[vmID] ?? 0) &+ 1
 
         onProgress?("Guest agent connected on vsock port \(guestPort) (attempt \(attempt)).")
         tty.feed("[VZBoot] Started Apple Virtualization.framework guest '\(record.spec.name)'.\r\n")
@@ -2154,6 +2162,7 @@ public actor AgentVMFleetCoordinator {
         }
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+        inFlightVsockAttachTokens.removeValue(forKey: vmID)
         vsockSessionTokens.removeValue(forKey: vmID)
         negotiatedGuestAgentVersions.removeValue(forKey: vmID)
         latestGuestHeartbeats.removeValue(forKey: vmID)
@@ -2230,6 +2239,7 @@ public actor AgentVMFleetCoordinator {
         guard hardwareBoxTokens[vmID] == boxToken else { return }
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+        inFlightVsockAttachTokens.removeValue(forKey: vmID)
         vsockSessionTokens.removeValue(forKey: vmID)
         negotiatedGuestAgentVersions.removeValue(forKey: vmID)
         latestGuestHeartbeats.removeValue(forKey: vmID)
@@ -2255,6 +2265,7 @@ public actor AgentVMFleetCoordinator {
         hardwareBoxTokens.removeValue(forKey: vmID)
         vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
         heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+        inFlightVsockAttachTokens.removeValue(forKey: vmID)
         vsockSessionTokens.removeValue(forKey: vmID)
         negotiatedGuestAgentVersions.removeValue(forKey: vmID)
         latestGuestHeartbeats.removeValue(forKey: vmID)
@@ -2413,9 +2424,7 @@ public actor AgentVMFleetCoordinator {
         receivedUptimeNs: UInt64,
         persistState: Bool
     ) async {
-        guard hardwareBoxTokens[vmID] == boxToken,
-              vsockSessionTokens[vmID] == sessionToken,
-              let session = vsockSessions[vmID] else {
+        guard hardwareBoxTokens[vmID] == boxToken else {
             return
         }
         let sample = LiveGuestHeartbeatSample(
@@ -2426,6 +2435,18 @@ public actor AgentVMFleetCoordinator {
         )
         if let existing = latestGuestHeartbeats[vmID],
            existing.receivedUptimeNanoseconds > receivedUptimeNs {
+            return
+        }
+
+        // While a vsock session is still completing handshake / pre-publish setup (cold boot or reconnect),
+        // buffer the sample in memory without flipping `guestAgentConnected` or persisting to SQLite prematurely.
+        if inFlightVsockAttachTokens[vmID] == sessionToken {
+            latestGuestHeartbeats[vmID] = sample
+            return
+        }
+
+        guard vsockSessionTokens[vmID] == sessionToken,
+              let session = vsockSessions[vmID] else {
             return
         }
 
@@ -2483,11 +2504,15 @@ public actor AgentVMFleetCoordinator {
         persistState: Bool
     ) async {
         guard hardwareBoxTokens[vmID] == boxToken,
-              vsockSessionTokens[vmID] == sessionToken else {
+              vsockSessionTokens[vmID] == sessionToken || inFlightVsockAttachTokens[vmID] == sessionToken else {
             return
         }
         negotiatedGuestAgentVersions[vmID] = version
-        guard persistState, !inFlightHardwareBoots.contains(vmID) else { return }
+        guard persistState,
+              !inFlightHardwareBoots.contains(vmID),
+              vsockSessionTokens[vmID] == sessionToken else {
+            return
+        }
         if var record = try? await store.fetchVM(vmID),
            hardwareBoxTokens[vmID] == boxToken,
            vsockSessionTokens[vmID] == sessionToken,
@@ -2504,14 +2529,16 @@ public actor AgentVMFleetCoordinator {
         descriptor: HardwareVsockFDDescriptor,
         persistState: Bool,
         vmSpec: VMSpec
-    ) async throws -> VsockMultiplexSession {
+    ) async throws -> (session: VsockMultiplexSession, sessionToken: UUID) {
         let sessionToken = UUID()
         let session = VsockMultiplexSession(vmID: vmID)
         heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
         negotiatedGuestAgentVersions.removeValue(forKey: vmID)
         latestGuestHeartbeats.removeValue(forKey: vmID)
-        vsockSessions[vmID] = session
-        vsockSessionTokens[vmID] = sessionToken
+        inFlightVsockAttachTokens[vmID] = sessionToken
+        defer {
+            disconnectedInFlightVsockTokens.remove(sessionToken)
+        }
 
         await session.setControlPongObserver { [weak self] pong in
             guard let self else { return }
@@ -2550,10 +2577,9 @@ public actor AgentVMFleetCoordinator {
                 }
             )
         } catch {
-            if vsockSessionTokens[vmID] == sessionToken {
+            if inFlightVsockAttachTokens[vmID] == sessionToken {
+                inFlightVsockAttachTokens.removeValue(forKey: vmID)
                 heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
-                vsockSessionTokens.removeValue(forKey: vmID)
-                vsockSessions.removeValue(forKey: vmID)
                 negotiatedGuestAgentVersions.removeValue(forKey: vmID)
                 latestGuestHeartbeats.removeValue(forKey: vmID)
             }
@@ -2563,7 +2589,6 @@ public actor AgentVMFleetCoordinator {
 
         let tty = ensureTerminalBuffer(for: vmID)
         await session.attachTerminalScreenBuffer(tty)
-        vsockGenerationCounters[vmID] = (vsockGenerationCounters[vmID] ?? 0) &+ 1
 
         // Perform initial control `ping` handshake on every vsock connection (including Stage 3b reconnects)
         // to record the peer's `agentVersion` ("2" or legacy "1.0.0") in the daemon (Fixes A46 & A50).
@@ -2581,7 +2606,22 @@ public actor AgentVMFleetCoordinator {
         for rule in vmSpec.portForwards where rule.enabled {
             _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
         }
-        return session
+
+        if disconnectedInFlightVsockTokens.contains(sessionToken)
+            || inFlightVsockAttachTokens[vmID] != sessionToken
+            || (hardwareBoxTokens[vmID] != nil && hardwareBoxTokens[vmID] != boxToken) {
+            if inFlightVsockAttachTokens[vmID] == sessionToken {
+                inFlightVsockAttachTokens.removeValue(forKey: vmID)
+                heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+                negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+                latestGuestHeartbeats.removeValue(forKey: vmID)
+            }
+            await portForwardManager.stopAllRules(for: vmID)
+            await session.shutdown()
+            throw VsockProtocolError.transportClosed("Vsock session disconnected before publish")
+        }
+
+        return (session, sessionToken)
     }
 
     private func handleVsockTransportDisconnected(
@@ -2590,6 +2630,14 @@ public actor AgentVMFleetCoordinator {
         sessionToken: UUID,
         persistState: Bool
     ) async {
+        if inFlightVsockAttachTokens[vmID] == sessionToken {
+            inFlightVsockAttachTokens.removeValue(forKey: vmID)
+            disconnectedInFlightVsockTokens.insert(sessionToken)
+            heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+            negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+            latestGuestHeartbeats.removeValue(forKey: vmID)
+            return
+        }
         guard hardwareBoxTokens[vmID] == boxToken,
               vsockSessionTokens[vmID] == sessionToken else {
             return
@@ -2685,46 +2733,88 @@ public actor AgentVMFleetCoordinator {
                     return
                 }
 
-                let newSession = try await attachManagedVsockSession(
+                let (newSession, sessionToken) = try await attachManagedVsockSession(
                     vmID: vmID,
                     boxToken: boxToken,
                     descriptor: desc,
                     persistState: true,
                     vmSpec: currentRecord.spec
                 )
-                let generation = vsockGenerationCounters[vmID] ?? 1
-                if var refreshed = try? await store.fetchVM(vmID),
-                   refreshed.telemetry.state != .stopped {
-                    refreshed.telemetry.guestAgentConnected = true
-                    refreshed.telemetry.vsockStreamsOpen = await newSession.openStreamCount()
-                    refreshed.telemetry.guestAgentVersion = negotiatedGuestAgentVersions[vmID]
-                    if refreshed.telemetry.state == .running,
-                       let sample = latestGuestHeartbeats[vmID],
-                       vsockSessionTokens[vmID] == sample.sessionToken {
-                        Self.mapHeartbeatPayload(sample.payload, receivedAt: sample.receivedAt, onto: &refreshed.telemetry)
+                let openStreams = await newSession.openStreamCount()
+                guard !Task.isCancelled,
+                      hardwareBoxTokens[vmID] == boxToken,
+                      hardwareBoxes[vmID] != nil,
+                      box.prematureStopReason() == nil,
+                      var refreshed = try? await store.fetchVM(vmID),
+                      refreshed.telemetry.state != .stopped else {
+                    if inFlightVsockAttachTokens[vmID] == sessionToken {
+                        inFlightVsockAttachTokens.removeValue(forKey: vmID)
+                        heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+                        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+                        latestGuestHeartbeats.removeValue(forKey: vmID)
                     }
-                    stampRuntimeOrigin(&refreshed)
-                    try? await store.upsertVM(refreshed)
-
-                    let vmName = refreshed.spec.name
-                    let zhMsg = "客户机「\(vmName)」的 vsock 守护连接在断开后已重新连上（端口 \(guestPort)，第 \(attempt) 次重连尝试，连接代数 \(generation)；如客户机原地 reboot 或守护服务重启）。"
-                    let enMsg = "Reconnected guest agent vsock on VM '\(vmName)' after disconnect (port \(guestPort), attempt \(attempt), generation \(generation); e.g. in-place guest reboot or agent restart)."
-                    try? await store.appendDiagnostic(DiagnosticEvent(
-                        severity: .notice,
-                        subsystem: "VsockRPC",
-                        vmID: vmID,
-                        code: "VSOCK_RECONNECTED",
-                        message: enMsg,
-                        metadata: [
-                            "vmName": vmName,
-                            "port": "\(guestPort)",
-                            "attempt": "\(attempt)",
-                            "generation": "\(generation)",
-                            "message_zh": zhMsg,
-                            "message_en": enMsg
-                        ]
-                    ))
+                    await portForwardManager.stopAllRules(for: vmID)
+                    await newSession.shutdown()
+                    return
                 }
+
+                let generation = (vsockGenerationCounters[vmID] ?? 0) &+ 1
+                let vmName = refreshed.spec.name
+                let zhMsg = "客户机「\(vmName)」的 vsock 守护连接在断开后已重新连上（端口 \(guestPort)，第 \(attempt) 次重连尝试，连接代数 \(generation)；如客户机原地 reboot 或守护服务重启）。"
+                let enMsg = "Reconnected guest agent vsock on VM '\(vmName)' after disconnect (port \(guestPort), attempt \(attempt), generation \(generation); e.g. in-place guest reboot or agent restart)."
+                try? await store.appendDiagnostic(DiagnosticEvent(
+                    severity: .notice,
+                    subsystem: "VsockRPC",
+                    vmID: vmID,
+                    code: "VSOCK_RECONNECTED",
+                    message: enMsg,
+                    metadata: [
+                        "vmName": vmName,
+                        "port": "\(guestPort)",
+                        "attempt": "\(attempt)",
+                        "generation": "\(generation)",
+                        "message_zh": zhMsg,
+                        "message_en": enMsg
+                    ]
+                ))
+
+                guard !Task.isCancelled,
+                      hardwareBoxTokens[vmID] == boxToken,
+                      hardwareBoxes[vmID] != nil,
+                      box.prematureStopReason() == nil else {
+                    if inFlightVsockAttachTokens[vmID] == sessionToken {
+                        inFlightVsockAttachTokens.removeValue(forKey: vmID)
+                        heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+                        negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+                        latestGuestHeartbeats.removeValue(forKey: vmID)
+                    }
+                    await portForwardManager.stopAllRules(for: vmID)
+                    await newSession.shutdown()
+                    return
+                }
+
+                inFlightVsockAttachTokens.removeValue(forKey: vmID)
+                vsockSessions[vmID] = newSession
+                vsockSessionTokens[vmID] = sessionToken
+                vsockGenerationCounters[vmID] = generation
+
+                refreshed.telemetry.guestAgentConnected = true
+                refreshed.telemetry.vsockStreamsOpen = openStreams
+                refreshed.telemetry.guestAgentVersion = negotiatedGuestAgentVersions[vmID]
+                if refreshed.telemetry.state == .running,
+                   let sample = latestGuestHeartbeats[vmID],
+                   sample.sessionToken == sessionToken {
+                    Self.mapHeartbeatPayload(sample.payload, receivedAt: sample.receivedAt, onto: &refreshed.telemetry)
+                    scheduleHeartbeatExpiryWatchdog(
+                        vmID: vmID,
+                        boxToken: boxToken,
+                        sessionToken: sessionToken,
+                        expectedUptimeNs: sample.receivedUptimeNanoseconds,
+                        persistState: true
+                    )
+                }
+                stampRuntimeOrigin(&refreshed)
+                try? await store.upsertVM(refreshed)
                 vsockReconnectTasks.removeValue(forKey: vmID)
                 return
             } catch {

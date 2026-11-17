@@ -230,14 +230,35 @@ public struct HardwareVsockFDDescriptor: Sendable {
     }
 }
 
+public enum HardwareVMStopEvent: Sendable, Equatable {
+    case guestDidStop
+    case didStopWithError(String)
+}
+
+public enum HardwareVMShutdownDisposition: String, Sendable, Equatable {
+    case guestShutdown = "guest-shutdown"
+    case hardStop = "hard-stop"
+}
+
 public protocol HardwareVMInstanceHandle: Sendable {
     func prematureStopReason() -> String?
+    func setStopObserver(_ observer: (@Sendable (HardwareVMStopEvent) -> Void)?)
     func connectVsock(port: UInt32) async throws -> HardwareVsockFDDescriptor
     func closeVsockConnection() async
     func pause() async throws
     func resume() async throws
     func saveMachineState(to url: URL) async throws
     func shutdown(gracefulTimeoutNanoseconds: UInt64) async
+    func shutdownReportingDisposition(gracefulTimeoutNanoseconds: UInt64) async -> HardwareVMShutdownDisposition
+}
+
+extension HardwareVMInstanceHandle {
+    public func setStopObserver(_ observer: (@Sendable (HardwareVMStopEvent) -> Void)?) {}
+
+    public func shutdownReportingDisposition(gracefulTimeoutNanoseconds: UInt64) async -> HardwareVMShutdownDisposition {
+        await shutdown(gracefulTimeoutNanoseconds: gracefulTimeoutNanoseconds)
+        return .guestShutdown
+    }
 }
 
 public protocol HardwareVMLowLevelBackend: Sendable {
@@ -275,6 +296,8 @@ public actor AgentVMFleetCoordinator {
     private var vsockSessions: [VMID: VsockMultiplexSession] = [:]
     private var terminalBuffers: [VMID: VT100ScreenBuffer] = [:]
     private var hardwareBoxes: [VMID: any HardwareVMInstanceHandle] = [:]
+    private var hardwareBoxTokens: [VMID: UUID] = [:]
+    private var vsockReconnectTasks: [VMID: Task<Void, Never>] = [:]
     private var bootTimestamps: [VMID: Date] = [:]
     private var heldExecutionLocks: [VMID: VMExecutionLock] = [:]
     private var activeOneShotLocks: Set<VMID> = []
@@ -288,7 +311,10 @@ public actor AgentVMFleetCoordinator {
         var vsockConnection: VZVirtioSocketConnection?
 
         private let stateLock = NSLock()
+        private var hostShutdownInitiated = false
         private var stopReasonStorage: String?
+        private var stopEventStorage: HardwareVMStopEvent?
+        private var stopObserver: (@Sendable (HardwareVMStopEvent) -> Void)?
         private var stopWaiters: [UUID: CheckedContinuation<String?, Never>] = [:]
 
         init(queue: DispatchQueue, vm: VZVirtualMachine? = nil) {
@@ -297,24 +323,56 @@ public actor AgentVMFleetCoordinator {
         }
 
         func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-            recordStop(reason: "guestDidStop")
+            recordStop(reason: "guestDidStop", spontaneousEvent: .guestDidStop)
         }
 
         func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
-            recordStop(reason: "didStopWithError: \(error.localizedDescription)")
+            let errDetail = error.localizedDescription
+            recordStop(reason: "didStopWithError: \(errDetail)", spontaneousEvent: .didStopWithError(errDetail))
         }
 
-        private func recordStop(reason: String) {
-            let waiters = stateLock.withLock { () -> [CheckedContinuation<String?, Never>] in
+        func setStopObserver(_ observer: (@Sendable (HardwareVMStopEvent) -> Void)?) {
+            let immediateEvent: HardwareVMStopEvent? = stateLock.withLock {
+                if hostShutdownInitiated {
+                    stopObserver = nil
+                    return nil
+                }
+                if let already = stopEventStorage {
+                    stopObserver = nil
+                    return already
+                }
+                stopObserver = observer
+                return nil
+            }
+            if let immediateEvent, let observer {
+                observer(immediateEvent)
+            }
+        }
+
+        private func recordStop(reason: String, spontaneousEvent: HardwareVMStopEvent?) {
+            let (waiters, observerToNotify) = stateLock.withLock { () -> ([CheckedContinuation<String?, Never>], (@Sendable (HardwareVMStopEvent) -> Void)?) in
                 if stopReasonStorage == nil {
                     stopReasonStorage = reason
                 }
+                if stopEventStorage == nil, let spontaneousEvent {
+                    stopEventStorage = spontaneousEvent
+                }
                 let current = Array(stopWaiters.values)
                 stopWaiters.removeAll()
-                return current
+                let obs: (@Sendable (HardwareVMStopEvent) -> Void)?
+                if !hostShutdownInitiated, spontaneousEvent != nil {
+                    obs = stopObserver
+                    stopObserver = nil
+                } else {
+                    obs = nil
+                }
+                return (current, obs)
             }
             for waiter in waiters {
                 waiter.resume(returning: reason)
+            }
+            if let observerToNotify, let spontaneousEvent {
+                observerToNotify(spontaneousEvent)
             }
         }
 
@@ -447,10 +505,19 @@ public actor AgentVMFleetCoordinator {
         }
 
         func shutdown(gracefulTimeoutNanoseconds: UInt64) async {
+            _ = await shutdownReportingDisposition(gracefulTimeoutNanoseconds: gracefulTimeoutNanoseconds)
+        }
+
+        func shutdownReportingDisposition(gracefulTimeoutNanoseconds: UInt64) async -> HardwareVMShutdownDisposition {
             enum StopStep {
                 case alreadyStopped
                 case requestedGracefulStop
                 case needsHardStop
+            }
+
+            stateLock.withLock {
+                hostShutdownInitiated = true
+                stopObserver = nil
             }
 
             let step: StopStep = await withCheckedContinuation { cont in
@@ -458,12 +525,12 @@ public actor AgentVMFleetCoordinator {
                     self.vsockConnection?.close()
                     self.vsockConnection = nil
                     guard let machine = self.vm else {
-                        self.recordStop(reason: "no-vm")
+                        self.recordStop(reason: "no-vm", spontaneousEvent: nil)
                         cont.resume(returning: .alreadyStopped)
                         return
                     }
                     if machine.state == .stopped {
-                        self.recordStop(reason: "already-stopped")
+                        self.recordStop(reason: "already-stopped", spontaneousEvent: nil)
                         cont.resume(returning: .alreadyStopped)
                         return
                     }
@@ -480,6 +547,7 @@ public actor AgentVMFleetCoordinator {
                 }
             }
 
+            var disposition: HardwareVMShutdownDisposition = .guestShutdown
             var stoppedGracefully = (step == .alreadyStopped)
             if step == .requestedGracefulStop {
                 if await waitForStop(timeoutNanoseconds: gracefulTimeoutNanoseconds) != nil {
@@ -488,15 +556,23 @@ public actor AgentVMFleetCoordinator {
             }
 
             if !stoppedGracefully {
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                disposition = await withCheckedContinuation { (cont: CheckedContinuation<HardwareVMShutdownDisposition, Never>) in
                     queue.async {
-                        guard let machine = self.vm, machine.state != .stopped, machine.canStop else {
-                            cont.resume()
+                        guard let machine = self.vm else {
+                            cont.resume(returning: .guestShutdown)
+                            return
+                        }
+                        if machine.state == .stopped {
+                            cont.resume(returning: .guestShutdown)
+                            return
+                        }
+                        guard machine.canStop else {
+                            cont.resume(returning: .hardStop)
                             return
                         }
                         machine.stop { _ in
-                            self.recordStop(reason: "hard-stop")
-                            cont.resume()
+                            self.recordStop(reason: "hard-stop", spontaneousEvent: nil)
+                            cont.resume(returning: .hardStop)
                         }
                     }
                 }
@@ -509,6 +585,7 @@ public actor AgentVMFleetCoordinator {
                     cont.resume()
                 }
             }
+            return disposition
         }
     }
 
@@ -643,16 +720,14 @@ public actor AgentVMFleetCoordinator {
     }
 
     public static func localizedDiagnosticMessage(for event: DiagnosticEvent, in language: AppLanguage) -> String {
-        if event.code == "VM_RUNTIME_LOST" || event.code == "EXEC_OUTPUT_BUFFER_OVERFLOW" || event.code == "AUTO_CHECKPOINT_SKIPPED_UNTIL_M3" {
-            if language == .zhHans, let zh = event.metadata["message_zh"], !zh.isEmpty {
-                return zh
-            }
-            if language == .en, let en = event.metadata["message_en"], !en.isEmpty {
-                return en
-            }
-            if event.code == "VM_RUNTIME_LOST", let vmName = event.metadata["vmName"], !vmName.isEmpty {
-                return vmRuntimeLostMessage(vmName: vmName, language: language)
-            }
+        if language == .zhHans, let zh = event.metadata["message_zh"], !zh.isEmpty {
+            return zh
+        }
+        if language == .en, let en = event.metadata["message_en"], !en.isEmpty {
+            return en
+        }
+        if event.code == "VM_RUNTIME_LOST", let vmName = event.metadata["vmName"], !vmName.isEmpty {
+            return vmRuntimeLostMessage(vmName: vmName, language: language)
         }
         return event.message
     }
@@ -785,17 +860,23 @@ public actor AgentVMFleetCoordinator {
     }
 
     /// Gracefully shuts down all VMs held by this daemon process (`daemon stop` / `SIGTERM` / `SIGINT`).
-    public func shutdownAllDaemonHeldVMs() async -> [VMID] {
+    public func shutdownAllDaemonHeldVMs(language: AppLanguage = .en) async -> [VMID] {
         let heldIDs = Set(hardwareBoxes.keys).union(heldExecutionLocks.keys).sorted()
         guard !heldIDs.isEmpty else { return [] }
-        var stopped: [VMID] = []
-        stopped.reserveCapacity(heldIDs.count)
-        for vmID in heldIDs {
-            if (try? await haltVM(vmID)) != nil {
-                stopped.append(vmID)
+        var stoppedSet = Set<VMID>()
+        await withTaskGroup(of: VMID?.self) { group in
+            for vmID in heldIDs {
+                group.addTask {
+                    (try? await self.haltVM(vmID, language: language)) != nil ? vmID : nil
+                }
+            }
+            for await maybeID in group {
+                if let id = maybeID {
+                    stoppedSet.insert(id)
+                }
             }
         }
-        return stopped
+        return heldIDs.filter { stoppedSet.contains($0) }
     }
 
     private func ownsExecutionLock(for vmID: VMID) -> Bool {
@@ -1553,7 +1634,10 @@ public actor AgentVMFleetCoordinator {
         defer { inFlightHardwareBoots.remove(vmID) }
 
         func rollbackFailedBootAndReleaseLockIfNeeded(vmFD: Int32?) async {
+            vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+            hardwareBoxTokens.removeValue(forKey: vmID)
             if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
+                ownedBox.setStopObserver(nil)
                 let stopTimeout = gracefulStopTimeoutNanoseconds
                 await Task {
                     await ownedBox.closeVsockConnection()
@@ -1599,6 +1683,7 @@ public actor AgentVMFleetCoordinator {
 
         onProgress?("Booting VM '\(record.spec.name)' via Apple Virtualization.framework (console log: \(resolvedConsoleLogURL.path))...")
 
+        let boxToken = UUID()
         let box: any HardwareVMInstanceHandle
         do {
             box = try await hardwareBackend.startMachine(
@@ -1608,6 +1693,7 @@ public actor AgentVMFleetCoordinator {
                 translator: vzTranslator
             )
             hardwareBoxes[vmID] = box
+            hardwareBoxTokens[vmID] = boxToken
         } catch {
             await rollbackFailedBootAndReleaseLockIfNeeded(vmFD: vmFD)
             throw error
@@ -1692,6 +1778,7 @@ public actor AgentVMFleetCoordinator {
 
         await session.attachTerminalScreenBuffer(tty)
         hardwareBoxes[vmID] = box
+        hardwareBoxTokens[vmID] = boxToken
         vsockSessions[vmID] = session
 
         for rule in record.spec.portForwards where rule.enabled {
@@ -1721,6 +1808,18 @@ public actor AgentVMFleetCoordinator {
             code: "VM_BOOTED",
             message: "Booted VM '\(record.spec.name)' via Virtualization.framework and connected vsock port \(guestPort)."
         ))
+
+        box.setStopObserver { [weak self] stopEvent in
+            guard let self else { return }
+            Task {
+                await self.notifyHardwareBoxStopped(
+                    vmID: vmID,
+                    boxToken: boxToken,
+                    persistStoppedState: persistRunningState,
+                    event: stopEvent
+                )
+            }
+        }
 
         return record
     }
@@ -1910,6 +2009,7 @@ public actor AgentVMFleetCoordinator {
             try await self.haltVMUnlocked(
                 vmID,
                 releaseHeldLock: true,
+                recordStopDiagnostic: true,
                 language: language,
                 onProgress: onProgress
             )
@@ -1919,6 +2019,7 @@ public actor AgentVMFleetCoordinator {
     private func haltVMUnlocked(
         _ vmID: VMID,
         releaseHeldLock: Bool,
+        recordStopDiagnostic: Bool = false,
         language: AppLanguage = .en,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> VMInstanceRecord {
@@ -1942,14 +2043,18 @@ public actor AgentVMFleetCoordinator {
                 record = reconciled
             }
         }
+        vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+        hardwareBoxTokens.removeValue(forKey: vmID)
         await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
             await session.shutdown()
         }
+        var shutdownDisposition: HardwareVMShutdownDisposition?
         if let box = hardwareBoxes.removeValue(forKey: vmID) {
+            box.setStopObserver(nil)
             onProgress?("Shutting down VM '\(record.spec.name)'...")
             await box.closeVsockConnection()
-            await box.shutdown(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
+            shutdownDisposition = await box.shutdownReportingDisposition(gracefulTimeoutNanoseconds: gracefulStopTimeoutNanoseconds)
         }
         await l2Switch.detachPort(for: vmID)
         bootTimestamps.removeValue(forKey: vmID)
@@ -1967,7 +2072,134 @@ public actor AgentVMFleetCoordinator {
             }
         }
         try await store.upsertVM(record)
+
+        if recordStopDiagnostic, !isSimulationBackend, let disposition = shutdownDisposition {
+            let reasonStr = disposition.rawValue
+            let zhMsg: String
+            let enMsg: String
+            let sev: DiagnosticSeverity
+            switch disposition {
+            case .guestShutdown:
+                sev = .info
+                zhMsg = "虚拟机「\(record.spec.name)」已正常关机（原因：\(reasonStr)）。"
+                enMsg = "Stopped VM '\(record.spec.name)' cleanly (reason: \(reasonStr))."
+            case .hardStop:
+                sev = .warning
+                zhMsg = "虚拟机「\(record.spec.name)」在优雅关机超时后已强制停机（原因：\(reasonStr)）。"
+                enMsg = "Force-stopped VM '\(record.spec.name)' after graceful shutdown timed out (reason: \(reasonStr))."
+            }
+            try await store.appendDiagnostic(DiagnosticEvent(
+                severity: sev,
+                subsystem: "Hypervisor",
+                vmID: vmID,
+                code: "VM_STOPPED",
+                message: (language == .zhHans) ? zhMsg : enMsg,
+                metadata: [
+                    "vmName": record.spec.name,
+                    "reason": reasonStr,
+                    "message_zh": zhMsg,
+                    "message_en": enMsg
+                ]
+            ))
+        }
         return record
+    }
+
+    private func notifyHardwareBoxStopped(
+        vmID: VMID,
+        boxToken: UUID,
+        persistStoppedState: Bool,
+        event: HardwareVMStopEvent
+    ) async {
+        guard hardwareBoxTokens[vmID] == boxToken else { return }
+        vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+        if let session = vsockSessions.removeValue(forKey: vmID) {
+            await session.shutdown()
+        }
+        guard persistStoppedState else { return }
+        _ = try? await enqueueVMLifecycleOperation(for: vmID) {
+            try await self.completeSpontaneousHardwareStopUnlocked(
+                vmID: vmID,
+                boxToken: boxToken,
+                event: event
+            )
+        }
+    }
+
+    private func completeSpontaneousHardwareStopUnlocked(
+        vmID: VMID,
+        boxToken: UUID,
+        event: HardwareVMStopEvent
+    ) async throws {
+        guard hardwareBoxTokens[vmID] == boxToken else { return }
+        hardwareBoxTokens.removeValue(forKey: vmID)
+        vsockReconnectTasks.removeValue(forKey: vmID)?.cancel()
+
+        await portForwardManager.stopAllRules(for: vmID)
+        if let session = vsockSessions.removeValue(forKey: vmID) {
+            await session.shutdown()
+        }
+        if let box = hardwareBoxes.removeValue(forKey: vmID) {
+            box.setStopObserver(nil)
+            await box.closeVsockConnection()
+            await box.shutdown(gracefulTimeoutNanoseconds: 0)
+        }
+        await l2Switch.detachPort(for: vmID)
+        bootTimestamps.removeValue(forKey: vmID)
+
+        defer {
+            heldExecutionLocks.removeValue(forKey: vmID)?.release()
+        }
+
+        if var record = try await store.fetchVM(vmID) {
+            record.telemetry.state = .stopped
+            record.telemetry.cpuUsagePercent = 0
+            record.telemetry.memoryResidentMB = 0
+            record.telemetry.hasLiveGuestTelemetry = false
+            record.telemetry.guestAgentConnected = false
+            record.telemetry.vsockStreamsOpen = 0
+            stampRuntimeOrigin(&record)
+            try await store.upsertVM(record)
+
+            let vmName = record.spec.name
+            let diag: DiagnosticEvent
+            switch event {
+            case .guestDidStop:
+                let zhMsg = "客户机「\(vmName)」自行关机停止（guestDidStop）。"
+                let enMsg = "Guest VM '\(vmName)' stopped on its own (guestDidStop)."
+                diag = DiagnosticEvent(
+                    severity: .notice,
+                    subsystem: "Hypervisor",
+                    vmID: vmID,
+                    code: "VM_STOPPED_BY_GUEST",
+                    message: enMsg,
+                    metadata: [
+                        "vmName": vmName,
+                        "reason": "guestDidStop",
+                        "message_zh": zhMsg,
+                        "message_en": enMsg
+                    ]
+                )
+            case let .didStopWithError(vzReason):
+                let zhMsg = "虚拟机「\(vmName)」因虚拟化错误停止：\(vzReason)"
+                let enMsg = "VM '\(vmName)' stopped with error: \(vzReason)"
+                diag = DiagnosticEvent(
+                    severity: .error,
+                    subsystem: "Hypervisor",
+                    vmID: vmID,
+                    code: "VM_STOPPED_WITH_ERROR",
+                    message: enMsg,
+                    metadata: [
+                        "vmName": vmName,
+                        "error": vzReason,
+                        "reason": vzReason,
+                        "message_zh": zhMsg,
+                        "message_en": enMsg
+                    ]
+                )
+            }
+            try await store.appendDiagnostic(diag)
+        }
     }
 
     // MARK: - Instant APFS Copy-on-Write Branching & Snapshot Checkpoints

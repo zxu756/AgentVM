@@ -198,6 +198,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
     private let stopGate = DaemonAsyncStopGate()
     private let stateLock = NSLock()
     private var isStoppingFlag = false
+    private var cleanupCompletedFlag = false
     private var stopWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     private init(
@@ -388,7 +389,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             let id = UUID()
             let alreadyStopped = stateLock.withLock { () -> Bool in
-                if isStoppingFlag && singletonLockFDIsReleased {
+                if cleanupCompletedFlag {
                     return true
                 }
                 stopWaiters[id] = cont
@@ -428,10 +429,6 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
 
     // MARK: - Private Accept & Single-Request-Per-Connection Dispatch
 
-    private var singletonLockFDIsReleased: Bool {
-        listener.listenFD < 0
-    }
-
     private func markStopping() {
         stateLock.withLock {
             isStoppingFlag = true
@@ -444,6 +441,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
 
     private func resumeStopWaiters() {
         let waiters = stateLock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            cleanupCompletedFlag = true
             let all = Array(stopWaiters.values)
             stopWaiters.removeAll()
             return all
@@ -539,17 +537,18 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                 try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
                 conn.close()
 
-            case .stop:
-                // Run shutdown once, unlink socket & symlink before replying so the filesystem is already clean
-                // when the `daemon stop` client receives its response, then release daemon.lock and finish!
+            case let .stop(params):
+                // Halt all running VMs (writing VM_STOPPED), remove socket & symlink, and clear/unlock daemon.lock
+                // strictly in order before returning the RPC response and exiting.
                 let stoppedIDs = await stopGate.runOnce { [self] in
                     markStopping()
                     logManager.appendLine("stopping (rpc-stop): shutting down held machines...")
                     if let onShutdownAllMachines {
                         await onShutdownAllMachines()
                     }
-                    let halted = await coordinator.shutdownAllDaemonHeldVMs()
+                    let halted = await coordinator.shutdownAllDaemonHeldVMs(language: params.lang)
                     listener.close(unlinkSocket: true, removeSymlink: true)
+                    singletonLock.release(clearFile: true)
                     return halted
                 }
                 let resp = DaemonRPCResponse<DaemonRPCStopResult>.success(
@@ -558,7 +557,6 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                 )
                 try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
                 conn.close()
-                singletonLock.release(clearFile: true)
                 logManager.appendLine("stopped (rpc-stop, stoppedVMs=\(stoppedIDs.count))")
                 logManager.close()
                 resumeStopWaiters()
@@ -1244,7 +1242,7 @@ public enum DaemonClient {
         workspaceURL: URL,
         language: AppLanguage,
         userTempDirectoryOverride: URL? = nil,
-        waitTimeoutSeconds: TimeInterval = 10.0
+        waitTimeoutSeconds: TimeInterval = 65.0
     ) throws -> DaemonClientConnectionResult<(pid: Int32?, result: DaemonRPCStopResult)> {
         let paths = DaemonWorkspacePaths(workspaceURL: workspaceURL)
         let lockHolderBefore = DaemonSingletonLock.readHolderInfo(at: paths.lockFileURL)

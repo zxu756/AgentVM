@@ -1820,8 +1820,83 @@ PY
         fail_row 27 "up_rc=$r27_up_rc, boot_rc=$r27_boot_rc, boot_ok=$r27_boot_ok, old_boot='$R11_BOOT_ID', new_boot='$(cat "$TMP_ROOT/r27-boot.out" 2>/dev/null | tr -d '\n')', extra_vz_count=$r27_extra_vz_count"
     fi
 
-    # Row 28 requires guest spontaneous stop observation A33 (Stage 3b).
-    unrun_row 28 "客户机自发停机观察 A33 是第 3b 段"
+    # --------------------------------------------------------------
+    # Row 28: `exec t1 -- systemctl poweroff` (ignore its exit code)
+    #   Expect: within 30s t1's VirtualMachine process exits; `ps --json` is stopped;
+    #           `events --vm t1 --json` has `VM_STOPPED_BY_GUEST`; lock released so subsequent
+    #           `run t1 -- true` exits 0.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    r28_t0="$(now_sec)"
+    run_cli "$TMP_ROOT/r28-poweroff.out" "$TMP_ROOT/r28-poweroff.err" --lang en --workspace "$WS" exec t1 -- systemctl poweroff
+    r28_exec_rc=$LAST_RC
+
+    r28_vz_gone=0
+    if wait_for_extra_vz_count 0 30; then
+        r28_vz_gone=1
+    fi
+    r28_t1="$(now_sec)"
+    r28_vz_elapsed="$(diff_sec "$r28_t0" "$r28_t1")"
+
+    r28_ps_stopped=0
+    r28_ps_ticks=0
+    while (( r28_ps_ticks <= 50 )); do
+        run_cli "$TMP_ROOT/r28-ps.json" "$TMP_ROOT/r28-ps.err" --lang en --workspace "$WS" ps --json
+        if [[ $LAST_RC -eq 0 ]]; then
+            if /usr/bin/python3 - "$TMP_ROOT/r28-ps.json" <<'PY'
+import json, sys
+
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t1 = [v for v in vms if v.get("spec", {}).get("name") == "t1"]
+if len(t1) != 1:
+    sys.exit(1)
+tel = t1[0].get("telemetry", {})
+if tel.get("state") != "stopped" or tel.get("guestAgentConnected") is not False:
+    sys.exit(1)
+PY
+            then
+                r28_ps_stopped=1
+                break
+            fi
+        fi
+        sleep 0.1
+        r28_ps_ticks=$((r28_ps_ticks + 1))
+    done
+
+    run_cli "$TMP_ROOT/r28-events.json" "$TMP_ROOT/r28-events.err" --lang en --workspace "$WS" events --vm t1 --json
+    r28_ev_rc=$LAST_RC
+    r28_ev_ok=0
+    if [[ $r28_ev_rc -eq 0 ]]; then
+        /usr/bin/python3 - "$TMP_ROOT/r28-events.json" "$T1_ID" <<'PY' && r28_ev_ok=1 || r28_ev_ok=0
+import json, sys
+
+events = json.load(open(sys.argv[1], encoding="utf-8"))
+t1_id = sys.argv[2].strip()
+matched = [
+    ev for ev in events
+    if ev.get("code") == "VM_STOPPED_BY_GUEST" and (not t1_id or ev.get("vmID") == t1_id)
+]
+if not matched:
+    sys.exit(1)
+PY
+    fi
+
+    run_cli "$TMP_ROOT/r28-run.out" "$TMP_ROOT/r28-run.err" --lang en --workspace "$WS" run t1 -- true
+    r28_run_rc=$LAST_RC
+    r28_run_elapsed="$LAST_ELAPSED_SEC"
+    r28_run_out="$(cat "$TMP_ROOT/r28-run.out")"
+    r28_run_err="$(cat "$TMP_ROOT/r28-run.err")"
+    r28_post_run_vz_gone=0
+    if wait_for_extra_vz_count 0 30; then
+        r28_post_run_vz_gone=1
+    fi
+
+    if [[ $r28_vz_gone -eq 1 && $r28_ps_stopped -eq 1 && $r28_ev_ok -eq 1 \
+        && $r28_run_rc -eq 0 && -z "$r28_run_out" && -z "$r28_run_err" && $r28_post_run_vz_gone -eq 1 ]]; then
+        pass_row 28 "'exec t1 -- systemctl poweroff' (rc=$r28_exec_rc): VirtualMachine exited in ${r28_vz_elapsed}s (<30s); ps --json=stopped; events has VM_STOPPED_BY_GUEST; lock released ('run t1 -- true' exited 0 in ${r28_run_elapsed}s)."
+    else
+        fail_row 28 "vz_gone=$r28_vz_gone (${r28_vz_elapsed}s), ps_stopped=$r28_ps_stopped, ev_ok=$r28_ev_ok, run_rc=$r28_run_rc, run_err='$r28_run_err'"
+    fi
 
     # --------------------------------------------------------------
     # Row 29: `up t1`, `up t2`
@@ -1922,8 +1997,107 @@ PY
         fail_row 32 "one or more of the 20 exec calls failed; true_times=[${r32_true_times[*]}], uname_times=[${r32_uname_times[*]}]"
     fi
 
-    # Rows 33-34 require Stage 3b VM_STOPPED reason + clean shutdown dmesg verification.
-    unrun_row 33 "VM_STOPPED 停机原因与第 33-34 行正常关机 dmesg 核对在第 3b 段"
+    # --------------------------------------------------------------
+    # Row 33: `up t2`, then `daemon stop`
+    #   Expect: exits 0; within 60s both VirtualMachine processes exit; in `events`,
+    #           both t1 and t2 have new `VM_STOPPED` events with reason `guest-shutdown`
+    #           (not `hard-stop`); socket file absent; 0 workspace daemons running.
+    # --------------------------------------------------------------
+    ROW_START_SEC="$(now_sec)"
+    run_cli "$TMP_ROOT/r33-up2.out" "$TMP_ROOT/r33-up2.err" --lang en --workspace "$WS" up t2
+    r33_up2_rc=$LAST_RC
+    r33_up2_elapsed="$LAST_ELAPSED_SEC"
+
+    run_cli "$TMP_ROOT/r33-ps-before.json" "$TMP_ROOT/r33-ps-before.err" --lang en --workspace "$WS" ps --json
+    T2_ID=""
+    if [[ $LAST_RC -eq 0 ]]; then
+        T2_ID="$(
+            /usr/bin/python3 - "$TMP_ROOT/r33-ps-before.json" <<'PY'
+import json, sys
+vms = json.load(open(sys.argv[1], encoding="utf-8"))
+t2 = [v for v in vms if v.get("spec", {}).get("name") == "t2"]
+print(t2[0].get("spec", {}).get("id", "") if len(t2) == 1 else "")
+PY
+        )"
+    fi
+
+    r33_vz_before="$(count_extra_vz_pids)"
+
+    run_cli "$TMP_ROOT/r33-ev-before.json" "$TMP_ROOT/r33-ev-before.err" --lang en --workspace "$WS" events --json
+    r33_ev_before_rc=$LAST_RC
+
+    r33_t0="$(now_sec)"
+    run_cli "$TMP_ROOT/r33-stop.out" "$TMP_ROOT/r33-stop.err" --lang en --workspace "$WS" daemon stop
+    r33_stop_rc=$LAST_RC
+
+    r33_vz_gone=0
+    if wait_for_extra_vz_count 0 60; then
+        r33_vz_gone=1
+    fi
+    r33_t1="$(now_sec)"
+    r33_stop_elapsed="$(diff_sec "$r33_t0" "$r33_t1")"
+
+    r33_sock_gone=0
+    if [[ ! -e "$WS/run/daemon.sock" ]]; then
+        r33_sock_gone=1
+    fi
+
+    r33_daemons_after="$(find_workspace_daemon_pids "$WS")"
+    run_cli "$TMP_ROOT/r33-dstatus.out" "$TMP_ROOT/r33-dstatus.err" --lang en --workspace "$WS" daemon status
+    r33_dstatus_rc=$LAST_RC
+
+    run_cli "$TMP_ROOT/r33-ev-after.json" "$TMP_ROOT/r33-ev-after.err" --lang en --workspace "$WS" events --json
+    r33_ev_after_rc=$LAST_RC
+    r33_daemons_post_events="$(find_workspace_daemon_pids "$WS")"
+
+    r33_events_ok=0
+    if [[ $r33_ev_before_rc -eq 0 && $r33_ev_after_rc -eq 0 && -n "$T1_ID" && -n "$T2_ID" ]]; then
+        /usr/bin/python3 - \
+            "$TMP_ROOT/r33-ev-before.json" \
+            "$TMP_ROOT/r33-ev-after.json" \
+            "$T1_ID" \
+            "$T2_ID" <<'PY' && r33_events_ok=1 || r33_events_ok=0
+import json, sys
+
+before = json.load(open(sys.argv[1], encoding="utf-8"))
+after = json.load(open(sys.argv[2], encoding="utf-8"))
+t1_id = sys.argv[3].strip()
+t2_id = sys.argv[4].strip()
+
+before_ids = {ev.get("id") for ev in before if ev.get("id")}
+new_stopped = [
+    ev for ev in after
+    if ev.get("id") not in before_ids and ev.get("code") == "VM_STOPPED"
+]
+
+def check_vm(vm_id):
+    matches = [ev for ev in new_stopped if ev.get("vmID") == vm_id]
+    if len(matches) != 1:
+        return False
+    ev = matches[0]
+    meta_reason = (ev.get("metadata") or {}).get("reason", "")
+    msg = ev.get("message") or ""
+    if meta_reason != "guest-shutdown":
+        return False
+    if "guest-shutdown" not in msg or "hard-stop" in msg:
+        return False
+    return True
+
+if not (check_vm(t1_id) and check_vm(t2_id)):
+    sys.exit(1)
+PY
+    fi
+
+    if [[ $r33_up2_rc -eq 0 && "$r33_vz_before" == "2" \
+        && $r33_stop_rc -eq 0 && $r33_vz_gone -eq 1 \
+        && $r33_sock_gone -eq 1 && -z "$r33_daemons_after" && -z "$r33_daemons_post_events" \
+        && $r33_dstatus_rc -eq 3 && $r33_events_ok -eq 1 ]]; then
+        pass_row 33 "'up t2' (${r33_up2_elapsed}s) & 'daemon stop' exited 0; both VirtualMachine processes exited in ${r33_stop_elapsed}s (<60s); t1 & t2 recorded VM_STOPPED reason=guest-shutdown; daemon.sock removed; 0 daemons running."
+    else
+        fail_row 33 "up2_rc=$r33_up2_rc, vz_before='$r33_vz_before', stop_rc=$r33_stop_rc, vz_gone=$r33_vz_gone (${r33_stop_elapsed}s), sock_gone=$r33_sock_gone, daemons='$r33_daemons_after', dstatus_rc=$r33_dstatus_rc, events_ok=$r33_events_ok"
+    fi
+
+    # Row 34 requires Stage 3b part 2 clean shutdown dmesg verification.
     unrun_row 34 "daemon stop 后下次开机 dmesg 无 recovery complete 核对在第 3b 段"
 
     unrun_row 35 "待第 7 段 milestone 2 收尾脚本串联执行"

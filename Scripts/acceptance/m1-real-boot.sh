@@ -332,11 +332,64 @@ terminate_own_agentvm_processes() {
     wait_for_no_extra_vz_pids 15 || true
 }
 
+stop_workspace_daemon_if_running() {
+    if [[ -z "$TEST_BIN" || ! -x "$TEST_BIN" || -z "$WS" || ! -d "$WS" ]]; then
+        return 0
+    fi
+    env -u AGENTVM_WORKSPACE -u AGENTVM_REAL_VM -u AGENTVM_LANG \
+        HOME="$ISOLATED_HOME" \
+        CFFIXED_USER_HOME="$ISOLATED_HOME" \
+        AGENTVM_IMAGE_CACHE="$IMAGE_CACHE_DIR" \
+        "$TEST_BIN" --workspace "$WS" daemon stop >/dev/null 2>&1 || true
+
+    local daemon_pids
+    daemon_pids="$(
+        /usr/bin/python3 - "$WS" "$TEST_BIN" <<'PY'
+import os, shlex, subprocess, sys
+ws_real = os.path.realpath(sys.argv[1])
+bin_real = os.path.realpath(sys.argv[2])
+proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
+if proc.returncode != 0:
+    sys.exit(0)
+for raw in proc.stdout.splitlines():
+    parts = raw.strip().split(None, 1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        continue
+    try:
+        tokens = shlex.split(parts[1])
+    except ValueError:
+        tokens = parts[1].split()
+    if len(tokens) != 5 or tokens[1:4] != ["daemon", "run", "--workspace"]:
+        continue
+    if os.path.realpath(tokens[4]) != ws_real:
+        continue
+    cp = subprocess.run(["ps", "-ww", "-p", parts[0], "-o", "comm="], capture_output=True, text=True)
+    if cp.returncode == 0 and cp.stdout.strip() and os.path.realpath(cp.stdout.strip()) == bin_real:
+        print(parts[0])
+PY
+    )"
+    local dpid
+    for dpid in $daemon_pids; do
+        kill -TERM "$dpid" 2>/dev/null || true
+    done
+    for dpid in $daemon_pids; do
+        local tick=0
+        while (( tick < 50 )) && kill -0 "$dpid" 2>/dev/null; do
+            sleep 0.1
+            tick=$((tick + 1))
+        done
+        if kill -0 "$dpid" 2>/dev/null; then
+            kill -KILL "$dpid" 2>/dev/null || true
+        fi
+    done
+}
+
 cleanup() {
     if [[ $CLEANUP_DONE -eq 1 ]]; then
         return 0
     fi
     CLEANUP_DONE=1
+    stop_workspace_daemon_if_running
     terminate_own_agentvm_processes
     if [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" ]]; then
         rm -rf "$TMP_ROOT"
@@ -1091,21 +1144,31 @@ else
 fi
 
 # ------------------------------------------------------------------
-# Row 17: `up t1` -> non-zero, hints `run`, `ps --json` t1 != running, 0 new VM processes
+# Row 17 (updated in M2): `up t1` -> exits 0; then `halt t1` -> exits 0, 0 leftover VM processes
 # ------------------------------------------------------------------
 if [[ $T1_READY -eq 1 ]]; then
     invoke_agentvm "$IMAGE_CACHE_DIR" --workspace "$WS" up t1
-    r17_rc=$LAST_RC
-    r17_out_len="$(wc -c < "$LAST_OUT" | tr -d ' ')"
-    r17_err_str="$(cat "$LAST_ERR")"
-    r17_state="$(vm_json_field "t1" "state" || true)"
-    r17_extra_vz="$(list_extra_vz_pids || true)"
+    r17_up_rc=$LAST_RC
+    r17_up_err="$(cat "$LAST_ERR")"
 
-    if [[ $r17_rc -ne 0 && "$r17_out_len" == "0" && "$r17_state" != "running" && -z "$r17_extra_vz" ]] \
-        && [[ "$r17_err_str" == *"ERR_DAEMON_REQUIRED"* && "$r17_err_str" == *"agentvm run"* ]]; then
-        pass_row 17 "'up t1' exited $r17_rc, hinted 'agentvm run', left state='$r17_state', and spawned 0 VM processes."
+    invoke_agentvm "$IMAGE_CACHE_DIR" --workspace "$WS" halt t1
+    r17_halt_rc=$LAST_RC
+    r17_halt_err="$(cat "$LAST_ERR")"
+
+    r17_vz_reaped=0
+    if wait_for_no_extra_vz_pids 30; then
+        r17_vz_reaped=1
+    fi
+    r17_extra_vz="$(list_extra_vz_pids || true)"
+    r17_state="$(vm_json_field "t1" "state" || true)"
+
+    invoke_agentvm "$IMAGE_CACHE_DIR" --workspace "$WS" daemon stop
+    r17_dstop_rc=$LAST_RC
+
+    if [[ $r17_up_rc -eq 0 && $r17_halt_rc -eq 0 && $r17_vz_reaped -eq 1 && -z "$r17_extra_vz" && "$r17_state" == "stopped" && $r17_dstop_rc -eq 0 ]]; then
+        pass_row 17 "'up t1' exited 0, subsequent 'halt t1' exited 0, state='stopped', and 0 leftover VM processes."
     else
-        fail_row 17 "'up t1' check failed (rc=$r17_rc, state=$r17_state, extra_vz=$r17_extra_vz, err=$r17_err_str)"
+        fail_row 17 "'up t1' / 'halt t1' check failed (up_rc=$r17_up_rc, halt_rc=$r17_halt_rc, vz_reaped=$r17_vz_reaped, extra_vz='$r17_extra_vz', state='$r17_state', dstop_rc=$r17_dstop_rc, up_err=$r17_up_err, halt_err=$r17_halt_err)"
     fi
 else
     unrun_row 17 "skipped because t1 was not created in Row 6"

@@ -65,6 +65,7 @@ map_module_to_filters() {
             ;;
         AgentVMHypervisor|Hypervisor)
             echo "HypervisorCoordinatorTests"
+            echo "CLIAndMCPDaemonStage3aTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -72,6 +73,7 @@ map_module_to_filters() {
             echo "BilingualLocalizationTests"
             echo "CLIAndMCPDaemonRPCTests"
             echo "CLIAndMCPDaemonStage2Tests"
+            echo "CLIAndMCPDaemonStage3aTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -84,6 +86,7 @@ map_module_to_filters() {
             echo "CLIAndMCPSimulationHonestyTests"
             echo "CLIAndMCPDaemonRPCTests"
             echo "CLIAndMCPDaemonStage2Tests"
+            echo "CLIAndMCPDaemonStage3aTests"
             echo "StudioViewsHonestyTests"
             ;;
         *)

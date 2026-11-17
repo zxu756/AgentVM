@@ -2465,31 +2465,68 @@ struct CLIAndMCPTests {
 
         let mockBackend = FakeVsockResponderHardwareBackend(stdoutPayload: Data(), stderrPayload: Data(), exitCode: 0)
 
-        // 1. Default backend `up t1` (and `boot` / `start`) on bootable disk -> non-zero, advises `run`, starts nothing, state stays `stopped`
-        for cmd in ["up", "boot", "start"] {
-            let upEn = await cli.execute(
-                arguments: ["--lang", "en", cmd, "t1"],
+        // 1. Default backend `up t1` (and `boot` / `start`) on bootable disk routes through the workspace daemon,
+        //    boots idempotently once, persists `running`, and `halt t1` stops it back to `stopped`.
+        let daemonMockBackend = FakeVsockResponderHardwareBackend(stdoutPayload: Data(), stderrPayload: Data(), exitCode: 0)
+        let startOut = try await WorkspaceDaemonServer.start(
+            workspaceURL: bundleURL,
+            imageCacheDirectoryURL: cacheDir,
+            curatedImageEntries: [entry],
+            hardwareBackendOverride: daemonMockBackend
+        )
+        guard case let .started(daemonServer) = startOut else {
+            Issue.record("Expected WorkspaceDaemonServer.start to succeed")
+            return
+        }
+        do {
+            defer {
+                daemonServer.listener.close(unlinkSocket: true, removeSymlink: true)
+                daemonServer.singletonLock.release(clearFile: true)
+                daemonServer.logManager.close()
+            }
+            for cmd in ["up", "boot", "start"] {
+                let upEn = await cli.execute(
+                    arguments: ["--lang", "en", cmd, "t1"],
+                    bundleURLOverride: bundleURL,
+                    curatedEntriesOverride: [entry],
+                    environment: env,
+                    hardwareBackendOverride: daemonMockBackend
+                )
+                #expect(upEn.exitCode == 0, "up (\(cmd)) failed: \(upEn.stderr)")
+                #expect(upEn.stdout.contains("running"))
+            }
+            #expect(daemonMockBackend.lifecycleEvents == ["startMachine", "connectVsock"])
+
+            let upZh = await cli.execute(
+                arguments: ["--lang", "zh", "up", "t1"],
                 bundleURLOverride: bundleURL,
                 curatedEntriesOverride: [entry],
                 environment: env,
-                hardwareBackendOverride: mockBackend
+                hardwareBackendOverride: daemonMockBackend
             )
-            #expect(upEn.exitCode != 0)
-            #expect(upEn.stderr.contains("ERR_DAEMON_REQUIRED"))
-            #expect(upEn.stderr.contains("agentvm run"))
-            #expect(mockBackend.lifecycleEvents.isEmpty)
-        }
+            #expect(upZh.exitCode == 0)
+            #expect(upZh.stdout.contains("运行中"))
+            #expect(daemonMockBackend.lifecycleEvents == ["startMachine", "connectVsock"])
 
-        let upZh = await cli.execute(
-            arguments: ["--lang", "zh", "up", "t1"],
-            bundleURLOverride: bundleURL,
-            curatedEntriesOverride: [entry],
-            environment: env,
-            hardwareBackendOverride: mockBackend
-        )
-        #expect(upZh.exitCode != 0)
-        #expect(upZh.stderr.contains("agentvm run"))
-        #expect(mockBackend.lifecycleEvents.isEmpty)
+            let psRunning = await cli.execute(
+                arguments: ["--lang", "en", "ps", "--json"],
+                bundleURLOverride: bundleURL,
+                curatedEntriesOverride: [entry],
+                environment: env
+            )
+            #expect(psRunning.exitCode == 0)
+            #expect(psRunning.stdout.contains("\"state\" : \"running\""))
+
+            let haltEn = await cli.execute(
+                arguments: ["--lang", "en", "halt", "t1"],
+                bundleURLOverride: bundleURL,
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hardwareBackendOverride: daemonMockBackend
+            )
+            #expect(haltEn.exitCode == 0)
+            await daemonServer.stopAndCleanup()
+        }
 
         let psJSON = await cli.execute(
             arguments: ["--lang", "en", "ps", "--json"],

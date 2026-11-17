@@ -265,6 +265,7 @@ public actor AgentVMFleetCoordinator {
     public let vzTranslator = VZConfigurationTranslator()
     public let guestBootstrap = GuestAgentBootstrapGenerator()
 
+    public nonisolated let isWorkspaceDaemon: Bool
     private let hardwareBackend: any HardwareVMLowLevelBackend
     private let vsockConnectTimeoutNanoseconds: UInt64
     private let vsockRetryIntervalNanoseconds: UInt64
@@ -275,6 +276,11 @@ public actor AgentVMFleetCoordinator {
     private var terminalBuffers: [VMID: VT100ScreenBuffer] = [:]
     private var hardwareBoxes: [VMID: any HardwareVMInstanceHandle] = [:]
     private var bootTimestamps: [VMID: Date] = [:]
+    private var heldExecutionLocks: [VMID: VMExecutionLock] = [:]
+    private var activeOneShotLocks: Set<VMID> = []
+    private var inFlightHardwareBoots: Set<VMID> = []
+    private var vmLifecycleTails: [UUID: Task<Void, Never>] = [:]
+    private var vmLifecycleQueueHeads: [VMID: UUID] = [:]
 
     private final class HardwareVZBox: NSObject, VZVirtualMachineDelegate, HardwareVMInstanceHandle, @unchecked Sendable {
         let queue: DispatchQueue
@@ -573,6 +579,7 @@ public actor AgentVMFleetCoordinator {
     public init(
         bundleURL: URL,
         executionBackend: HypervisorExecutionBackend = .strictHardwareVZ,
+        isWorkspaceDaemon: Bool = false,
         imageCacheDirectoryURL: URL? = nil,
         curatedImageEntries: [BaseImageCatalogEntry]? = nil,
         diskEngine: APFSCoWDiskEngine = APFSCoWDiskEngine(),
@@ -583,6 +590,7 @@ public actor AgentVMFleetCoordinator {
     ) throws {
         let createdStore = try AgentVMProjectStore(bundleURL: bundleURL, createIfMissing: true)
         self.store = createdStore
+        self.isWorkspaceDaemon = isWorkspaceDaemon
         self.undoRedo = UndoRedoController()
         // `agentvm policy <preset>` persists its selection in manifest.json; a new process starts from it.
         let initialPolicy = Self.persistedActiveFirewallPolicy(manifestURL: createdStore.manifestFileURL)
@@ -778,7 +786,7 @@ public actor AgentVMFleetCoordinator {
 
     /// Gracefully shuts down all VMs held by this daemon process (`daemon stop` / `SIGTERM` / `SIGINT`).
     public func shutdownAllDaemonHeldVMs() async -> [VMID] {
-        let heldIDs = hardwareBoxes.keys.sorted()
+        let heldIDs = Set(hardwareBoxes.keys).union(heldExecutionLocks.keys).sorted()
         guard !heldIDs.isEmpty else { return [] }
         var stopped: [VMID] = []
         stopped.reserveCapacity(heldIDs.count)
@@ -788,6 +796,39 @@ public actor AgentVMFleetCoordinator {
             }
         }
         return stopped
+    }
+
+    private func ownsExecutionLock(for vmID: VMID) -> Bool {
+        heldExecutionLocks[vmID] != nil || activeOneShotLocks.contains(vmID)
+    }
+
+    /// Serializes lifecycle transitions (`up`, `halt`, `pause`, `resume`) per `vmID` so at most one transition
+    /// executes on a given VM at a time (Fixes A38).
+    private func enqueueVMLifecycleOperation<T: Sendable>(
+        for vmID: VMID,
+        _ operation: @Sendable @escaping () async throws -> T
+    ) async throws -> T {
+        let previousToken = vmLifecycleQueueHeads[vmID]
+        let previousTask = previousToken.flatMap { vmLifecycleTails[$0] }
+        let myToken = UUID()
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let gateTask = Task<Void, Never> {
+            var iterator = stream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        vmLifecycleTails[myToken] = gateTask
+        vmLifecycleQueueHeads[vmID] = myToken
+        defer {
+            continuation.finish()
+            vmLifecycleTails.removeValue(forKey: myToken)
+            if vmLifecycleQueueHeads[vmID] == myToken {
+                vmLifecycleQueueHeads.removeValue(forKey: vmID)
+            }
+        }
+        if let previousTask {
+            await previousTask.value
+        }
+        return try await operation()
     }
 
     /// Loads a VM record for a lifecycle or exec operation.
@@ -1288,18 +1329,24 @@ public actor AgentVMFleetCoordinator {
         _ vmID: VMID,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> VMInstanceRecord {
-        try await bootVMInternal(vmID, persistRunningState: true, onProgress: onProgress)
+        try await enqueueVMLifecycleOperation(for: vmID) {
+            try await self.bootVMInternal(
+                vmID,
+                persistRunningState: true,
+                acquireExecutionLock: true,
+                onProgress: onProgress
+            )
+        }
     }
 
     /// Boots a VM into a persistent background state (`agentvm up`, `exec` auto-boot, Studio boot).
-    /// Under `--backend simulation`, delegates to `bootVM`. Under the default hardware backend, checks
-    /// `verifyBootableGuestSystem` first (so empty disks still report `ERR_NO_BOOTABLE_SYSTEM`) and then
-    /// refuses persistent hardware boot before the M2 daemon exists, advising `agentvm run` (A31).
+    /// Under `--backend simulation` or inside the workspace daemon (`isWorkspaceDaemon`), delegates to `bootVM`.
+    /// Non-daemon hardware callers verify bootability first and refuse in-process persistent boot.
     public func bootPersistentVM(
         _ vmID: VMID,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> VMInstanceRecord {
-        if isSimulationBackend {
+        if isSimulationBackend || isWorkspaceDaemon {
             return try await bootVM(vmID, onProgress: onProgress)
         }
         let record = try await loadVMForOperation(vmID)
@@ -1310,24 +1357,62 @@ public actor AgentVMFleetCoordinator {
     private func bootVMInternal(
         _ vmID: VMID,
         persistRunningState: Bool,
+        acquireExecutionLock: Bool,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> VMInstanceRecord {
         var record = try await loadVMForOperation(vmID)
-        if record.telemetry.state == .running {
-            if isSimulationBackend && !record.telemetry.simulated {
-                // A `running` record the simulator is asked to drive is simulated from here on; say so in the store.
-                record.telemetry.simulated = true
-                try await store.upsertVM(record)
+        if isSimulationBackend {
+            if record.telemetry.state == .running {
+                if !record.telemetry.simulated {
+                    // A `running` record the simulator is asked to drive is simulated from here on; say so in the store.
+                    record.telemetry.simulated = true
+                    try await store.upsertVM(record)
+                }
+                return record
             }
-            return record
+        } else {
+            // Fixes A51: under the hardware backend, a VM counts as already running ONLY when SQLite records `running`
+            // AND this process holds the live hardware VM instance in memory.
+            if record.telemetry.state == .running && hardwareBoxes[vmID] != nil {
+                return record
+            }
+            if record.telemetry.state == .paused && hardwareBoxes[vmID] != nil {
+                throw AgentVMError.invalidLifecycleTransition(
+                    vmID: vmID,
+                    from: record.telemetry.state.rawValue,
+                    requested: "up"
+                )
+            }
+            if record.telemetry.state == .running,
+               !record.telemetry.simulated,
+               hardwareBoxes[vmID] == nil,
+               !ownsExecutionLock(for: vmID),
+               !VMExecutionLock.isLocked(at: lockFileURL(for: vmID)) {
+                let diag = makeVMRuntimeLostDiagnostic(for: record, language: .en)
+                if let reconciled = try await store.reconcileLostRunningVM(vmID: vmID, diagnostic: diag).record {
+                    record = reconciled
+                }
+            }
+        }
+
+        if !isSimulationBackend {
+            try verifyBootableGuestSystem(for: record.spec)
         }
 
         let manifest = try await store.loadManifest()
         let allVMs = try await store.listVMs()
-        // Simulated `running` records never count against a hardware-backend quota.
-        let activeCount = allVMs.filter {
-            $0.telemetry.state == .running && (isSimulationBackend || !$0.telemetry.simulated)
-        }.count
+        // Simulated `running` records never count against a hardware-backend quota; include in-flight hardware boots.
+        var activeIDs = Set(
+            allVMs.filter {
+                $0.id != vmID
+                    && $0.telemetry.state == .running
+                    && (isSimulationBackend || !$0.telemetry.simulated)
+            }.map(\.id)
+        )
+        if !isSimulationBackend {
+            activeIDs.formUnion(inFlightHardwareBoots.subtracting([vmID]))
+        }
+        let activeCount = activeIDs.count
         if activeCount >= manifest.preferences.maxConcurrentRunningVMs {
             throw AgentVMError.resourceQuotaExceeded(
                 resource: "maxConcurrentRunningVMs",
@@ -1372,14 +1457,56 @@ public actor AgentVMFleetCoordinator {
             return record
         }
 
-        try verifyBootableGuestSystem(for: record.spec)
+        // Acquire per-VM execution lock BEFORE starting the hardware machine, and keep holding it until
+        // the VM stops and `stopped` has been written back to SQLite (Item 2 / Section 4).
+        var newlyAcquiredLock = false
+        if acquireExecutionLock && heldExecutionLocks[vmID] == nil {
+            let freshLock = try VMExecutionLock.acquire(
+                at: lockFileURL(for: vmID),
+                vmName: record.spec.name
+            )
+            heldExecutionLocks[vmID] = freshLock
+            newlyAcquiredLock = true
+        }
+
+        inFlightHardwareBoots.insert(vmID)
+        defer { inFlightHardwareBoots.remove(vmID) }
+
+        func rollbackFailedBootAndReleaseLockIfNeeded(vmFD: Int32?) async {
+            if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
+                let stopTimeout = gracefulStopTimeoutNanoseconds
+                await Task {
+                    await ownedBox.closeVsockConnection()
+                    await ownedBox.shutdown(gracefulTimeoutNanoseconds: stopTimeout)
+                }.value
+            }
+            if vmFD != nil {
+                await l2Switch.detachPort(for: vmID)
+            }
+            record.telemetry.state = .stopped
+            record.telemetry.guestAgentConnected = false
+            record.telemetry.hasLiveGuestTelemetry = false
+            record.telemetry.vsockStreamsOpen = 0
+            record.telemetry.cpuUsagePercent = 0
+            record.telemetry.memoryResidentMB = 0
+            stampRuntimeOrigin(&record)
+            try? await store.upsertVM(record)
+            if newlyAcquiredLock {
+                heldExecutionLocks.removeValue(forKey: vmID)?.release()
+            }
+        }
 
         var vmFD: Int32? = nil
-        if let primaryNIC = record.spec.networkInterfaces.first, primaryNIC.mode == .userSpaceSwitch {
-            let nicMAC = MACAddress(parsing: primaryNIC.macAddress)
-                ?? MACAddress.deterministicGuestMAC(seed: vmID.rawValue)
-            let (createdFD, _) = try await l2Switch.createPortSocketPair(for: vmID, macAddress: nicMAC)
-            vmFD = createdFD
+        do {
+            if let primaryNIC = record.spec.networkInterfaces.first, primaryNIC.mode == .userSpaceSwitch {
+                let nicMAC = MACAddress(parsing: primaryNIC.macAddress)
+                    ?? MACAddress.deterministicGuestMAC(seed: vmID.rawValue)
+                let (createdFD, _) = try await l2Switch.createPortSocketPair(for: vmID, macAddress: nicMAC)
+                vmFD = createdFD
+            }
+        } catch {
+            await rollbackFailedBootAndReleaseLockIfNeeded(vmFD: vmFD)
+            throw error
         }
 
         let resolvedConsoleLogURL: URL = {
@@ -1402,9 +1529,7 @@ public actor AgentVMFleetCoordinator {
             )
             hardwareBoxes[vmID] = box
         } catch {
-            if vmFD != nil {
-                await l2Switch.detachPort(for: vmID)
-            }
+            await rollbackFailedBootAndReleaseLockIfNeeded(vmFD: vmFD)
             throw error
         }
 
@@ -1457,36 +1582,12 @@ public actor AgentVMFleetCoordinator {
             }
             try Task.checkCancellation()
         } catch {
-            if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
-                let stopTimeout = gracefulStopTimeoutNanoseconds
-                await Task {
-                    await ownedBox.closeVsockConnection()
-                    await ownedBox.shutdown(gracefulTimeoutNanoseconds: stopTimeout)
-                }.value
-            }
-            if vmFD != nil {
-                await l2Switch.detachPort(for: vmID)
-            }
+            await rollbackFailedBootAndReleaseLockIfNeeded(vmFD: vmFD)
             throw error
         }
 
         guard let connectedDescriptor, connectedDescriptor.fileDescriptor >= 0 else {
-            if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
-                let stopTimeout = gracefulStopTimeoutNanoseconds
-                await Task {
-                    await ownedBox.closeVsockConnection()
-                    await ownedBox.shutdown(gracefulTimeoutNanoseconds: stopTimeout)
-                }.value
-            }
-            if vmFD != nil {
-                await l2Switch.detachPort(for: vmID)
-            }
-            record.telemetry.state = .stopped
-            record.telemetry.guestAgentConnected = false
-            record.telemetry.vsockStreamsOpen = 0
-            stampRuntimeOrigin(&record)
-            try? await store.upsertVM(record)
-
+            await rollbackFailedBootAndReleaseLockIfNeeded(vmFD: vmFD)
             let timeoutSec = max(1, Int(vsockConnectTimeoutNanoseconds / 1_000_000_000))
             throw AgentVMError.guestVsockConnectTimedOut(
                 vmName: record.spec.name,
@@ -1505,16 +1606,7 @@ public actor AgentVMFleetCoordinator {
             )
         } catch {
             await session.shutdown()
-            if let ownedBox = hardwareBoxes.removeValue(forKey: vmID) {
-                let stopTimeout = gracefulStopTimeoutNanoseconds
-                await Task {
-                    await ownedBox.closeVsockConnection()
-                    await ownedBox.shutdown(gracefulTimeoutNanoseconds: stopTimeout)
-                }.value
-            }
-            if vmFD != nil {
-                await l2Switch.detachPort(for: vmID)
-            }
+            await rollbackFailedBootAndReleaseLockIfNeeded(vmFD: vmFD)
             throw error
         }
 
@@ -1595,12 +1687,41 @@ public actor AgentVMFleetCoordinator {
         }
     }
 
-    public func pauseVM(_ vmID: VMID, reason: String = "User requested pause") async throws -> VMInstanceRecord {
+    public func pauseVM(
+        _ vmID: VMID,
+        reason: String = "User requested pause",
+        language: AppLanguage = .en
+    ) async throws -> VMInstanceRecord {
+        try await enqueueVMLifecycleOperation(for: vmID) {
+            try await self.pauseVMUnlocked(vmID, reason: reason, language: language)
+        }
+    }
+
+    private func pauseVMUnlocked(
+        _ vmID: VMID,
+        reason: String,
+        language: AppLanguage
+    ) async throws -> VMInstanceRecord {
         var record = try await loadVMForOperation(vmID)
-        guard record.telemetry.state == .running else {
+        if !isSimulationBackend,
+           record.telemetry.state == .running,
+           !record.telemetry.simulated,
+           hardwareBoxes[vmID] == nil,
+           !ownsExecutionLock(for: vmID),
+           !VMExecutionLock.isLocked(at: lockFileURL(for: vmID)) {
+            let diag = makeVMRuntimeLostDiagnostic(for: record, language: language)
+            if let reconciled = try await store.reconcileLostRunningVM(vmID: vmID, diagnostic: diag).record {
+                record = reconciled
+            }
+        }
+        guard record.telemetry.state == .running,
+              isSimulationBackend || hardwareBoxes[vmID] != nil else {
+            let effectiveState = (!isSimulationBackend && hardwareBoxes[vmID] == nil && record.telemetry.state == .running)
+                ? VMLifecycleState.stopped.rawValue
+                : record.telemetry.state.rawValue
             throw AgentVMError.invalidLifecycleTransition(
                 vmID: vmID,
-                from: record.telemetry.state.rawValue,
+                from: effectiveState,
                 requested: "pause"
             )
         }
@@ -1611,6 +1732,7 @@ public actor AgentVMFleetCoordinator {
 
         record.telemetry.state = .paused
         record.telemetry.cpuUsagePercent = 0.0
+        record.telemetry.hasLiveGuestTelemetry = false
         stampRuntimeOrigin(&record)
         try await store.upsertVM(record)
         try await store.appendDiagnostic(DiagnosticEvent(
@@ -1623,8 +1745,48 @@ public actor AgentVMFleetCoordinator {
         return record
     }
 
-    public func resumeVM(_ vmID: VMID) async throws -> VMInstanceRecord {
+    public func resumeVM(
+        _ vmID: VMID,
+        language: AppLanguage = .en
+    ) async throws -> VMInstanceRecord {
+        try await enqueueVMLifecycleOperation(for: vmID) {
+            try await self.resumeVMUnlocked(vmID, language: language)
+        }
+    }
+
+    private func resumeVMUnlocked(
+        _ vmID: VMID,
+        language: AppLanguage
+    ) async throws -> VMInstanceRecord {
         var record = try await loadVMForOperation(vmID)
+        if !isSimulationBackend,
+           record.telemetry.state == .running,
+           !record.telemetry.simulated,
+           hardwareBoxes[vmID] == nil,
+           !ownsExecutionLock(for: vmID),
+           !VMExecutionLock.isLocked(at: lockFileURL(for: vmID)) {
+            let diag = makeVMRuntimeLostDiagnostic(for: record, language: language)
+            if let reconciled = try await store.reconcileLostRunningVM(vmID: vmID, diagnostic: diag).record {
+                record = reconciled
+            }
+        }
+        if !isSimulationBackend && hardwareBoxes[vmID] == nil {
+            if record.telemetry.state != .stopped {
+                record.telemetry.state = .stopped
+                record.telemetry.guestAgentConnected = false
+                record.telemetry.hasLiveGuestTelemetry = false
+                record.telemetry.vsockStreamsOpen = 0
+                record.telemetry.cpuUsagePercent = 0
+                record.telemetry.memoryResidentMB = 0
+                stampRuntimeOrigin(&record)
+                try await store.upsertVM(record)
+            }
+            throw AgentVMError.invalidLifecycleTransition(
+                vmID: vmID,
+                from: record.telemetry.state.rawValue,
+                requested: "resume"
+            )
+        }
         guard record.telemetry.state == .paused else {
             throw AgentVMError.invalidLifecycleTransition(
                 vmID: vmID,
@@ -1645,10 +1807,36 @@ public actor AgentVMFleetCoordinator {
 
     public func haltVM(
         _ vmID: VMID,
+        language: AppLanguage = .en,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> VMInstanceRecord {
-        guard var record = try await store.fetchVM(vmID) else {
-            throw AgentVMError.vmNotFound(vmID)
+        try await enqueueVMLifecycleOperation(for: vmID) {
+            try await self.haltVMUnlocked(
+                vmID,
+                releaseHeldLock: true,
+                language: language,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    private func haltVMUnlocked(
+        _ vmID: VMID,
+        releaseHeldLock: Bool,
+        language: AppLanguage = .en,
+        onProgress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> VMInstanceRecord {
+        var record = try await loadVMForOperation(vmID)
+        if !isSimulationBackend,
+           record.telemetry.state == .running,
+           !record.telemetry.simulated,
+           hardwareBoxes[vmID] == nil,
+           !ownsExecutionLock(for: vmID),
+           !VMExecutionLock.isLocked(at: lockFileURL(for: vmID)) {
+            let diag = makeVMRuntimeLostDiagnostic(for: record, language: language)
+            if let reconciled = try await store.reconcileLostRunningVM(vmID: vmID, diagnostic: diag).record {
+                record = reconciled
+            }
         }
         await portForwardManager.stopAllRules(for: vmID)
         if let session = vsockSessions.removeValue(forKey: vmID) {
@@ -1669,6 +1857,11 @@ public actor AgentVMFleetCoordinator {
         record.telemetry.guestAgentConnected = false
         record.telemetry.vsockStreamsOpen = 0
         stampRuntimeOrigin(&record)
+        defer {
+            if releaseHeldLock {
+                heldExecutionLocks.removeValue(forKey: vmID)?.release()
+            }
+        }
         try await store.upsertVM(record)
         return record
     }
@@ -2036,12 +2229,17 @@ public actor AgentVMFleetCoordinator {
             at: lockFileURL(for: vmID),
             vmName: initialRecord.spec.name
         )
-        defer { vmLock.release() }
+        activeOneShotLocks.insert(vmID)
+        defer {
+            activeOneShotLocks.remove(vmID)
+            vmLock.release()
+        }
 
         try Task.checkCancellation()
         let bootedRecord = try await bootVMInternal(
             vmID,
             persistRunningState: false,
+            acquireExecutionLock: false,
             onProgress: onProgress
         )
         do {
@@ -2062,13 +2260,13 @@ public actor AgentVMFleetCoordinator {
             try? await store.appendExecResult(ledgerEntry)
 
             _ = try await Task {
-                try await self.haltVM(vmID, onProgress: onProgress)
+                try await self.haltVMUnlocked(vmID, releaseHeldLock: false, onProgress: onProgress)
             }.value
             onProgress?("VM '\(bootedRecord.spec.name)' stopped.")
             return execResult
         } catch {
             _ = await Task {
-                try? await self.haltVM(vmID, onProgress: onProgress)
+                try? await self.haltVMUnlocked(vmID, releaseHeldLock: false, onProgress: onProgress)
             }.value
             throw error
         }

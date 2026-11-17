@@ -682,6 +682,8 @@ public struct AgentVMCLIRunner: Sendable {
                     parsed: parsed,
                     language: language,
                     isSimulation: isSimulationFlagged,
+                    environment: environment,
+                    daemonSpawnOverride: daemonSpawnOverride,
                     checkProcessEntitlement: hardwareBackendOverride == nil || hasEntitlementOverride != nil,
                     hasEntitlementOverride: hasEntitlementOverride
                 )
@@ -692,6 +694,8 @@ public struct AgentVMCLIRunner: Sendable {
                     parsed: parsed,
                     language: language,
                     isSimulation: isSimulationFlagged,
+                    environment: environment,
+                    daemonSpawnOverride: daemonSpawnOverride,
                     checkProcessEntitlement: false,
                     hasEntitlementOverride: nil
                 )
@@ -702,6 +706,8 @@ public struct AgentVMCLIRunner: Sendable {
                     parsed: parsed,
                     language: language,
                     isSimulation: isSimulationFlagged,
+                    environment: environment,
+                    daemonSpawnOverride: daemonSpawnOverride,
                     checkProcessEntitlement: false,
                     hasEntitlementOverride: nil
                 )
@@ -712,6 +718,8 @@ public struct AgentVMCLIRunner: Sendable {
                     parsed: parsed,
                     language: language,
                     isSimulation: isSimulationFlagged,
+                    environment: environment,
+                    daemonSpawnOverride: daemonSpawnOverride,
                     checkProcessEntitlement: false,
                     hasEntitlementOverride: nil
                 )
@@ -1085,6 +1093,8 @@ public struct AgentVMCLIRunner: Sendable {
         parsed: ParsedSubcommandArguments,
         language: AppLanguage,
         isSimulation: Bool,
+        environment: [String: String],
+        daemonSpawnOverride: DaemonSpawnCommandOverride?,
         checkProcessEntitlement: Bool,
         hasEntitlementOverride: Bool?
     ) async throws -> CLIExecutionOutcome {
@@ -1095,6 +1105,7 @@ public struct AgentVMCLIRunner: Sendable {
             )
         }
         let vmID = try await resolveVMID(targetToken, coordinator: coordinator)
+        let updated: VMInstanceRecord
         if action == "boot" && !isSimulation {
             let entProvider: (@Sendable () -> Bool)?
             if let explicitEnt = hasEntitlementOverride {
@@ -1102,17 +1113,34 @@ public struct AgentVMCLIRunner: Sendable {
             } else {
                 entProvider = nil
             }
-            let record = try await coordinator.preflightPersistentBoot(
+            _ = try await coordinator.preflightPersistentBoot(
                 vmID,
                 checkProcessEntitlement: checkProcessEntitlement,
                 hasEntitlementOverride: entProvider
             )
-            // Stage 2 keeps returning ERR_DAEMON_REQUIRED after passing both local preflight checks
-            // without launching the daemon (real-VM persistent boot via daemon is Stage 3).
-            throw AgentVMError.persistentBootRequiresDaemon(vmName: record.spec.name)
-        }
-        let updated: VMInstanceRecord
-        if !isSimulation {
+            _ = try await DaemonProcessLauncher.launchOrConnect(
+                workspaceURL: coordinator.store.bundleURL,
+                language: language,
+                environment: environment,
+                spawnOverride: daemonSpawnOverride
+            )
+            let params = DaemonRPCVMLifecycleParams(vm: vmID.rawValue, lang: language)
+            let rpcOutcome = try DaemonClient.performUnaryCall(
+                workspaceURL: coordinator.store.bundleURL,
+                call: .up(params),
+                resultType: DaemonRPCVMLifecycleResult.self
+            )
+            switch rpcOutcome {
+            case let .connected((_, lifeRes)):
+                updated = lifeRes.vm
+            case .daemonNotRunning:
+                let paths = DaemonWorkspacePaths(workspaceURL: coordinator.store.bundleURL)
+                throw AgentVMError.ipcDaemonUnavailable(
+                    socketPath: paths.directSocketPath,
+                    detail: "Workspace daemon closed connection before completing 'up'."
+                )
+            }
+        } else if !isSimulation {
             let params = DaemonRPCVMLifecycleParams(vm: vmID.rawValue, lang: language)
             let call: DaemonRPCCall
             switch action {

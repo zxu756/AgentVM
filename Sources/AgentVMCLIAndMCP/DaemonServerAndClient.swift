@@ -259,6 +259,12 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
         startedAt: Date = Date(),
         backlog: Int32 = 32,
         userTempDirectoryOverride: URL? = nil,
+        imageCacheDirectoryURL: URL? = nil,
+        curatedImageEntries: [BaseImageCatalogEntry]? = nil,
+        hardwareBackendOverride: (any HardwareVMLowLevelBackend)? = nil,
+        vsockConnectTimeoutNanoseconds: UInt64 = 180_000_000_000,
+        vsockRetryIntervalNanoseconds: UInt64 = 1_000_000_000,
+        gracefulStopTimeoutNanoseconds: UInt64 = 30_000_000_000,
         onShutdownAllMachines: (@Sendable () async -> Void)? = nil
     ) async throws -> WorkspaceDaemonStartOutcome {
         let paths = DaemonWorkspacePaths(workspaceURL: workspaceURL)
@@ -312,7 +318,14 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
             // Step 3: Reconcile crashed `running` VMs -> `stopped` + `VM_RUNTIME_LOST` BEFORE bind/listen.
             let coordinator = try AgentVMFleetCoordinator(
                 bundleURL: paths.workspaceURL,
-                executionBackend: .strictHardwareVZ
+                executionBackend: .strictHardwareVZ,
+                isWorkspaceDaemon: true,
+                imageCacheDirectoryURL: imageCacheDirectoryURL,
+                curatedImageEntries: curatedImageEntries,
+                hardwareBackendOverride: hardwareBackendOverride,
+                vsockConnectTimeoutNanoseconds: vsockConnectTimeoutNanoseconds,
+                vsockRetryIntervalNanoseconds: vsockRetryIntervalNanoseconds,
+                gracefulStopTimeoutNanoseconds: gracefulStopTimeoutNanoseconds
             )
             _ = try await coordinator.reconcileStaleRunningVMs()
             steps.append("reconcile")
@@ -572,13 +585,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                 conn.close()
 
             case let .up(params):
-                let resp = DaemonRPCResponse<DaemonRPCVMLifecycleResult>.failure(
-                    id: envelope.id,
-                    agentVMError: .persistentBootRequiresDaemon(vmName: params.vm),
-                    language: params.lang
-                )
-                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
-                conn.close()
+                await handleLifecycleCall(id: envelope.id, action: "up", params: params, conn: conn)
 
             case let .halt(params):
                 await handleLifecycleCall(id: envelope.id, action: "halt", params: params, conn: conn)
@@ -619,15 +626,14 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
             let vmID = try await resolveVMID(params.vm)
             let updated: VMInstanceRecord
             switch action {
+            case "up":
+                updated = try await coordinator.bootPersistentVM(vmID)
             case "halt":
-                _ = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: params.lang)
-                updated = try await coordinator.haltVM(vmID)
+                updated = try await coordinator.haltVM(vmID, language: params.lang)
             case "pause":
-                _ = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: params.lang)
-                updated = try await coordinator.pauseVM(vmID)
+                updated = try await coordinator.pauseVM(vmID, language: params.lang)
             default:
-                _ = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: params.lang)
-                updated = try await coordinator.resumeVM(vmID)
+                updated = try await coordinator.resumeVM(vmID, language: params.lang)
             }
             let resp = DaemonRPCResponse<DaemonRPCVMLifecycleResult>.success(
                 id: id,

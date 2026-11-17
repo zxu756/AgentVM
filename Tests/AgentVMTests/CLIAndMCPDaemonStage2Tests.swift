@@ -947,7 +947,8 @@ struct CLIAndMCPDaemonStage2Tests {
         #expect(!FileManager.default.fileExists(atPath: paths.lockFileURL.path))
         #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
 
-        // 3. Hardware `up t1` when both checks pass still returns ERR_DAEMON_REQUIRED in Stage 2 and never spawns daemon.
+        // 3. Hardware `up t1` when both local preflight checks pass proceeds to `DaemonProcessLauncher`
+        //    (invoking `forbiddenSpawn` which exits 91 -> ERR_DAEMON_IPC), proving preflight gated steps 1 & 2 above.
         let upEntitled = await cli.execute(
             arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
             curatedEntriesOverride: [entry],
@@ -956,8 +957,8 @@ struct CLIAndMCPDaemonStage2Tests {
             daemonSpawnOverride: forbiddenSpawn
         )
         #expect(upEntitled.exitCode == 1)
-        #expect(upEntitled.stderr.contains("ERR_DAEMON_REQUIRED"))
-        #expect(!FileManager.default.fileExists(atPath: paths.lockFileURL.path))
+        #expect(upEntitled.stderr.contains("ERR_DAEMON_IPC"))
+        #expect(upEntitled.stderr.contains("91"))
         #expect(!FileManager.default.fileExists(atPath: paths.directSocketPath))
     }
 

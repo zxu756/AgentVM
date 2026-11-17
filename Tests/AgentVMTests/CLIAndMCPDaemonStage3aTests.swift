@@ -494,6 +494,175 @@ struct CLIAndMCPDaemonStage3aTests {
         _ = try await coordinator.haltVM(vmID)
         #expect(VMExecutionLock.isLocked(at: lockURL) == false)
     }
+
+    // MARK: - Item 4 (A40): Re-Read Manifest Policy Before Every `up` (`airgap` -> Exit 1 `ERR_AIRGAP_UNSUPPORTED`)
+
+    @Test("Item 4a (A40): mutating manifest.json via a second AgentVMProjectStore causes subsequent boot on the same coordinator to be rejected")
+    func secondStoreManifestMutationBlocksSubsequentBootOnSameCoordinatorA40() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s3a-i4a")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+
+        let (cacheDir, cachedURL, entry) = try await stageBootableCachedImage(in: realBase)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let wsURL = URL(fileURLWithPath: "\(realBase)/A40Store.agentvm", isDirectory: true)
+        let mockBackend = Stage3aMockHardwareBackend()
+        defer { mockBackend.closeAllDescriptors() }
+
+        let coordinator = try AgentVMFleetCoordinator(
+            bundleURL: wsURL,
+            executionBackend: .strictHardwareVZ,
+            isWorkspaceDaemon: true,
+            imageCacheDirectoryURL: cacheDir,
+            curatedImageEntries: [entry],
+            hardwareBackendOverride: mockBackend,
+            vsockConnectTimeoutNanoseconds: 5_000_000_000,
+            vsockRetryIntervalNanoseconds: 10_000_000,
+            gracefulStopTimeoutNanoseconds: 50_000_000
+        )
+
+        let created = try await coordinator.createVMFromImage(name: "t1", imageID: entry.id)
+        let vmID = created.vmRecord.id
+        let lockURL = coordinator.lockFileURL(for: vmID)
+
+        // Mutate manifest.json through a completely separate AgentVMProjectStore instance (simulating another CLI process).
+        let secondStore = try AgentVMProjectStore(bundleURL: wsURL, createIfMissing: false)
+        var manifest = try await secondStore.loadManifest()
+        manifest.activeFirewallPolicyID = PolicySetID("pol-airgap")
+        manifest.updatedAt = Date()
+        try await secondStore.saveManifest(manifest)
+
+        var caughtError: AgentVMError?
+        do {
+            _ = try await coordinator.bootVM(vmID)
+        } catch let err as AgentVMError {
+            caughtError = err
+        }
+        let err = try #require(caughtError, "Expected coordinator.bootVM to reject boot after secondStore set airgap in manifest.json")
+        #expect(err == .airgapPolicyUnsupportedBeforeM5(vmName: "t1"))
+        #expect(err.errorCode == "ERR_AIRGAP_UNSUPPORTED")
+        #expect(mockBackend.startCount == 0)
+        #expect(VMExecutionLock.isLocked(at: lockURL) == false)
+
+        // Flip manifest back to strict via secondStore -> same coordinator now allows booting t1.
+        var strictManifest = try await secondStore.loadManifest()
+        strictManifest.activeFirewallPolicyID = PolicySetID("pol-strict-agent-allowlist")
+        strictManifest.updatedAt = Date()
+        try await secondStore.saveManifest(strictManifest)
+
+        let booted = try await coordinator.bootVM(vmID)
+        #expect(booted.telemetry.state == .running)
+        #expect(mockBackend.startCount == 1)
+        _ = try await coordinator.haltVM(vmID)
+    }
+
+    @Test("Item 4b (A40): live daemon re-reads manifest policy before 'up', returning exit 1 ERR_AIRGAP_UNSUPPORTED on airgap and 0 after switching to strict")
+    func daemonUpReReadsManifestAirgapPolicyExiting1AndRecoversOnStrictA40() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s3a-i4b")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+
+        let (cacheDir, cachedURL, entry) = try await stageBootableCachedImage(in: realBase)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let wsURL = URL(fileURLWithPath: "\(realBase)/A40Daemon.agentvm", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = [
+            "HOME": isolatedHome,
+            "CFFIXED_USER_HOME": isolatedHome,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+        let forbiddenSpawn = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exit 95"],
+            environment: env
+        )
+
+        #expect(await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "create", "t1", "--image", entry.id],
+            curatedEntriesOverride: [entry],
+            environment: env
+        ).exitCode == 0)
+        #expect(await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "create", "t2", "--image", entry.id],
+            curatedEntriesOverride: [entry],
+            environment: env
+        ).exitCode == 0)
+
+        let mockBackend = Stage3aMockHardwareBackend()
+        defer { mockBackend.closeAllDescriptors() }
+
+        try await withStartedDaemonServer(
+            workspaceURL: wsURL,
+            imageCacheDirectoryURL: cacheDir,
+            curatedImageEntries: [entry],
+            hardwareBackendOverride: mockBackend
+        ) { _ in
+            // Boot t1 while policy is default (strict).
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+            #expect(mockBackend.startCount == 1)
+
+            // Another CLI invocation sets `policy airgap` in manifest.json while daemon stays running.
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "policy", "airgap"],
+                curatedEntriesOverride: [entry],
+                environment: env
+            ).exitCode == 0)
+
+            // Daemon `up t2` must re-read manifest, reject with exit 1 & ERR_AIRGAP_UNSUPPORTED (EN & ZH), and start nothing.
+            let upAirgapEn = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t2"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(upAirgapEn.exitCode == 1)
+            #expect(upAirgapEn.stderr.contains("ERR_AIRGAP_UNSUPPORTED"))
+            #expect(upAirgapEn.stderr.contains("M5"))
+            #expect(mockBackend.startCount == 1)
+
+            let upAirgapZh = await cli.execute(
+                arguments: ["--lang", "zh", "--workspace", wsURL.path, "up", "t2"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(upAirgapZh.exitCode == 1)
+            #expect(upAirgapZh.stderr.contains("ERR_AIRGAP_UNSUPPORTED"))
+            #expect(upAirgapZh.stderr.contains("M5"))
+            #expect(mockBackend.startCount == 1)
+
+            // Switch back to `policy strict`, then `up t2` succeeds -> exit 0.
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "policy", "strict"],
+                curatedEntriesOverride: [entry],
+                environment: env
+            ).exitCode == 0)
+
+            let upStrict = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t2"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(upStrict.exitCode == 0)
+            #expect(mockBackend.startCount == 2)
+
+            _ = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t2"], curatedEntriesOverride: [entry], environment: env, daemonSpawnOverride: forbiddenSpawn)
+            _ = await cli.execute(arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t1"], curatedEntriesOverride: [entry], environment: env, daemonSpawnOverride: forbiddenSpawn)
+        }
+    }
 }
 
 // MARK: - Deterministic Mock Hardware Backend for Stage 3a Tests

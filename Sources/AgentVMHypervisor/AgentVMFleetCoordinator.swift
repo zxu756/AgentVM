@@ -898,6 +898,32 @@ public actor AgentVMFleetCoordinator {
         await l2Switch.firewall.updatePolicy(policy)
     }
 
+    /// Re-reads `manifest.json` before every hardware VM boot (Fixes A40) so a long-lived daemon or coordinator
+    /// immediately observes `agentvm policy airgap|strict` written by another process, and rejects `airgap`
+    /// with the exact same `ERR_AIRGAP_UNSUPPORTED` error as `agentvm run`.
+    private func refreshAndVerifyHardwareEgressPolicy(
+        for record: VMInstanceRecord,
+        manifest: AgentVMProjectManifest
+    ) async throws {
+        if let policyID = manifest.activeFirewallPolicyID {
+            let resolved: FirewallPolicySet?
+            if let preset = FirewallPolicySet.builtInPreset(id: policyID) {
+                resolved = preset
+            } else {
+                resolved = try? await store.fetchFirewallPolicy(policyID)
+            }
+            if let resolved {
+                await l2Switch.firewall.updatePolicy(resolved)
+            }
+        }
+        let activePolicy = await l2Switch.firewall.currentPolicy()
+        if manifest.activeFirewallPolicyID == PolicySetID("pol-airgap")
+            || activePolicy.id == PolicySetID("pol-airgap")
+            || record.spec.networkInterfaces.contains(where: { $0.mode == .isolatedAirgap }) {
+            throw AgentVMError.airgapPolicyUnsupportedBeforeM5(vmName: record.spec.name)
+        }
+    }
+
     // MARK: - Provision New Sandbox VM (Real APFS Sparse Disk + GPT + Cloud-Init ISO + Root Snapshot)
 
     public func createSandboxVM(
@@ -1400,6 +1426,9 @@ public actor AgentVMFleetCoordinator {
         }
 
         let manifest = try await store.loadManifest()
+        if !isSimulationBackend {
+            try await refreshAndVerifyHardwareEgressPolicy(for: record, manifest: manifest)
+        }
         let allVMs = try await store.listVMs()
         // Simulated `running` records never count against a hardware-backend quota; include in-flight hardware boots.
         var activeIDs = Set(
@@ -2219,11 +2248,8 @@ public actor AgentVMFleetCoordinator {
             throw AgentVMError.runUnsupportedInSimulation(vmName: fallbackName)
         }
         let initialRecord = try await loadVMForOperation(vmID)
-        let activePolicy = await l2Switch.firewall.currentPolicy()
-        if activePolicy.id == PolicySetID("pol-airgap")
-            || initialRecord.spec.networkInterfaces.contains(where: { $0.mode == .isolatedAirgap }) {
-            throw AgentVMError.airgapPolicyUnsupportedBeforeM5(vmName: initialRecord.spec.name)
-        }
+        let manifest = try await store.loadManifest()
+        try await refreshAndVerifyHardwareEgressPolicy(for: initialRecord, manifest: manifest)
 
         let vmLock = try VMExecutionLock.acquire(
             at: lockFileURL(for: vmID),

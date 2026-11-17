@@ -651,7 +651,7 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
         params: DaemonRPCExecParams,
         conn: DaemonSocketConnection
     ) async {
-        defer { conn.close() }
+        let disconnectMonitor = DaemonExecClientDisconnectMonitor(fd: conn.fd)
         do {
             let vmID = try await resolveVMID(params.vm)
             let req = GuestExecRequest(
@@ -662,47 +662,207 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                 runAsUser: params.runAsUser,
                 timeoutSeconds: params.timeoutSeconds
             )
+            disconnectMonitor.start { [coordinator] streamID in
+                Task {
+                    await coordinator.cancelDaemonExecStream(
+                        vmID: vmID,
+                        streamID: streamID,
+                        reason: "Exec cancelled by client disconnect."
+                    )
+                }
+            }
             let execResult = try await coordinator.executeInRunningDaemonVM(
                 vmID: vmID,
                 request: req,
-                language: params.lang
-            ) { chunk in
-                guard !chunk.data.isEmpty else { return }
-                let outStream: DaemonRPCExecStream
-                switch chunk.stream {
-                case .stdout:
-                    outStream = .stdout
-                case .stderr, .systemNotice:
-                    outStream = .stderr
+                language: params.lang,
+                onStreamOpened: { streamID in
+                    disconnectMonitor.bindStreamID(streamID)
+                },
+                onOutputChunk: { chunk in
+                    guard !chunk.data.isEmpty, !disconnectMonitor.isDisconnected else { return }
+                    let outStream: DaemonRPCExecStream
+                    switch chunk.stream {
+                    case .stdout:
+                        outStream = .stdout
+                    case .stderr, .systemNotice:
+                        outStream = .stderr
+                    }
+                    let notif = DaemonRPCExecOutputParams(stream: outStream, data: chunk.data)
+                    guard let encoded = try? DaemonRPCCodec.encodeExecOutputLine(notif) else { return }
+                    do {
+                        try conn.writeLineData(encoded)
+                    } catch {
+                        disconnectMonitor.triggerDisconnect()
+                    }
                 }
-                let notif = DaemonRPCExecOutputParams(stream: outStream, data: chunk.data)
-                if let encoded = try? DaemonRPCCodec.encodeExecOutputLine(notif) {
-                    try? conn.writeLineData(encoded)
+            )
+            await disconnectMonitor.stop()
+            if !disconnectMonitor.isDisconnected {
+                let resp = DaemonRPCResponse<DaemonRPCExecResult>.success(
+                    id: id,
+                    result: DaemonRPCExecResult(
+                        exitCode: execResult.exitCode,
+                        timedOut: execResult.timedOut
+                    )
+                )
+                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+            }
+            conn.close()
+        } catch let err as AgentVMError {
+            await disconnectMonitor.stop()
+            if !disconnectMonitor.isDisconnected {
+                let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(
+                    id: id,
+                    agentVMError: err,
+                    language: params.lang
+                )
+                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+            }
+            conn.close()
+        } catch {
+            await disconnectMonitor.stop()
+            if !disconnectMonitor.isDisconnected {
+                let rpcErr = DaemonRPCError(
+                    code: DaemonRPCError.internalErrorCode,
+                    errorCode: "ERR_DAEMON_INTERNAL",
+                    message: error.localizedDescription
+                )
+                let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(id: id, error: rpcErr)
+                try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+            }
+            conn.close()
+        }
+    }
+}
+
+/// Monitors an `exec` client's Unix socket descriptor for EOF/disconnect without setting `O_NONBLOCK`
+/// on the shared open file description (`MSG_DONTWAIT`), guaranteeing `setCancelHandler` completes
+/// before `DaemonSocketConnection.close()` closes the descriptor.
+private final class DaemonExecClientDisconnectMonitor: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fd: Int32
+    private var source: DispatchSourceRead?
+    private var onCancelStream: (@Sendable (UInt32) -> Void)?
+    private var boundStreamID: UInt32?
+    private var disconnected = false
+    private var cancelFired = false
+    private var sourceStopped = false
+    private var stopWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(fd: Int32) {
+        self.fd = fd
+    }
+
+    var isDisconnected: Bool {
+        lock.withLock { disconnected }
+    }
+
+    func start(onCancelStream: @escaping @Sendable (UInt32) -> Void) {
+        guard fd >= 0 else {
+            lock.withLock {
+                disconnected = true
+                sourceStopped = true
+            }
+            return
+        }
+        let queue = DispatchQueue(label: "io.zxu756.agentvm.daemon.exec-eof.\(fd)", qos: .userInitiated)
+        let readSource = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        let descriptor = fd
+
+        readSource.setEventHandler { [weak self] in
+            var scratch = [UInt8](repeating: 0, count: 64)
+            let n = Darwin.recv(descriptor, &scratch, scratch.count, MSG_DONTWAIT)
+            if n == 0 {
+                self?.triggerDisconnect()
+                readSource.cancel()
+            } else if n < 0 {
+                let code = Darwin.errno
+                if code != EAGAIN && code != EWOULDBLOCK && code != EINTR {
+                    self?.triggerDisconnect()
+                    readSource.cancel()
                 }
             }
-            let resp = DaemonRPCResponse<DaemonRPCExecResult>.success(
-                id: id,
-                result: DaemonRPCExecResult(
-                    exitCode: execResult.exitCode,
-                    timedOut: execResult.timedOut
-                )
-            )
-            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
-        } catch let err as AgentVMError {
-            let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(
-                id: id,
-                agentVMError: err,
-                language: params.lang
-            )
-            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
-        } catch {
-            let rpcErr = DaemonRPCError(
-                code: DaemonRPCError.internalErrorCode,
-                errorCode: "ERR_DAEMON_INTERNAL",
-                message: error.localizedDescription
-            )
-            let resp = DaemonRPCResponse<DaemonRPCExecResult>.failure(id: id, error: rpcErr)
-            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        }
+
+        readSource.setCancelHandler { [weak self] in
+            guard let self else { return }
+            let waiters = self.lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+                self.sourceStopped = true
+                let all = self.stopWaiters
+                self.stopWaiters.removeAll()
+                return all
+            }
+            for w in waiters {
+                w.resume()
+            }
+        }
+
+        let immediateStreamToCancel: UInt32? = lock.withLock {
+            self.onCancelStream = onCancelStream
+            self.source = readSource
+            if self.disconnected, !self.cancelFired, let sid = self.boundStreamID {
+                self.cancelFired = true
+                return sid
+            }
+            return nil
+        }
+        readSource.resume()
+        if let sid = immediateStreamToCancel {
+            onCancelStream(sid)
+        }
+    }
+
+    func bindStreamID(_ streamID: UInt32) {
+        let action: ((@Sendable (UInt32) -> Void), UInt32)? = lock.withLock {
+            boundStreamID = streamID
+            if disconnected, !cancelFired, let cb = onCancelStream {
+                cancelFired = true
+                return (cb, streamID)
+            }
+            return nil
+        }
+        if let (cb, sid) = action {
+            cb(sid)
+        }
+    }
+
+    func triggerDisconnect() {
+        let action: ((@Sendable (UInt32) -> Void), UInt32)? = lock.withLock {
+            disconnected = true
+            if !cancelFired, let sid = boundStreamID, let cb = onCancelStream {
+                cancelFired = true
+                return (cb, sid)
+            }
+            return nil
+        }
+        if let (cb, sid) = action {
+            cb(sid)
+        }
+    }
+
+    func stop() async {
+        let (srcToCancel, alreadyDone) = lock.withLock { () -> (DispatchSourceRead?, Bool) in
+            if source == nil || sourceStopped {
+                return (nil, true)
+            }
+            return (source, false)
+        }
+        if alreadyDone {
+            return
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let resumeNow = lock.withLock { () -> Bool in
+                if sourceStopped {
+                    return true
+                }
+                stopWaiters.append(cont)
+                return false
+            }
+            if resumeNow {
+                cont.resume()
+            } else {
+                srcToCancel?.cancel()
+            }
         }
     }
 }

@@ -426,6 +426,19 @@ public actor VsockMultiplexSession {
         _ request: GuestExecRequest,
         onChunk: (@Sendable (GuestExecOutputChunk) async -> Void)? = nil
     ) async throws -> GuestExecResult {
+        try await executeCommandStreaming(
+            request,
+            onStreamOpened: nil,
+            onChunk: onChunk
+        )
+    }
+
+    /// Executes a command inside the guest sandbox while exposing the allocated `AVM1` `streamID` and streaming chunks.
+    public func executeCommandStreaming(
+        _ request: GuestExecRequest,
+        onStreamOpened: (@Sendable (UInt32) -> Void)?,
+        onChunk: (@Sendable (GuestExecOutputChunk) async -> Void)?
+    ) async throws -> GuestExecResult {
         try ensureActiveTransport()
 
         let streamID = allocateStreamID(channel: .execProcess)
@@ -438,6 +451,7 @@ public actor VsockMultiplexSession {
             onChunk: onChunk,
             promise: promise
         )
+        onStreamOpened?(streamID)
 
         let encodedRequest = try VsockWireJSON.encode(request)
 
@@ -490,6 +504,23 @@ public actor VsockMultiplexSession {
             completedAt: Date()
         )
         ctx.promise.resolve(timedOutResult)
+    }
+
+    /// Aborts a single in-flight `.execProcess` stream by sending an `AVM1` `RST` frame on `streamID`
+    /// without tearing down the multiplexed vsock session or affecting sibling streams.
+    public func cancelExecStream(
+        streamID: UInt32,
+        reason: String = "Exec cancelled by client disconnect."
+    ) async {
+        guard let ctx = pendingExecs.removeValue(forKey: streamID) else { return }
+        try? await sendRawControlFrame(
+            channel: .execProcess,
+            flags: [.rst, .endOfMessage],
+            streamID: streamID,
+            payload: Data()
+        )
+        closeStreamState(streamID: streamID)
+        ctx.promise.reject(AgentVMError.vsockProtocolViolation(detail: reason))
     }
 
     // MARK: File Transfer with SHA-256 Integrity & Flow Control (Channel .fileTransfer)

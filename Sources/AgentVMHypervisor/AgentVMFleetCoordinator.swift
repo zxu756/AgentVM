@@ -2348,6 +2348,7 @@ public actor AgentVMFleetCoordinator {
         vmID: VMID,
         request: GuestExecRequest,
         language: AppLanguage = .en,
+        onStreamOpened: (@Sendable (UInt32) -> Void)? = nil,
         onOutputChunk: (@Sendable (GuestExecOutputChunk) async -> Void)? = nil
     ) async throws -> GuestExecResult {
         guard let existing = try await store.fetchVM(vmID) else {
@@ -2387,9 +2388,23 @@ public actor AgentVMFleetCoordinator {
                 state: record.telemetry.state.rawValue
             )
         }
-        let execResult = try await session.executeCommandStreaming(request, onChunk: onOutputChunk)
+        let execResult = try await session.executeCommandStreaming(
+            request,
+            onStreamOpened: onStreamOpened,
+            onChunk: onOutputChunk
+        )
         try? await store.appendExecResult(execResult)
         return execResult
+    }
+
+    /// Cancels a single `.execProcess` stream on a running daemon VM by emitting an `AVM1` `RST` frame.
+    public func cancelDaemonExecStream(
+        vmID: VMID,
+        streamID: UInt32,
+        reason: String = "Exec cancelled by client disconnect."
+    ) async {
+        guard let session = vsockSessions[vmID] else { return }
+        await session.cancelExecStream(streamID: streamID, reason: reason)
     }
 
     /// Executes a single guest command in a complete in-process boot -> vsock connect -> exec -> halt lifecycle (`agentvm run`).

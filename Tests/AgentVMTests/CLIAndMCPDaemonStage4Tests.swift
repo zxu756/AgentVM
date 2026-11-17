@@ -366,6 +366,256 @@ struct CLIAndMCPDaemonStage4Tests {
             )
         }
     }
+
+    // MARK: - Item 2: `exec` Cancellation (`SIGINT` -> 130, `SIGTERM` -> 143, Daemon Emits Vsock `RST`, VM Keeps Running)
+
+    @Test("Item 2: 'exec' client receiving SIGINT or SIGTERM closes socket, daemon emits AVM1 RST on that stream, client exits 130 or 143, and VM stays running")
+    func daemonExecCancellationClosesSocketEmitsVsockRSTExits130Or143AndLeavesVMRunning() async throws {
+        let realBase = try makePrivateTmpDirectory(prefix: "avm-s4-i2")
+        defer { try? FileManager.default.removeItem(atPath: realBase) }
+        defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
+
+        let (cacheDir, cachedURL, entry) = try await stageBootableCachedImage(in: realBase)
+        defer { _ = Darwin.chmod(cachedURL.path, 0o644) }
+
+        let wsURL = URL(fileURLWithPath: "\(realBase)/ExecCancelStage4.agentvm", isDirectory: true)
+        let isolatedHome = "\(realBase)/home"
+        try FileManager.default.createDirectory(atPath: isolatedHome, withIntermediateDirectories: true)
+        let env = [
+            "HOME": isolatedHome,
+            "CFFIXED_USER_HOME": isolatedHome,
+            "AGENTVM_IMAGE_CACHE": cacheDir.path
+        ]
+        let cli = AgentVMCLIRunner()
+        let forbiddenSpawn = DaemonSpawnCommandOverride(
+            executablePath: "/bin/sh",
+            arguments: ["-c", "exit 95"],
+            environment: env
+        )
+
+        #expect(await cli.execute(
+            arguments: ["--lang", "en", "--workspace", wsURL.path, "create", "t1", "--image", entry.id],
+            curatedEntriesOverride: [entry],
+            environment: env
+        ).exitCode == 0)
+
+        let rstRecorder = Stage4InboundFrameRecorder()
+        let mockBackend = Stage4ScriptableGuestBackend(
+            frameObserver: { header, _, _ in
+                rstRecorder.record(header)
+            },
+            execHandler: { streamID, req, writer in
+                rstRecorder.recordExecStarted(executable: req.executable, streamID: streamID)
+                if req.executable.hasPrefix("hang-until-rst") {
+                    writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: 1, data: Data("started\n".utf8))
+                    let deadline = DispatchTime.now().uptimeNanoseconds &+ 1_500_000_000
+                    while DispatchTime.now().uptimeNanoseconds < deadline {
+                        if rstRecorder.hasRST(forStreamID: streamID) {
+                            return
+                        }
+                        try? await Task.sleep(nanoseconds: 10_000_000)
+                    }
+                    // Fallback completion if host never sent RST so unimplemented test fails fast instead of hanging.
+                    writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 99)
+                } else if req.executable == "after-cancel-echo" {
+                    writer.sendOutputChunk(streamID: streamID, requestID: req.id, stream: .stdout, seq: 1, data: Data("alive\n".utf8))
+                    writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+                } else {
+                    writer.sendCompletion(streamID: streamID, requestID: req.id, exitCode: 0)
+                }
+            }
+        )
+        defer { mockBackend.shutdownAll() }
+
+        try await withStartedDaemonServer(
+            workspaceURL: wsURL,
+            imageCacheDirectoryURL: cacheDir,
+            curatedImageEntries: [entry],
+            hardwareBackendOverride: mockBackend
+        ) { _ in
+            #expect(await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                hasEntitlementOverride: true,
+                daemonSpawnOverride: forbiddenSpawn
+            ).exitCode == 0)
+
+            // 1. SIGINT via OneShotRunSignalController -> client closes socket, returns 130 promptly, daemon emits RST on streamID1.
+            let sigIntController = OneShotRunSignalController()
+            let t0Int = DispatchTime.now().uptimeNanoseconds
+            let intTask = Task<CLIExecutionOutcome, Never> {
+                await cli.execute(
+                    arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "hang-until-rst-int"],
+                    curatedEntriesOverride: [entry],
+                    environment: env,
+                    daemonSpawnOverride: forbiddenSpawn,
+                    signalController: sigIntController
+                )
+            }
+            let streamID1 = try await rstRecorder.waitForExecStreamID(executable: "hang-until-rst-int", timeoutSeconds: 2.0)
+            try await Task.sleep(nanoseconds: 40_000_000)
+            sigIntController.deliver(signal: SIGINT)
+
+            let intOutcome = await intTask.value
+            let intElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - t0Int) / 1_000_000.0
+            #expect(intOutcome.exitCode == 130, "Expected SIGINT exit 130, got \(intOutcome.exitCode) (stderr: \(intOutcome.stderr))")
+            #expect(intOutcome.stderrData.isEmpty)
+            #expect(intElapsedMs < 1_000.0, "SIGINT cancellation took \(intElapsedMs) ms (expected < 1000 ms)")
+            let rst1Observed = await rstRecorder.waitForRST(streamID: streamID1, timeoutSeconds: 1.0)
+            #expect(rst1Observed == true, "Daemon must emit AVM1 .rst frame on cancelled exec stream \(streamID1)")
+
+            // 2. Real child `AgentVM ... exec` CLI process receiving OS SIGTERM -> exits 143 (not uncaught signal), daemon emits RST on streamID2.
+            let agentVMBinaryURL = try Self.locateBuiltAgentVMExecutable()
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            let childProc = Process()
+            childProc.executableURL = agentVMBinaryURL
+            childProc.arguments = ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "hang-until-rst-term"]
+            childProc.environment = [
+                "HOME": isolatedHome,
+                "CFFIXED_USER_HOME": isolatedHome,
+                "AGENTVM_IMAGE_CACHE": cacheDir.path,
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"
+            ]
+            childProc.standardInput = FileHandle.nullDevice
+            childProc.standardOutput = stdoutPipe
+            childProc.standardError = stderrPipe
+            try childProc.run()
+            defer {
+                if childProc.isRunning {
+                    childProc.terminate()
+                }
+            }
+
+            let streamID2 = try await rstRecorder.waitForExecStreamID(executable: "hang-until-rst-term", timeoutSeconds: 2.0)
+            try await Task.sleep(nanoseconds: 40_000_000)
+            #expect(Darwin.kill(childProc.processIdentifier, SIGTERM) == 0)
+            childProc.waitUntilExit()
+
+            #expect(childProc.terminationReason == .exit, "Expected graceful exit(143), got terminationReason=\(childProc.terminationReason.rawValue)")
+            #expect(childProc.terminationStatus == 143, "Expected SIGTERM exit 143, got \(childProc.terminationStatus)")
+            let childStderr = (try? stderrPipe.fileHandleForReading.readToEnd()) ?? Data()
+            #expect(childStderr.isEmpty)
+            let rst2Observed = await rstRecorder.waitForRST(streamID: streamID2, timeoutSeconds: 1.0)
+            #expect(rst2Observed == true, "Daemon must emit AVM1 .rst frame on SIGTERM-cancelled exec stream \(streamID2)")
+
+            // 3. VM `t1` keeps running on the same instance and serves subsequent `exec` cleanly.
+            #expect(mockBackend.startCount == 1)
+            let psRes = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "ps", "--json"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(psRes.exitCode == 0)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let fleet = try decoder.decode([VMInstanceRecord].self, from: Data(psRes.stdout.utf8))
+            #expect(fleet.first?.telemetry.state == .running)
+
+            let afterRes = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "after-cancel-echo"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+            #expect(afterRes.exitCode == 0)
+            #expect(afterRes.stdout == "alive\n")
+
+            _ = await cli.execute(
+                arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t1"],
+                curatedEntriesOverride: [entry],
+                environment: env,
+                daemonSpawnOverride: forbiddenSpawn
+            )
+        }
+    }
+
+    private static func locateBuiltAgentVMExecutable() throws -> URL {
+        let bundleDir = Bundle(for: Stage4BundleLocatorToken.self).bundleURL.deletingLastPathComponent()
+        let sibling = bundleDir.appendingPathComponent("AgentVM", isDirectory: false)
+        if FileManager.default.isExecutableFile(atPath: sibling.path) {
+            return sibling
+        }
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let fallbacks = [
+            repoRoot.appendingPathComponent(".build/out/Products/Debug/AgentVM"),
+            repoRoot.appendingPathComponent(".build/arm64-apple-macosx/debug/AgentVM"),
+            repoRoot.appendingPathComponent(".build/debug/AgentVM")
+        ]
+        for candidate in fallbacks where FileManager.default.isExecutableFile(atPath: candidate.path) {
+            return candidate
+        }
+        throw NSError(
+            domain: "CLIAndMCPDaemonStage4Tests",
+            code: 404,
+            userInfo: [NSLocalizedDescriptionKey: "Unable to locate built AgentVM binary next to test bundle at \(bundleDir.path)."]
+        )
+    }
+}
+
+private final class Stage4BundleLocatorToken {}
+
+final class Stage4InboundFrameRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rstStreamIDs: Set<UInt32> = []
+    private var windowUpdatesByStream: [UInt32: [UInt32]] = [:]
+    private var execStreamByExecutable: [String: UInt32] = [:]
+
+    func record(_ header: VsockFrameHeader) {
+        lock.withLock {
+            if header.channel == .execProcess && header.flags.contains(.rst) {
+                rstStreamIDs.insert(header.streamID)
+            }
+            if header.flags.contains(.windowUpdate) {
+                windowUpdatesByStream[header.streamID, default: []].append(header.windowCredit)
+            }
+        }
+    }
+
+    func recordExecStarted(executable: String, streamID: UInt32) {
+        lock.withLock {
+            execStreamByExecutable[executable] = streamID
+        }
+    }
+
+    func hasRST(forStreamID streamID: UInt32) -> Bool {
+        lock.withLock { rstStreamIDs.contains(streamID) }
+    }
+
+    func windowUpdates(forStreamID streamID: UInt32) -> [UInt32] {
+        lock.withLock { windowUpdatesByStream[streamID] ?? [] }
+    }
+
+    func waitForExecStreamID(executable: String, timeoutSeconds: TimeInterval) async throws -> UInt32 {
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ UInt64(max(0.05, timeoutSeconds) * 1_000_000_000)
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if let sid = lock.withLock({ execStreamByExecutable[executable] }) {
+                return sid
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw NSError(
+            domain: "Stage4InboundFrameRecorder",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for exec '\(executable)' to reach guest."]
+        )
+    }
+
+    func waitForRST(streamID: UInt32, timeoutSeconds: TimeInterval) async -> Bool {
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ UInt64(max(0.05, timeoutSeconds) * 1_000_000_000)
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if hasRST(forStreamID: streamID) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return hasRST(forStreamID: streamID)
+    }
 }
 
 // MARK: - Stage 4 Test Support: Scriptable AVM1 Guest Peer & Live Stream Tracker

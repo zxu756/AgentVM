@@ -134,6 +134,7 @@ public final class OneShotRunSignalController: @unchecked Sendable {
     private var activeTask: Task<GuestExecResult, Error>?
     private var activeCoordinator: AgentVMFleetCoordinator?
     private var activeVMID: VMID?
+    private var activeDaemonConnection: DaemonSocketConnection?
 
     public init() {}
 
@@ -182,13 +183,30 @@ public final class OneShotRunSignalController: @unchecked Sendable {
         }
     }
 
+    func registerActiveDaemonExecConnection(_ conn: DaemonSocketConnection) {
+        let shouldShutdownImmediately = lock.withLock { () -> Bool in
+            activeDaemonConnection = conn
+            return recordedSignal != nil
+        }
+        if shouldShutdownImmediately {
+            conn.shutdownReadWrite()
+        }
+    }
+
+    func clearActiveDaemonExecConnection() {
+        lock.withLock {
+            activeDaemonConnection = nil
+        }
+    }
+
     public func deliver(signal: Int32) {
-        let snapshot: (Task<GuestExecResult, Error>?, AgentVMFleetCoordinator?, VMID?) = lock.withLock {
+        let snapshot: (Task<GuestExecResult, Error>?, AgentVMFleetCoordinator?, VMID?, DaemonSocketConnection?) = lock.withLock {
             if recordedSignal == nil {
                 recordedSignal = signal
             }
-            return (activeTask, activeCoordinator, activeVMID)
+            return (activeTask, activeCoordinator, activeVMID, activeDaemonConnection)
         }
+        snapshot.3?.shutdownReadWrite()
         snapshot.0?.cancel()
         if let coordinator = snapshot.1, let vmID = snapshot.2 {
             Task {
@@ -1343,7 +1361,9 @@ public struct AgentVMCLIRunner: Sendable {
         let vmID = try await resolveVMID(vmToken, coordinator: coordinator)
 
         if !isSimulation {
-            _ = signalController
+            if let earlySignalExit = signalController?.terminationExitCode {
+                return CLIExecutionOutcome(exitCode: earlySignalExit, stdoutData: Data(), stderrData: Data())
+            }
             let execParams = DaemonRPCExecParams(
                 vm: vmID.rawValue,
                 executable: exe,
@@ -1355,10 +1375,14 @@ public struct AgentVMCLIRunner: Sendable {
                 lang: language
             )
             let collector = StreamedBinaryOutputCollector()
+            defer { signalController?.clearActiveDaemonExecConnection() }
             do {
                 let rpcOutcome = try DaemonClient.performExecCall(
                     workspaceURL: coordinator.store.bundleURL,
                     params: execParams,
+                    onConnectionEstablished: { conn in
+                        signalController?.registerActiveDaemonExecConnection(conn)
+                    },
                     onOutputChunk: { chunk in
                         guard !chunk.data.isEmpty else { return }
                         switch chunk.stream {
@@ -1377,6 +1401,14 @@ public struct AgentVMCLIRunner: Sendable {
                         }
                     }
                 )
+                if let signalExitCode = signalController?.terminationExitCode {
+                    let partial = collector.snapshot()
+                    return CLIExecutionOutcome(
+                        exitCode: signalExitCode,
+                        stdoutData: partial.stdout,
+                        stderrData: partial.stderr
+                    )
+                }
                 switch rpcOutcome {
                 case let .connected((_, execRes)):
                     let collected = collector.snapshot()
@@ -1405,6 +1437,14 @@ public struct AgentVMCLIRunner: Sendable {
                     )
                 }
             } catch let rpcErr as DaemonRPCError {
+                if let signalExitCode = signalController?.terminationExitCode {
+                    let partial = collector.snapshot()
+                    return CLIExecutionOutcome(
+                        exitCode: signalExitCode,
+                        stdoutData: partial.stdout,
+                        stderrData: partial.stderr
+                    )
+                }
                 return CLIExecutionOutcome(
                     exitCode: Self.runInfrastructureErrorExitCode,
                     stderr: DaemonLifecycleErrorFormatter.formatExecRPCErrorStderr(
@@ -1413,6 +1453,16 @@ public struct AgentVMCLIRunner: Sendable {
                         language: language
                     )
                 )
+            } catch {
+                if let signalExitCode = signalController?.terminationExitCode {
+                    let partial = collector.snapshot()
+                    return CLIExecutionOutcome(
+                        exitCode: signalExitCode,
+                        stdoutData: partial.stdout,
+                        stderrData: partial.stderr
+                    )
+                }
+                throw error
             }
         }
 

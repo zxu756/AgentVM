@@ -574,6 +574,13 @@ public final class DaemonSocketConnection: @unchecked Sendable {
         try DaemonRPCLineWriter.writeLineData(lineData, toFD: current, maxLineBytes: maxLineBytes)
     }
 
+    public func shutdownReadWrite() {
+        let descriptor = lock.withLock { rawFD }
+        if descriptor >= 0 {
+            _ = Darwin.shutdown(descriptor, SHUT_RDWR)
+        }
+    }
+
     public func close() {
         let descriptor = lock.withLock { () -> Int32 in
             let current = rawFD

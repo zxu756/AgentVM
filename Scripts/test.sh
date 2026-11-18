@@ -50,6 +50,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage1PrivateBytesTests"
+            echo "M3Stage2aChildIdentityTests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
@@ -57,11 +58,13 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage1PrivateBytesTests"
+            echo "M3Stage2aChildIdentityTests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"
             echo "CLIAndMCPDaemonStage5Tests"
             echo "M3Stage1PrivateBytesTests"
+            echo "M3Stage2aChildIdentityTests"
             ;;
         AgentVMNetSwitch|NetSwitch)
             echo "NetSwitchDissectorAndPCAPTests"
@@ -72,6 +75,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage5Tests"
             echo "CLIAndMCPDaemonStage6Tests"
+            echo "M3Stage2aChildIdentityTests"
             ;;
         AgentVMPluginHost|PluginHost)
             echo "PluginSandboxAndIACTests"
@@ -85,6 +89,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage5Tests"
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage1PrivateBytesTests"
+            echo "M3Stage2aChildIdentityTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -98,6 +103,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage5Tests"
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage1PrivateBytesTests"
+            echo "M3Stage2aChildIdentityTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -117,6 +123,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage6Tests"
             echo "StudioViewsHonestyTests"
             echo "M3Stage1PrivateBytesTests"
+            echo "M3Stage2aChildIdentityTests"
             ;;
         *)
             echo "ERROR: Unknown module '$mod'" >&2

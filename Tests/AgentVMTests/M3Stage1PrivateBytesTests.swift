@@ -437,16 +437,30 @@ struct M3Stage1PrivateBytesTests {
             try await store.upsertSnapshot(decodedSnap)
         }
 
-        // Overwrite telemetry_json in SQLite with strict pre-M3 JSON (no apfsPrivateBytes / allocatedDiskBytes)
-        // and set apfs_private_bytes (if column exists) to NULL so decoding falls back to dirty_delta_bytes.
+        // Overwrite telemetry_json in SQLite with strict pre-M3 SQLite JSON (numeric Date, cowDirtyBytes only,
+        // no apfsPrivateBytes / allocatedDiskBytes) and set apfs_private_bytes to NULL so decoding falls back to dirty_delta_bytes.
         do {
             let rawDB = try SQLiteWALDatabase(
                 fileURL: bundleURL.appendingPathComponent("state.sqlite"),
                 runMigrations: false
             )
+            let existingRow = try #require(try rawDB.queryOne(
+                "SELECT telemetry_json FROM vms WHERE id = ?;",
+                bindings: ["vm-legacy-01".sqliteValue]
+            ))
+            let currentJSON = try existingRow.string("telemetry_json")
+            var obj = try #require(try JSONSerialization.jsonObject(with: Data(currentJSON.utf8)) as? [String: Any])
+            obj.removeValue(forKey: "apfsPrivateBytes")
+            obj.removeValue(forKey: "allocatedDiskBytes")
+            obj["cowDirtyBytes"] = 131_072
+            let strippedData = try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
+            let strippedJSON = String(decoding: strippedData, as: UTF8.self)
+            #expect(!strippedJSON.contains("apfsPrivateBytes"))
+            #expect(!strippedJSON.contains("allocatedDiskBytes"))
+
             try rawDB.execute(
                 "UPDATE vms SET telemetry_json = ? WHERE id = ?;",
-                bindings: [legacyTelemetryJSON.sqliteValue, "vm-legacy-01".sqliteValue]
+                bindings: [strippedJSON.sqliteValue, "vm-legacy-01".sqliteValue]
             )
             let cols = try rawDB.query("PRAGMA table_info(snapshots);")
             let colNames = Set(try cols.map { try $0.string("name").lowercased() })

@@ -548,6 +548,15 @@ public struct AgentVMCLIRunner: Sendable {
                 )
             }
         }
+        if subcommand == "snapshot" {
+            if let usageErr = Self.validateSnapshotSubcommandUsage(parsed: parsed, language: language) {
+                let rawStderr = usageErr + "\n"
+                return CLIExecutionOutcome(
+                    exitCode: Self.usageErrorExitCode,
+                    stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                )
+            }
+        }
         var parsedRun: ParsedRunArguments?
         if subcommand == "run" {
             switch Self.parseRunArguments(rest, language: language) {
@@ -754,11 +763,33 @@ public struct AgentVMCLIRunner: Sendable {
                     hasEntitlementOverride: nil
                 )
             case "branch", "fork":
-                rawOutcome = try await runBranchFork(coordinator: coordinator, parsed: parsed, language: language)
+                rawOutcome = try await runBranchFork(
+                    coordinator: coordinator,
+                    parsed: parsed,
+                    language: language,
+                    progressStderrCollector: streamedProgressStderr,
+                    liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
+                )
             case "snapshot":
-                rawOutcome = try await runSnapshot(coordinator: coordinator, parsed: parsed, language: language)
+                if parsed.flags.contains("--json"),
+                   parsed.positionals.first == "list" || parsed.positionals.isEmpty {
+                    stdoutFormat = .json
+                }
+                rawOutcome = try await runSnapshot(
+                    coordinator: coordinator,
+                    parsed: parsed,
+                    language: language,
+                    progressStderrCollector: streamedProgressStderr,
+                    liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
+                )
             case "restore":
-                rawOutcome = try await runRestore(coordinator: coordinator, parsed: parsed, language: language)
+                rawOutcome = try await runRestore(
+                    coordinator: coordinator,
+                    parsed: parsed,
+                    language: language,
+                    progressStderrCollector: streamedProgressStderr,
+                    liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
+                )
             case "exec":
                 rawOutcome = try await runExec(
                     coordinator: coordinator,
@@ -1036,7 +1067,7 @@ public struct AgentVMCLIRunner: Sendable {
                 Self.padDisplayColumn("CPU", width: 8),
                 Self.padDisplayColumn("内存", width: 10),
                 Self.padDisplayColumn("IPv4", width: 15),
-                "CoW 脏块"
+                "私有字节（不与其他克隆共享）"
             ].joined(separator: " "))
         } else {
             lines.append([
@@ -1047,13 +1078,13 @@ public struct AgentVMCLIRunner: Sendable {
                 Self.padDisplayColumn("CPU", width: 8),
                 Self.padDisplayColumn("MEMORY", width: 10),
                 Self.padDisplayColumn("IPV4", width: 15),
-                "COW_DIRTY"
+                "APFS_PRIVATE (not shared with other clones)"
             ].joined(separator: " "))
         }
 
         for (vm, stateText) in zip(vms, stateTexts) {
             let ip = vm.spec.networkInterfaces.first?.ipv4Address ?? "—"
-            let dirty = ByteMetricsFormatter.formatBytes(vm.telemetry.cowDirtyBytes)
+            let privateBytesStr = ByteMetricsFormatter.formatBytes(vm.telemetry.apfsPrivateBytes)
             lines.append([
                 Self.padDisplayColumn(vm.id.rawValue, width: 20),
                 Self.padDisplayColumn(Self.truncateDisplayColumn(vm.spec.name, maxWidth: 21), width: 22),
@@ -1062,7 +1093,7 @@ public struct AgentVMCLIRunner: Sendable {
                 Self.padDisplayColumn(vm.telemetry.formattedCPUUsage, width: 8),
                 Self.padDisplayColumn(vm.telemetry.formattedMemoryResident, width: 10),
                 Self.padDisplayColumn(ip, width: 15),
-                dirty
+                privateBytesStr
             ].joined(separator: " "))
         }
         let simulatedActiveCount = vms.filter { $0.telemetry.isSimulatedActiveState }.count
@@ -1081,6 +1112,13 @@ public struct AgentVMCLIRunner: Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         return String(decoding: try encoder.encode(vms), as: UTF8.self)
+    }
+
+    private static func cloneFallbackStderrNotice(language: AppLanguage) -> String {
+        if language == .zhHans {
+            return "说明：目标卷不支持 APFS clonefile(2) 或跨卷无法克隆，已改为完整复制。\n"
+        }
+        return "Note: APFS clonefile(2) is unavailable on this volume or across volumes; fell back to a full copy.\n"
     }
 
     private func runCreateVM(
@@ -1108,10 +1146,10 @@ public struct AgentVMCLIRunner: Sendable {
                 memoryMB: mem
             )
             if summary.diskCloneStrategy == .fullCopyFallback {
-                let copyNote = isZh
-                    ? "说明：镜像缓存与工作区不在同一个卷（无法使用 clonefile），已改为完整复制生成根磁盘。\n"
-                    : "Note: image cache and workspace are not on the same volume (clonefile unavailable); fell back to a full copy for the root disk.\n"
-                progressStderrCollector.emit(copyNote, liveHandler: liveStderrHandler)
+                progressStderrCollector.emit(
+                    Self.cloneFallbackStderrNotice(language: language),
+                    liveHandler: liveStderrHandler
+                )
             }
             let diskBytes = summary.vmRecord.spec.blockDevices.first?.virtualSizeBytes ?? summary.rootSnapshot.virtualDiskBytes
             let sizeStr = ByteMetricsFormatter.formatBytes(diskBytes)
@@ -1136,10 +1174,20 @@ public struct AgentVMCLIRunner: Sendable {
             vcpus: cpus,
             memoryMB: mem
         )
+        if summary.diskCloneStrategy == .fullCopyFallback {
+            progressStderrCollector.emit(
+                Self.cloneFallbackStderrNotice(language: language),
+                liveHandler: liveStderrHandler
+            )
+        }
         let msg = isZh
             ? "已创建虚拟机「\(summary.vmRecord.spec.name)」（\(summary.vmRecord.id.rawValue)），根快照 \(summary.rootSnapshot.id.rawValue)（空稀疏 GPT 磁盘，未安装客户机系统）\n"
             : "Created VM '\(summary.vmRecord.spec.name)' (\(summary.vmRecord.id.rawValue)) with root snapshot \(summary.rootSnapshot.id.rawValue) (empty sparse GPT disk, no guest OS installed)\n"
-        return CLIExecutionOutcome(exitCode: 0, stdout: msg)
+        return CLIExecutionOutcome(
+            exitCode: 0,
+            stdout: msg,
+            stderr: progressStderrCollector.snapshot()
+        )
     }
 
     private func runLifecycle(
@@ -1246,7 +1294,13 @@ public struct AgentVMCLIRunner: Sendable {
         return CLIExecutionOutcome(exitCode: 0, stdout: msg)
     }
 
-    private func runBranchFork(coordinator: AgentVMFleetCoordinator, parsed: ParsedSubcommandArguments, language: AppLanguage) async throws -> CLIExecutionOutcome {
+    private func runBranchFork(
+        coordinator: AgentVMFleetCoordinator,
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage,
+        progressStderrCollector: StreamedStderrCollector,
+        liveStderrHandler: (@Sendable (String) -> Void)?
+    ) async throws -> CLIExecutionOutcome {
         let isZh = (language == .zhHans)
         let positional = parsed.positionals
         guard positional.count >= 2 else {
@@ -1280,6 +1334,12 @@ public struct AgentVMCLIRunner: Sendable {
             agentOwnerTag: owner,
             bootImmediately: shouldBoot
         )
+        if fork.diskCloneStrategy == .fullCopyFallback {
+            progressStderrCollector.emit(
+                Self.cloneFallbackStderrNotice(language: language),
+                liveHandler: liveStderrHandler
+            )
+        }
         let msg: String
         if isZh {
             msg = String(
@@ -1298,40 +1358,89 @@ public struct AgentVMCLIRunner: Sendable {
                 fork.forkPointSnapshot.id.rawValue
             )
         }
-        return CLIExecutionOutcome(exitCode: 0, stdout: msg)
+        return CLIExecutionOutcome(
+            exitCode: 0,
+            stdout: msg,
+            stderr: progressStderrCollector.snapshot()
+        )
     }
 
-    private func runSnapshot(coordinator: AgentVMFleetCoordinator, parsed: ParsedSubcommandArguments, language: AppLanguage) async throws -> CLIExecutionOutcome {
+    private func runSnapshot(
+        coordinator: AgentVMFleetCoordinator,
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage,
+        progressStderrCollector: StreamedStderrCollector,
+        liveStderrHandler: (@Sendable (String) -> Void)?
+    ) async throws -> CLIExecutionOutcome {
         let isZh = (language == .zhHans)
         let positional = parsed.positionals
         if positional.first == "list" || positional.isEmpty {
-            let snaps = try await coordinator.store.listSnapshots()
-            let lines = snaps.map {
-                "\($0.id.rawValue)\t\($0.vmID.rawValue)\t[\($0.branchName)]\t\($0.kind.rawValue)\t\($0.title)"
+            let snaps = try await coordinator.listSnapshotsForReporting()
+            if parsed.flags.contains("--json") {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                let encoded = String(decoding: try encoder.encode(snaps), as: UTF8.self) + "\n"
+                return CLIExecutionOutcome(exitCode: 0, stdout: encoded)
             }
-            return CLIExecutionOutcome(exitCode: 0, stdout: lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n"))
+            let header = isZh
+                ? "快照 ID\t虚拟机 ID\t分支\t类型\t分配字节\t私有字节（不与其他克隆共享）\t标题"
+                : "SNAPSHOT_ID\tVM_ID\tBRANCH\tKIND\tALLOCATED\tAPFS_PRIVATE (not shared with other clones)\tTITLE"
+            var lines: [String] = [header]
+            for snap in snaps {
+                let allocStr = ByteMetricsFormatter.formatBytes(snap.allocatedDiskBytes)
+                let privStr = ByteMetricsFormatter.formatBytes(snap.apfsPrivateBytes)
+                lines.append("\(snap.id.rawValue)\t\(snap.vmID.rawValue)\t[\(snap.branchName)]\t\(snap.kind.rawValue)\t\(allocStr)\t\(privStr)\t\(snap.title)")
+            }
+            return CLIExecutionOutcome(exitCode: 0, stdout: lines.joined(separator: "\n") + "\n")
         }
         let vmID = try await resolveVMID(positional[0], coordinator: coordinator)
         let title = parsed.options["--title"] ?? (positional.count > 1 ? positional[1] : (isZh ? "命令行检查点" : "CLI Checkpoint"))
-        let snap = try await coordinator.captureSnapshot(vmID: vmID, title: title)
+        let (snap, strategy) = try await coordinator.captureSnapshotReportingStrategy(vmID: vmID, title: title)
+        if strategy == .fullCopyFallback {
+            progressStderrCollector.emit(
+                Self.cloneFallbackStderrNotice(language: language),
+                liveHandler: liveStderrHandler
+            )
+        }
         let msg = isZh
             ? "已为 \(vmID.rawValue) 捕获快照 \(snap.id.rawValue)（「\(snap.title)」）\n"
             : "Captured snapshot \(snap.id.rawValue) ('\(snap.title)') for \(vmID.rawValue)\n"
-        return CLIExecutionOutcome(exitCode: 0, stdout: msg)
+        return CLIExecutionOutcome(
+            exitCode: 0,
+            stdout: msg,
+            stderr: progressStderrCollector.snapshot()
+        )
     }
 
-    private func runRestore(coordinator: AgentVMFleetCoordinator, parsed: ParsedSubcommandArguments, language: AppLanguage) async throws -> CLIExecutionOutcome {
+    private func runRestore(
+        coordinator: AgentVMFleetCoordinator,
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage,
+        progressStderrCollector: StreamedStderrCollector,
+        liveStderrHandler: (@Sendable (String) -> Void)?
+    ) async throws -> CLIExecutionOutcome {
         let isZh = (language == .zhHans)
         guard let snapRaw = parsed.positionals.first else {
             throw AgentVMError.cliUsageError(
                 detail: isZh ? "用法：agentvm restore <快照ID>" : "Usage: agentvm restore <snapshot-id>"
             )
         }
-        let vm = try await coordinator.restoreToSnapshot(SnapshotID(snapRaw))
+        let (vm, strategy) = try await coordinator.restoreToSnapshotReportingStrategy(SnapshotID(snapRaw))
+        if strategy == .fullCopyFallback {
+            progressStderrCollector.emit(
+                Self.cloneFallbackStderrNotice(language: language),
+                liveHandler: liveStderrHandler
+            )
+        }
         let msg = isZh
             ? "已将「\(vm.spec.name)」恢复至快照 \(snapRaw)\n"
             : "Restored '\(vm.spec.name)' to snapshot \(snapRaw)\n"
-        return CLIExecutionOutcome(exitCode: 0, stdout: msg)
+        return CLIExecutionOutcome(
+            exitCode: 0,
+            stdout: msg,
+            stderr: progressStderrCollector.snapshot()
+        )
     }
 
     private func runExec(
@@ -2446,6 +2555,33 @@ public struct AgentVMCLIRunner: Sendable {
         return nil
     }
 
+    private static func validateSnapshotSubcommandUsage(
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage
+    ) -> String? {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+        let isListMode = parsed.positionals.isEmpty || parsed.positionals.first == "list"
+        if isListMode {
+            if parsed.positionals.count > 1 {
+                return isZh
+                    ? "子命令「snapshot list」不接受多余的参数「\(parsed.positionals[1])」。\(helpHintZh)"
+                    : "Unexpected argument '\(parsed.positionals[1])' for 'snapshot list'. \(helpHintEn)"
+            }
+            if parsed.options["--title"] != nil {
+                return isZh
+                    ? "子命令「snapshot list」不接受选项「--title」。\(helpHintZh)"
+                    : "Option '--title' is not valid for 'snapshot list'. \(helpHintEn)"
+            }
+        } else if parsed.flags.contains("--json") {
+            return isZh
+                ? "选项「--json」仅用于「agentvm snapshot list」。\(helpHintZh)"
+                : "Option '--json' is only valid for 'agentvm snapshot list'. \(helpHintEn)"
+        }
+        return nil
+    }
+
     // MARK: - Formatting & Resolution Helpers
 
     private func resolveVMID(_ token: String, coordinator: AgentVMFleetCoordinator) async throws -> VMID {
@@ -2518,7 +2654,7 @@ public struct AgentVMCLIRunner: Sendable {
             "pause": lifecycle, "resume": lifecycle,
             "halt": lifecycle, "stop": lifecycle,
             "branch": branch, "fork": branch,
-            "snapshot": SubcommandGrammar(valueOptions: ["--title"], maxPositionals: 2),
+            "snapshot": SubcommandGrammar(flags: ["--json"], valueOptions: ["--title"], maxPositionals: 2),
             "restore": SubcommandGrammar(maxPositionals: 1),
             "run": SubcommandGrammar(maxPositionals: nil),
             "exec": SubcommandGrammar(maxPositionals: nil),
@@ -2727,7 +2863,7 @@ public struct AgentVMCLIRunner: Sendable {
             子命令:
               doctor                          检测宿主机是否支持虚拟化、当前可执行文件是否具备虚拟化权限、APFS clonefile(2) 与 Rosetta
               init [--seed-demo]              初始化空 .agentvm 工作区（加 --seed-demo 显式载入带 [演示数据] 标记的合成演示集群）
-              ps [--json]                     列出沙盒虚拟机、状态、CPU/内存遥测（未实测时显示 —）、IPv4 与 CoW 脏块；
+              ps [--json]                     列出沙盒虚拟机、状态、CPU/内存遥测（未实测时显示 —）、IPv4 与 APFS 私有字节（不与其他克隆共享）；
                                               模拟后端写入的状态显示为 SIMULATED:<状态>，JSON 里是 telemetry.simulated = true
               events [--vm <名称>] [--limit N] [--json]
                                               读取工作区诊断事件账本（diagnostics 表），支持按虚拟机过滤与条数限制
@@ -2741,7 +2877,8 @@ public struct AgentVMCLIRunner: Sendable {
                                               从已校验缓存镜像克隆创建虚拟机（不传 --image 则创建空稀疏 GPT 磁盘）
               up | pause | resume | halt <vm> 控制虚拟机生命周期（无客户机系统且未传 --backend simulation 时返回错误）
               branch <源虚拟机> <新分支名>    基于 APFS clonefile(2) 派生写时复制磁盘与快照分支
-              snapshot [list | <vm> <标题>]   列出或捕获 CoW 磁盘快照检查点
+              snapshot [list [--json] | <vm> <标题>]
+                                              列出（含分配字节与不与其他克隆共享的私有字节）或捕获 CoW 磁盘快照检查点
               restore <快照ID>                将虚拟机磁盘回滚至指定快照节点
               run <vm> [--verbose] -- <命令> [参数...]
                                               单进程无界面启动真机、等待 vsock 守护进程、执行命令并关机（原始字节流直通）。
@@ -2776,7 +2913,7 @@ public struct AgentVMCLIRunner: Sendable {
         SUBCOMMANDS:
           doctor                          Check host virtualization support, this executable's virtualization entitlement, live APFS clonefile(2) & Rosetta
           init [--seed-demo]              Initialize an empty .agentvm bundle (pass --seed-demo for [DEMO]-labeled synthetic data)
-          ps [--json]                     List sandbox VMs, states, telemetry ('—' when unmeasured), IPv4, and CoW dirty bytes;
+          ps [--json]                     List sandbox VMs, states, telemetry ('—' when unmeasured), IPv4, and APFS private bytes (not shared with other clones);
                                           state written by the simulator shows as SIMULATED:<state> (JSON: telemetry.simulated = true)
           events [--vm <name>] [--limit N] [--json]
                                           Read diagnostic events from the workspace diagnostics ledger
@@ -2790,7 +2927,8 @@ public struct AgentVMCLIRunner: Sendable {
                                           Provision a VM cloned from a verified cached image (or an empty GPT disk without --image)
           up | pause | resume | halt <vm> Control VM lifecycle (fails honestly if disk has no bootable guest OS)
           branch <src-vm> <branch-name>   Fork an APFS clonefile(2) Copy-on-Write disk & snapshot branch
-          snapshot [list | <vm> <title>]  List or capture CoW disk snapshot checkpoints
+          snapshot [list [--json] | <vm> <title>]
+                                          List (with allocated & APFS private bytes not shared with other clones) or capture CoW disk snapshot checkpoints
           restore <snapshot-id>           Roll back VM disk & topology to a snapshot node
           run <vm> [--verbose] -- <cmd> [args...]
                                           Boot VM headlessly, wait for vsock guest daemon, execute command & shut down (byte-exact I/O).

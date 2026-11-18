@@ -500,7 +500,8 @@ public actor AgentVMPluginEngine {
                 "state": record.telemetry.state.rawValue,
                 "cpuPercent": record.telemetry.cpuUsagePercent ?? 0.0,
                 "memoryResidentMB": record.telemetry.memoryResidentMB,
-                "cowDirtyBytes": record.telemetry.cowDirtyBytes,
+                "apfsPrivateBytes": record.telemetry.apfsPrivateBytes,
+                "cowDirtyBytes": record.telemetry.apfsPrivateBytes,
                 "firewallDroppedPackets": record.telemetry.firewallDroppedPackets,
                 "uptimeSeconds": record.telemetry.uptimeSeconds,
                 "maxRuntimeMinutes": record.spec.maxRuntimeMinutes

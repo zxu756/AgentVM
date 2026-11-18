@@ -670,6 +670,7 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         case diskWriteBytesTotal
         case apfsPrivateBytes
         case allocatedDiskBytes
+        case cowDirtyBytes
         case netRxBytesTotal
         case netTxBytesTotal
         case netRxPackets
@@ -696,8 +697,10 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         self.balloonReclaimedMB = try container.decode(UInt64.self, forKey: .balloonReclaimedMB)
         self.diskReadBytesTotal = try container.decode(UInt64.self, forKey: .diskReadBytesTotal)
         self.diskWriteBytesTotal = try container.decode(UInt64.self, forKey: .diskWriteBytesTotal)
-        self.apfsPrivateBytes = try container.decode(UInt64.self, forKey: .apfsPrivateBytes)
-        self.allocatedDiskBytes = try container.decode(UInt64.self, forKey: .allocatedDiskBytes)
+        let decodedPrivate = try container.decodeIfPresent(UInt64.self, forKey: .apfsPrivateBytes)
+        let decodedLegacyDirty = try container.decodeIfPresent(UInt64.self, forKey: .cowDirtyBytes)
+        self.apfsPrivateBytes = decodedPrivate ?? decodedLegacyDirty ?? 0
+        self.allocatedDiskBytes = try container.decodeIfPresent(UInt64.self, forKey: .allocatedDiskBytes) ?? 0
         self.netRxBytesTotal = try container.decode(UInt64.self, forKey: .netRxBytesTotal)
         self.netTxBytesTotal = try container.decode(UInt64.self, forKey: .netTxBytesTotal)
         self.netRxPackets = try container.decode(UInt64.self, forKey: .netRxPackets)
@@ -710,6 +713,34 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         self.simulated = try container.decodeIfPresent(Bool.self, forKey: .simulated) ?? false
         self.uptimeSeconds = try container.decode(TimeInterval.self, forKey: .uptimeSeconds)
         self.sampledAt = try container.decode(Date.self, forKey: .sampledAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(vmID, forKey: .vmID)
+        try container.encode(state, forKey: .state)
+        try container.encodeIfPresent(cpuUsagePercent, forKey: .cpuUsagePercent)
+        try container.encode(memoryResidentMB, forKey: .memoryResidentMB)
+        try container.encodeIfPresent(guestMemTotalBytes, forKey: .guestMemTotalBytes)
+        try container.encodeIfPresent(guestMemAvailableBytes, forKey: .guestMemAvailableBytes)
+        try container.encodeIfPresent(guestAgentVersion, forKey: .guestAgentVersion)
+        try container.encode(balloonReclaimedMB, forKey: .balloonReclaimedMB)
+        try container.encode(diskReadBytesTotal, forKey: .diskReadBytesTotal)
+        try container.encode(diskWriteBytesTotal, forKey: .diskWriteBytesTotal)
+        try container.encode(apfsPrivateBytes, forKey: .apfsPrivateBytes)
+        try container.encode(allocatedDiskBytes, forKey: .allocatedDiskBytes)
+        try container.encode(netRxBytesTotal, forKey: .netRxBytesTotal)
+        try container.encode(netTxBytesTotal, forKey: .netTxBytesTotal)
+        try container.encode(netRxPackets, forKey: .netRxPackets)
+        try container.encode(netTxPackets, forKey: .netTxPackets)
+        try container.encode(firewallDroppedPackets, forKey: .firewallDroppedPackets)
+        try container.encode(activeTCPFlows, forKey: .activeTCPFlows)
+        try container.encode(vsockStreamsOpen, forKey: .vsockStreamsOpen)
+        try container.encode(guestAgentConnected, forKey: .guestAgentConnected)
+        try container.encode(hasLiveGuestTelemetry, forKey: .hasLiveGuestTelemetry)
+        try container.encode(simulated, forKey: .simulated)
+        try container.encode(uptimeSeconds, forKey: .uptimeSeconds)
+        try container.encode(sampledAt, forKey: .sampledAt)
     }
 
     /// A non-stopped lifecycle state that only exists inside the simulation backend.

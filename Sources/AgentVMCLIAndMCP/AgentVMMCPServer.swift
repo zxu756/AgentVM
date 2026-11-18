@@ -18,7 +18,7 @@ public actor AgentVMMCPServer {
         [
             [
                 "name": "agentvm_list_fleet",
-                "description": "List all sandbox VM records as JSON: lifecycle state, IPv4 address, APFS CoW dirty bytes. telemetry.simulated is true when the state was written or is reported by the simulation backend (no real guest behind it).",
+                "description": "List all sandbox VM records as JSON: lifecycle state, IPv4 address, allocatedDiskBytes, and apfsPrivateBytes (bytes not shared with other APFS clones). telemetry.simulated is true when the state was written or is reported by the simulation backend (no real guest behind it).",
                 "inputSchema": ["type": "object", "properties": [:]]
             ],
             [

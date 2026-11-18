@@ -794,12 +794,39 @@ public actor AgentVMFleetCoordinator {
     /// When a non-simulated VM is recorded as `running` in SQLite while neither held in this process nor
     /// locked by a live `VMExecutionLock` holder, it is atomically reconciled to `stopped` and a single
     /// `VM_RUNTIME_LOST` diagnostic is appended for that interruption.
+    private func refreshDiskSpaceTelemetry(on record: inout VMInstanceRecord) {
+        guard let bootDisk = record.spec.blockDevices.first else { return }
+        let diskURL = URL(fileURLWithPath: bootDisk.imagePath)
+        guard FileManager.default.fileExists(atPath: diskURL.path),
+              let metrics = try? diskEngine.readFileSpaceMetrics(at: diskURL) else {
+            return
+        }
+        record.telemetry.apfsPrivateBytes = metrics.privateBytes
+        record.telemetry.allocatedDiskBytes = metrics.allocatedDiskBytes
+    }
+
+    /// Snapshot records with live `apfsPrivateBytes` and `allocatedDiskBytes` refreshed via `getattrlist`/`stat`.
+    public func listSnapshotsForReporting(forVM vmID: VMID? = nil) async throws -> [SnapshotNode] {
+        let snaps = try await store.listSnapshots(forVM: vmID)
+        return snaps.map { snap in
+            var refreshed = snap
+            let snapURL = URL(fileURLWithPath: snap.diskClonePath)
+            if FileManager.default.fileExists(atPath: snapURL.path),
+               let metrics = try? diskEngine.readFileSpaceMetrics(at: snapURL) {
+                refreshed.apfsPrivateBytes = metrics.privateBytes
+                refreshed.allocatedDiskBytes = metrics.allocatedDiskBytes
+            }
+            return refreshed
+        }
+    }
+
     public func listVMsForReporting(language: AppLanguage = .en) async throws -> [VMInstanceRecord] {
         let vms = try await store.listVMs()
         if isSimulationBackend {
             return vms.map { record in
                 var marked = record
                 marked.telemetry.simulated = true
+                refreshDiskSpaceTelemetry(on: &marked)
                 return marked
             }
         }
@@ -812,7 +839,8 @@ public actor AgentVMFleetCoordinator {
                hardwareBoxes[record.id] == nil,
                !VMExecutionLock.isLocked(at: lockFileURL(for: record.id)) {
                 let diag = makeVMRuntimeLostDiagnostic(for: record, language: language)
-                if let reconciled = try await store.reconcileLostRunningVM(vmID: record.id, diagnostic: diag).record {
+                if var reconciled = try await store.reconcileLostRunningVM(vmID: record.id, diagnostic: diag).record {
+                    refreshDiskSpaceTelemetry(on: &reconciled)
                     reconciledList.append(reconciled)
                 } else {
                     var fallback = record
@@ -826,6 +854,7 @@ public actor AgentVMFleetCoordinator {
                     fallback.telemetry.guestMemAvailableBytes = nil
                     fallback.telemetry.guestAgentVersion = nil
                     stampRuntimeOrigin(&fallback)
+                    refreshDiskSpaceTelemetry(on: &fallback)
                     reconciledList.append(fallback)
                 }
             } else {
@@ -864,6 +893,7 @@ public actor AgentVMFleetCoordinator {
                         }
                     }
                 }
+                refreshDiskSpaceTelemetry(on: &enriched)
                 reconciledList.append(enriched)
             }
         }
@@ -927,7 +957,11 @@ public actor AgentVMFleetCoordinator {
         guard !hardwareBoxes.isEmpty else { return [] }
         let heldIDs = Set(hardwareBoxes.keys)
         let all = try await store.listVMs()
-        return all.filter { heldIDs.contains($0.id) }
+        return all.filter { heldIDs.contains($0.id) }.map { rec in
+            var copy = rec
+            refreshDiskSpaceTelemetry(on: &copy)
+            return copy
+        }
     }
 
     /// Returns the guest daemon `agentVersion` negotiated over vsock `ping`/`pong` for a running VM, if known.
@@ -1237,8 +1271,13 @@ public actor AgentVMFleetCoordinator {
         }
 
         let snapDiskURL = store.snapshotsDirectoryURL.appendingPathComponent("\(vmID.rawValue)-base.raw")
-        try diskEngine.cloneDiskCoW(from: rootDiskURL, to: snapDiskURL, overwrite: true)
-        let alloc = try diskEngine.scanSparseExtents(at: rootDiskURL)
+        let cloneStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+            from: rootDiskURL,
+            to: snapDiskURL,
+            overwrite: true
+        )
+        let rootMetrics = try diskEngine.readFileSpaceMetrics(at: rootDiskURL)
+        let snapMetrics = try diskEngine.readFileSpaceMetrics(at: snapDiskURL)
 
         let rootSnapshot = SnapshotNode(
             id: SnapshotID.generate(prefix: "snap"),
@@ -1250,8 +1289,8 @@ public actor AgentVMFleetCoordinator {
             kind: .baseGoldenImage,
             diskClonePath: snapDiskURL.path,
             virtualDiskBytes: diskVirtualBytes,
-            allocatedDiskBytes: alloc.physicalAllocatedBytes,
-            dirtyDeltaBytes: 0,
+            allocatedDiskBytes: snapMetrics.allocatedDiskBytes,
+            apfsPrivateBytes: snapMetrics.privateBytes,
             specSnapshot: spec,
             agentActor: agentOwnerTag,
             isPinned: true,
@@ -1264,7 +1303,8 @@ public actor AgentVMFleetCoordinator {
             telemetry: VMLiveTelemetry(
                 vmID: vmID,
                 state: .stopped,
-                cowDirtyBytes: alloc.uniqueDirtyBytes
+                apfsPrivateBytes: rootMetrics.privateBytes,
+                allocatedDiskBytes: rootMetrics.allocatedDiskBytes
             )
         )
 
@@ -1298,7 +1338,9 @@ public actor AgentVMFleetCoordinator {
             vmRecord: record,
             rootSnapshot: rootSnapshot,
             cloudInitISOPath: isoURL.path,
-            diskAllocation: alloc
+            diskAllocation: nil,
+            diskSpaceMetrics: rootMetrics,
+            diskCloneStrategy: cloneStrategy
         )
     }
 
@@ -1484,8 +1526,16 @@ public actor AgentVMFleetCoordinator {
             outputURL: isoURL
         )
 
-        try diskEngine.cloneDiskCoW(from: rootDiskURL, to: snapDiskURL, overwrite: true)
-        let alloc = try diskEngine.scanSparseExtents(at: rootDiskURL)
+        let snapCloneStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+            from: rootDiskURL,
+            to: snapDiskURL,
+            overwrite: true
+        )
+        let effectiveStrategy: DiskCloneStrategyUsed = (cloneStrategy == .fullCopyFallback || snapCloneStrategy == .fullCopyFallback)
+            ? .fullCopyFallback
+            : .apfsClonefile
+        let rootMetrics = try diskEngine.readFileSpaceMetrics(at: rootDiskURL)
+        let snapMetrics = try diskEngine.readFileSpaceMetrics(at: snapDiskURL)
 
         let rootSnapshot = SnapshotNode(
             id: SnapshotID.generate(prefix: "snap"),
@@ -1497,8 +1547,8 @@ public actor AgentVMFleetCoordinator {
             kind: .baseGoldenImage,
             diskClonePath: snapDiskURL.path,
             virtualDiskBytes: targetDiskBytes,
-            allocatedDiskBytes: alloc.physicalAllocatedBytes,
-            dirtyDeltaBytes: 0,
+            allocatedDiskBytes: snapMetrics.allocatedDiskBytes,
+            apfsPrivateBytes: snapMetrics.privateBytes,
             specSnapshot: spec,
             agentActor: agentOwnerTag,
             isPinned: true,
@@ -1511,7 +1561,8 @@ public actor AgentVMFleetCoordinator {
             telemetry: VMLiveTelemetry(
                 vmID: vmID,
                 state: .stopped,
-                cowDirtyBytes: alloc.uniqueDirtyBytes
+                apfsPrivateBytes: rootMetrics.privateBytes,
+                allocatedDiskBytes: rootMetrics.allocatedDiskBytes
             )
         )
 
@@ -1534,7 +1585,7 @@ public actor AgentVMFleetCoordinator {
             subsystem: "Hypervisor",
             vmID: vmID,
             code: "VM_PROVISIONED_FROM_IMAGE",
-            message: "Created \(name) from image '\(imageEntry.id)' (\(vcpus) vCPU, \(memoryMB) MB RAM, disk \(targetDiskBytes) B, clone=\(cloneStrategy.rawValue), system NAT + DHCP)."
+            message: "Created \(name) from image '\(imageEntry.id)' (\(vcpus) vCPU, \(memoryMB) MB RAM, disk \(targetDiskBytes) B, clone=\(effectiveStrategy.rawValue), system NAT + DHCP)."
         ))
 
         let tty = ensureTerminalBuffer(for: vmID)
@@ -1545,8 +1596,9 @@ public actor AgentVMFleetCoordinator {
             vmRecord: record,
             rootSnapshot: rootSnapshot,
             cloudInitISOPath: isoURL.path,
-            diskAllocation: alloc,
-            diskCloneStrategy: cloneStrategy
+            diskAllocation: nil,
+            diskSpaceMetrics: rootMetrics,
+            diskCloneStrategy: effectiveStrategy
         )
     }
 
@@ -2847,6 +2899,26 @@ public actor AgentVMFleetCoordinator {
         isPinned: Bool = false,
         triggerCommand: String? = nil
     ) async throws -> SnapshotNode {
+        try await captureSnapshotReportingStrategy(
+            vmID: vmID,
+            title: title,
+            notes: notes,
+            kind: kind,
+            branchName: branchName,
+            isPinned: isPinned,
+            triggerCommand: triggerCommand
+        ).snapshot
+    }
+
+    public func captureSnapshotReportingStrategy(
+        vmID: VMID,
+        title: String,
+        notes: String = "",
+        kind: SnapshotKind = .liveMemoryAndDisk,
+        branchName: String? = nil,
+        isPinned: Bool = false,
+        triggerCommand: String? = nil
+    ) async throws -> (snapshot: SnapshotNode, diskCloneStrategy: DiskCloneStrategyUsed) {
         guard let existing = try await store.fetchVM(vmID) else {
             throw AgentVMError.vmNotFound(vmID)
         }
@@ -2867,14 +2939,13 @@ public actor AgentVMFleetCoordinator {
         let snapID = SnapshotID.generate(prefix: "snap")
         let cloneURL = store.snapshotsDirectoryURL.appendingPathComponent("\(vmID.rawValue)-\(snapID.rawValue).raw")
         let sourceURL = URL(fileURLWithPath: bootDisk.imagePath)
-        try diskEngine.cloneDiskCoW(from: sourceURL, to: cloneURL, overwrite: true)
-
-        var parentURL: URL?
-        if let parentID = record.currentHeadSnapshotID,
-           let parentSnap = try await store.fetchSnapshot(parentID) {
-            parentURL = URL(fileURLWithPath: parentSnap.diskClonePath)
-        }
-        let alloc = try diskEngine.scanSparseExtents(at: cloneURL, compareAgainstParent: parentURL)
+        let cloneStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+            from: sourceURL,
+            to: cloneURL,
+            overwrite: true
+        )
+        let snapMetrics = try diskEngine.readFileSpaceMetrics(at: cloneURL)
+        let rootMetrics = try diskEngine.readFileSpaceMetrics(at: sourceURL)
 
         var ramPath: String?
         var ramBytes: UInt64 = 0
@@ -2916,9 +2987,9 @@ public actor AgentVMFleetCoordinator {
             kind: recordedKind,
             diskClonePath: cloneURL.path,
             memoryStatePath: ramPath,
-            virtualDiskBytes: alloc.virtualSizeBytes,
-            allocatedDiskBytes: alloc.physicalAllocatedBytes,
-            dirtyDeltaBytes: alloc.uniqueDirtyBytes,
+            virtualDiskBytes: snapMetrics.virtualSizeBytes,
+            allocatedDiskBytes: snapMetrics.allocatedDiskBytes,
+            apfsPrivateBytes: snapMetrics.privateBytes,
             memoryStateBytes: ramBytes,
             specSnapshot: record.spec,
             agentActor: record.spec.agentOwnerTag,
@@ -2927,7 +2998,8 @@ public actor AgentVMFleetCoordinator {
         )
 
         record.currentHeadSnapshotID = snapID
-        record.telemetry.cowDirtyBytes = alloc.uniqueDirtyBytes
+        record.telemetry.apfsPrivateBytes = rootMetrics.privateBytes
+        record.telemetry.allocatedDiskBytes = rootMetrics.allocatedDiskBytes
         let cmd = CompositeWorkspaceCommand(
             title: "Capture Snapshot '\(title)'",
             commands: [
@@ -2936,7 +3008,7 @@ public actor AgentVMFleetCoordinator {
             ]
         )
         try await undoRedo.execute(cmd, on: store)
-        return node
+        return (node, cloneStrategy)
     }
 
     public func forkCoWBranch(
@@ -2945,7 +3017,6 @@ public actor AgentVMFleetCoordinator {
         agentOwnerTag: String,
         bootImmediately: Bool = true
     ) async throws -> CoWBranchForkResult {
-        let startNs = DispatchTime.now().uptimeNanoseconds
         guard let existingParent = try await store.fetchVM(parentVMID) else {
             throw AgentVMError.vmNotFound(parentVMID)
         }
@@ -2954,6 +3025,9 @@ public actor AgentVMFleetCoordinator {
             vmName: existingParent.spec.name,
             operation: "branch"
         )
+        // Elapsed duration is measured from passing/acquiring the parent VM lock gate to committing the child VM in SQLite.
+        let startNs = DispatchTime.now().uptimeNanoseconds
+
         let parentRecord = try await loadVMForOperation(parentVMID)
         try await rejectDuplicateVMName(branchName)
         guard let parentDisk = parentRecord.spec.blockDevices.first else {
@@ -2964,7 +3038,7 @@ public actor AgentVMFleetCoordinator {
             )
         }
 
-        let forkSnap = try await captureSnapshot(
+        let (forkSnap, forkSnapStrategy) = try await captureSnapshotReportingStrategy(
             vmID: parentVMID,
             title: "Branch Fork -> \(branchName)",
             kind: .branchForkPoint,
@@ -2974,7 +3048,7 @@ public actor AgentVMFleetCoordinator {
         let childID = VMID.generate(prefix: "vm")
         let slug = sanitizeFilename(branchName)
         let childDiskURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(childID.rawValue).raw")
-        try diskEngine.cloneDiskCoW(
+        let childDiskStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
             from: URL(fileURLWithPath: forkSnap.diskClonePath),
             to: childDiskURL,
             overwrite: true
@@ -3001,10 +3075,11 @@ public actor AgentVMFleetCoordinator {
             isBootVolume: true,
             parentCoWImagePath: forkSnap.diskClonePath
         )
+        var nvramStrategy: DiskCloneStrategyUsed = .apfsClonefile
         let childNvramURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(childID.rawValue).nvram")
         if case let .efiBoot(parentNvramPath, _) = parentRecord.spec.bootLoader {
             if FileManager.default.fileExists(atPath: parentNvramPath) {
-                try diskEngine.cloneDiskCoW(
+                nvramStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
                     from: URL(fileURLWithPath: parentNvramPath),
                     to: childNvramURL,
                     overwrite: true
@@ -3032,7 +3107,20 @@ public actor AgentVMFleetCoordinator {
         }
 
         let childSnapDiskURL = store.snapshotsDirectoryURL.appendingPathComponent("\(childID.rawValue)-head.raw")
-        try diskEngine.cloneDiskCoW(from: childDiskURL, to: childSnapDiskURL, overwrite: true)
+        let childSnapStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+            from: childDiskURL,
+            to: childSnapDiskURL,
+            overwrite: true
+        )
+        let effectiveStrategy: DiskCloneStrategyUsed = (
+            forkSnapStrategy == .fullCopyFallback
+            || childDiskStrategy == .fullCopyFallback
+            || nvramStrategy == .fullCopyFallback
+            || childSnapStrategy == .fullCopyFallback
+        ) ? .fullCopyFallback : .apfsClonefile
+
+        let childDiskMetrics = try diskEngine.readFileSpaceMetrics(at: childDiskURL)
+        let childSnapMetrics = try diskEngine.readFileSpaceMetrics(at: childSnapDiskURL)
 
         let childRootSnap = SnapshotNode(
             id: SnapshotID.generate(prefix: "snap"),
@@ -3040,12 +3128,14 @@ public actor AgentVMFleetCoordinator {
             parentSnapshotID: forkSnap.id,
             branchName: branchName,
             title: "CoW Head (\(branchName))",
-            notes: "Zero-copy clonefile(2) fork from \(parentRecord.spec.name)",
+            notes: effectiveStrategy == .apfsClonefile
+                ? "Zero-copy clonefile(2) fork from \(parentRecord.spec.name)"
+                : "Full-copy fallback fork from \(parentRecord.spec.name)",
             kind: .branchForkPoint,
             diskClonePath: childSnapDiskURL.path,
-            virtualDiskBytes: parentDisk.virtualSizeBytes,
-            allocatedDiskBytes: forkSnap.allocatedDiskBytes,
-            dirtyDeltaBytes: 0,
+            virtualDiskBytes: childSnapMetrics.virtualSizeBytes,
+            allocatedDiskBytes: childSnapMetrics.allocatedDiskBytes,
+            apfsPrivateBytes: childSnapMetrics.privateBytes,
             specSnapshot: childSpec,
             agentActor: agentOwnerTag
         )
@@ -3053,7 +3143,12 @@ public actor AgentVMFleetCoordinator {
         var childRecord = VMInstanceRecord(
             spec: childSpec,
             currentHeadSnapshotID: childRootSnap.id,
-            telemetry: VMLiveTelemetry(vmID: childID, state: .stopped, cowDirtyBytes: 0)
+            telemetry: VMLiveTelemetry(
+                vmID: childID,
+                state: .stopped,
+                apfsPrivateBytes: childDiskMetrics.privateBytes,
+                allocatedDiskBytes: childDiskMetrics.allocatedDiskBytes
+            )
         )
 
         let cmd = CompositeWorkspaceCommand(
@@ -3064,18 +3159,40 @@ public actor AgentVMFleetCoordinator {
             ]
         )
         try await undoRedo.execute(cmd, on: store)
-
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
+
         if bootImmediately {
             childRecord = try await bootPersistentVM(childID)
         }
 
+        let privateFormatted = ByteMetricsFormatter.formatBytes(childDiskMetrics.privateBytes)
+        let enDiag = String(
+            format: "Forked CoW branch '%@' (@%@) in %.1f ms (%@ private bytes not shared with other clones).",
+            branchName,
+            agentOwnerTag,
+            elapsedMs,
+            privateFormatted
+        )
+        let zhDiag = String(
+            format: "已分叉 CoW 分支 '%@' (@%@) · 耗时 %.1f ms (%@ 私有字节，不与其他克隆共享)",
+            branchName,
+            agentOwnerTag,
+            elapsedMs,
+            privateFormatted
+        )
         try await store.appendDiagnostic(DiagnosticEvent(
             severity: .info,
             subsystem: "StorageCoW",
             vmID: childID,
             code: "COW_BRANCH_FORKED",
-            message: String(format: "Forked CoW branch '%@' (@%@) in %.1f ms (0 B unique dirty pages).", branchName, agentOwnerTag, elapsedMs)
+            message: enDiag,
+            metadata: [
+                "apfsPrivateBytes": String(childDiskMetrics.privateBytes),
+                "allocatedDiskBytes": String(childDiskMetrics.allocatedDiskBytes),
+                "cloneStrategy": effectiveStrategy.rawValue,
+                "message_en": enDiag,
+                "message_zh": zhDiag
+            ]
         ))
 
         return CoWBranchForkResult(
@@ -3083,11 +3200,18 @@ public actor AgentVMFleetCoordinator {
             childVM: childRecord,
             forkPointSnapshot: forkSnap,
             childInitialSnapshot: childRootSnap,
-            cloneDurationMilliseconds: elapsedMs
+            cloneDurationMilliseconds: elapsedMs,
+            diskCloneStrategy: effectiveStrategy
         )
     }
 
     public func restoreToSnapshot(_ snapshotID: SnapshotID) async throws -> VMInstanceRecord {
+        try await restoreToSnapshotReportingStrategy(snapshotID).record
+    }
+
+    public func restoreToSnapshotReportingStrategy(
+        _ snapshotID: SnapshotID
+    ) async throws -> (record: VMInstanceRecord, diskCloneStrategy: DiskCloneStrategyUsed) {
         guard let snap = try await store.fetchSnapshot(snapshotID) else {
             throw AgentVMError.snapshotNotFound(snapshotID)
         }
@@ -3106,16 +3230,27 @@ public actor AgentVMFleetCoordinator {
             record = try await haltVM(record.id)
         }
 
+        var cloneStrategy: DiskCloneStrategyUsed = .apfsClonefile
         if let bootDisk = record.spec.blockDevices.first {
-            try diskEngine.cloneDiskCoW(
+            let bootURL = URL(fileURLWithPath: bootDisk.imagePath)
+            cloneStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
                 from: URL(fileURLWithPath: snap.diskClonePath),
-                to: URL(fileURLWithPath: bootDisk.imagePath),
+                to: bootURL,
                 overwrite: true
             )
+            if let metrics = try? diskEngine.readFileSpaceMetrics(at: bootURL) {
+                record.telemetry.apfsPrivateBytes = metrics.privateBytes
+                record.telemetry.allocatedDiskBytes = metrics.allocatedDiskBytes
+            } else {
+                record.telemetry.apfsPrivateBytes = snap.apfsPrivateBytes
+                record.telemetry.allocatedDiskBytes = snap.allocatedDiskBytes
+            }
+        } else {
+            record.telemetry.apfsPrivateBytes = snap.apfsPrivateBytes
+            record.telemetry.allocatedDiskBytes = snap.allocatedDiskBytes
         }
 
         record.currentHeadSnapshotID = snap.id
-        record.telemetry.cowDirtyBytes = snap.dirtyDeltaBytes
         try await store.upsertVM(record)
 
         if wasRunning {
@@ -3129,7 +3264,7 @@ public actor AgentVMFleetCoordinator {
             code: "SNAPSHOT_RESTORED",
             message: "Rolled back '\(record.spec.name)' to snapshot '\(snap.title)' (\(snap.id.rawValue))."
         ))
-        return record
+        return (record, cloneStrategy)
     }
 
     // MARK: - Guarded Guest Command Execution & Network Packet Processing

@@ -229,15 +229,75 @@ public struct APFSCoWDiskEngine: Sendable {
 
     // MARK: - APFS Private Bytes & Allocated Space Metadata (`getattrlist` + `stat`)
 
+    /// Reads file space metrics without reading any disk content blocks:
+    /// - `virtualSizeBytes`: `st_size`
+    /// - `allocatedDiskBytes`: `st_blocks * 512`
+    /// - `privateBytes`: `getattrlist(2)` with `ATTR_CMNEXT_PRIVATESIZE` + `FSOPT_ATTR_CMN_EXTENDED`
+    ///   (bytes private to this file and not shared with any other APFS clone; falls back to `allocatedDiskBytes`
+    ///   when the underlying volume does not support `ATTR_CMNEXT_PRIVATESIZE`).
     public func readFileSpaceMetrics(at url: URL) throws -> DiskFileSpaceMetrics {
-        let summary = try scanSparseExtents(at: url)
+        let path = url.path
+        var st = Darwin.stat()
+        guard stat(path, &st) == 0 else {
+            let err = Darwin.errno
+            throw AgentVMError.diskImageOperationFailed(
+                path: path,
+                errnoCode: err,
+                detail: "stat failed on disk image (\(Self.posixErrorString(err)))."
+            )
+        }
+
+        let virtualSizeBytes = UInt64(max(0, st.st_size))
+        let allocatedDiskBytes = UInt64(max(0, st.st_blocks)) * 512
+        let fsBlockSize = UInt32(st.st_blksize > 0 ? st.st_blksize : 4096)
+
+        var alist = attrlist()
+        alist.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        alist.forkattr = attrgroup_t(ATTR_CMNEXT_PRIVATESIZE)
+
+        var rawBuf = [UInt8](repeating: 0, count: 16)
+        let rc = path.withCString { cPath in
+            rawBuf.withUnsafeMutableBytes { ptr -> Int32 in
+                guard let base = ptr.baseAddress else { return -1 }
+                return Darwin.getattrlist(
+                    cPath,
+                    &alist,
+                    base,
+                    12,
+                    UInt32(FSOPT_ATTR_CMN_EXTENDED)
+                )
+            }
+        }
+
+        let privateBytes: UInt64
+        if rc == 0 {
+            let returnedLength = rawBuf.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
+            if returnedLength >= 12 {
+                let signedPrivate = rawBuf.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: Int64.self) }
+                privateBytes = UInt64(max(0, signedPrivate))
+            } else {
+                privateBytes = allocatedDiskBytes
+            }
+        } else {
+            let err = Darwin.errno
+            if err == ENOTSUP || err == EOPNOTSUPP || err == EINVAL {
+                privateBytes = allocatedDiskBytes
+            } else {
+                throw AgentVMError.diskImageOperationFailed(
+                    path: path,
+                    errnoCode: err,
+                    detail: "getattrlist(ATTR_CMNEXT_PRIVATESIZE) failed (\(Self.posixErrorString(err)))."
+                )
+            }
+        }
+
         return DiskFileSpaceMetrics(
-            imagePath: summary.imagePath,
-            virtualSizeBytes: summary.virtualSizeBytes,
-            allocatedDiskBytes: summary.physicalAllocatedBytes,
-            privateBytes: summary.uniqueDirtyBytes,
-            filesystemBlockSize: summary.filesystemBlockSize,
-            sampledAt: summary.scannedAt
+            imagePath: path,
+            virtualSizeBytes: virtualSizeBytes,
+            allocatedDiskBytes: allocatedDiskBytes,
+            privateBytes: privateBytes,
+            filesystemBlockSize: fsBlockSize,
+            sampledAt: Date()
         )
     }
 
@@ -615,6 +675,7 @@ public struct APFSCoWDiskEngine: Sendable {
             var pos = dataStart
             while pos < holeStart {
                 let toRead = Int(min(UInt64(stepSize), holeStart - pos))
+                onDiskContentReadForTesting?(path)
                 try Self.preadExact(fd: fd, path: path, into: rawBuffer, count: toRead, offset: pos)
                 let slice = UnsafeRawBufferPointer(start: rawBuffer, count: toRead)
                 if Self.isAllZero(slice) && (pos % UInt64(fsBlockSize) == 0) {
@@ -936,6 +997,7 @@ public struct APFSCoWDiskEngine: Sendable {
             while pos < spanEnd {
                 let chunkLen = Int(min(UInt64(chunkCap), spanEnd - pos))
 
+                onDiskContentReadForTesting?(targetPath)
                 try Self.preadExact(fd: targetFD, path: targetPath, into: targetBuf, count: chunkLen, offset: pos)
 
                 if pos >= baseSize {

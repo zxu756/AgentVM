@@ -135,6 +135,21 @@ public actor AgentVMProjectStore {
 
         self.db = try SQLiteWALDatabase(fileURL: dbURL, runMigrations: true)
         try Self.ensureExecHistoryByteCountColumns(in: self.db)
+        try Self.ensureSnapshotsPrivateBytesColumn(in: self.db)
+    }
+
+    private static func ensureSnapshotsPrivateBytesColumn(in db: SQLiteWALDatabase) throws {
+        let cols = try db.query("PRAGMA table_info(snapshots);")
+        let names = Set(try cols.map { try $0.string("name").lowercased() })
+        if !names.contains("apfs_private_bytes") {
+            do {
+                try db.execute("ALTER TABLE snapshots ADD COLUMN apfs_private_bytes INTEGER;")
+            } catch let err as AgentVMError {
+                if !err.localizedMessage(in: .en).localizedCaseInsensitiveContains("duplicate column") {
+                    throw err
+                }
+            }
+        }
     }
 
     private static func ensureExecHistoryByteCountColumns(in db: SQLiteWALDatabase) throws {
@@ -311,9 +326,9 @@ public actor AgentVMProjectStore {
             INSERT INTO snapshots (
                 id, vm_id, parent_snapshot_id, branch_name, title, notes, kind,
                 created_at, disk_clone_path, memory_state_path, virtual_disk_bytes,
-                allocated_disk_bytes, dirty_delta_bytes, memory_state_bytes,
+                allocated_disk_bytes, dirty_delta_bytes, apfs_private_bytes, memory_state_bytes,
                 spec_snapshot_json, agent_actor, trigger_command, is_pinned, tags_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 vm_id = excluded.vm_id,
                 parent_snapshot_id = excluded.parent_snapshot_id,
@@ -327,6 +342,7 @@ public actor AgentVMProjectStore {
                 virtual_disk_bytes = excluded.virtual_disk_bytes,
                 allocated_disk_bytes = excluded.allocated_disk_bytes,
                 dirty_delta_bytes = excluded.dirty_delta_bytes,
+                apfs_private_bytes = excluded.apfs_private_bytes,
                 memory_state_bytes = excluded.memory_state_bytes,
                 spec_snapshot_json = excluded.spec_snapshot_json,
                 agent_actor = excluded.agent_actor,
@@ -347,7 +363,8 @@ public actor AgentVMProjectStore {
                 node.memoryStatePath.sqliteValue,
                 node.virtualDiskBytes.sqliteValue,
                 node.allocatedDiskBytes.sqliteValue,
-                node.dirtyDeltaBytes.sqliteValue,
+                node.apfsPrivateBytes.sqliteValue,
+                node.apfsPrivateBytes.sqliteValue,
                 node.memoryStateBytes.sqliteValue,
                 specJSON.sqliteValue,
                 node.agentActor.sqliteValue,
@@ -368,7 +385,7 @@ public actor AgentVMProjectStore {
             SELECT
                 id, vm_id, parent_snapshot_id, branch_name, title, notes, kind,
                 created_at, disk_clone_path, memory_state_path, virtual_disk_bytes,
-                allocated_disk_bytes, dirty_delta_bytes, memory_state_bytes,
+                allocated_disk_bytes, dirty_delta_bytes, apfs_private_bytes, memory_state_bytes,
                 spec_snapshot_json, agent_actor, trigger_command, is_pinned, tags_json
             FROM snapshots
             WHERE id = ?;
@@ -388,7 +405,7 @@ public actor AgentVMProjectStore {
                 SELECT
                     id, vm_id, parent_snapshot_id, branch_name, title, notes, kind,
                     created_at, disk_clone_path, memory_state_path, virtual_disk_bytes,
-                    allocated_disk_bytes, dirty_delta_bytes, memory_state_bytes,
+                    allocated_disk_bytes, dirty_delta_bytes, apfs_private_bytes, memory_state_bytes,
                     spec_snapshot_json, agent_actor, trigger_command, is_pinned, tags_json
                 FROM snapshots
                 WHERE vm_id = ?
@@ -402,7 +419,7 @@ public actor AgentVMProjectStore {
                 SELECT
                     id, vm_id, parent_snapshot_id, branch_name, title, notes, kind,
                     created_at, disk_clone_path, memory_state_path, virtual_disk_bytes,
-                    allocated_disk_bytes, dirty_delta_bytes, memory_state_bytes,
+                    allocated_disk_bytes, dirty_delta_bytes, apfs_private_bytes, memory_state_bytes,
                     spec_snapshot_json, agent_actor, trigger_command, is_pinned, tags_json
                 FROM snapshots
                 ORDER BY created_at ASC, id ASC;
@@ -417,6 +434,12 @@ public actor AgentVMProjectStore {
         let kind = SnapshotKind(rawValue: rawKind) ?? .coldDiskOnly
         let spec = try row.json(VMSpec.self, column: "spec_snapshot_json", decoder: jsonDecoder)
         let tags = try row.optionalJSON([String].self, column: "tags_json", decoder: jsonDecoder) ?? []
+        let privateBytes: UInt64
+        if row.hasColumn("apfs_private_bytes"), let explicitPriv = try row.optionalUInt64("apfs_private_bytes") {
+            privateBytes = explicitPriv
+        } else {
+            privateBytes = try row.uint64("dirty_delta_bytes")
+        }
         return SnapshotNode(
             id: SnapshotID(try row.string("id")),
             vmID: VMID(try row.string("vm_id")),
@@ -430,7 +453,7 @@ public actor AgentVMProjectStore {
             memoryStatePath: try row.optionalString("memory_state_path"),
             virtualDiskBytes: try row.uint64("virtual_disk_bytes"),
             allocatedDiskBytes: try row.uint64("allocated_disk_bytes"),
-            dirtyDeltaBytes: try row.uint64("dirty_delta_bytes"),
+            apfsPrivateBytes: privateBytes,
             memoryStateBytes: try row.uint64("memory_state_bytes"),
             specSnapshot: spec,
             agentActor: try row.string("agent_actor"),

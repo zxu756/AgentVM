@@ -541,6 +541,7 @@ extension DiagnosticEvent {
             return message
                 .replacingOccurrences(of: "Forked CoW branch ", with: "已分叉 CoW 分支 ")
                 .replacingOccurrences(of: " in ", with: " · 耗时 ")
+                .replacingOccurrences(of: " private bytes not shared with other clones).", with: " 私有字节，不与其他克隆共享)")
                 .replacingOccurrences(of: " unique dirty pages).", with: " 独有脏块)")
         }
         if message.hasPrefix("VM ") && message.contains("entered RUNNING state") {

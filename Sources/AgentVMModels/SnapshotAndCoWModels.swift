@@ -133,12 +133,61 @@ public struct SnapshotNode: Codable, Hashable, Sendable, Identifiable {
         case virtualDiskBytes
         case allocatedDiskBytes
         case apfsPrivateBytes
+        case dirtyDeltaBytes
         case memoryStateBytes
         case specSnapshot
         case agentActor
         case triggerCommand
         case isPinned
         case tags
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(SnapshotID.self, forKey: .id)
+        self.vmID = try container.decode(VMID.self, forKey: .vmID)
+        self.parentSnapshotID = try container.decodeIfPresent(SnapshotID.self, forKey: .parentSnapshotID)
+        self.branchName = try container.decodeIfPresent(String.self, forKey: .branchName) ?? "main"
+        self.title = try container.decode(String.self, forKey: .title)
+        self.notes = try container.decodeIfPresent(String.self, forKey: .notes) ?? ""
+        self.kind = try container.decode(SnapshotKind.self, forKey: .kind)
+        self.createdAt = try container.decode(Date.self, forKey: .createdAt)
+        self.diskClonePath = try container.decode(String.self, forKey: .diskClonePath)
+        self.memoryStatePath = try container.decodeIfPresent(String.self, forKey: .memoryStatePath)
+        self.virtualDiskBytes = try container.decode(UInt64.self, forKey: .virtualDiskBytes)
+        self.allocatedDiskBytes = try container.decodeIfPresent(UInt64.self, forKey: .allocatedDiskBytes) ?? 0
+        let decodedPrivate = try container.decodeIfPresent(UInt64.self, forKey: .apfsPrivateBytes)
+        let decodedLegacyDirty = try container.decodeIfPresent(UInt64.self, forKey: .dirtyDeltaBytes)
+        self.apfsPrivateBytes = decodedPrivate ?? decodedLegacyDirty ?? 0
+        self.memoryStateBytes = try container.decodeIfPresent(UInt64.self, forKey: .memoryStateBytes) ?? 0
+        self.specSnapshot = try container.decode(VMSpec.self, forKey: .specSnapshot)
+        self.agentActor = try container.decodeIfPresent(String.self, forKey: .agentActor) ?? "coordinator"
+        self.triggerCommand = try container.decodeIfPresent(String.self, forKey: .triggerCommand)
+        self.isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        self.tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(vmID, forKey: .vmID)
+        try container.encodeIfPresent(parentSnapshotID, forKey: .parentSnapshotID)
+        try container.encode(branchName, forKey: .branchName)
+        try container.encode(title, forKey: .title)
+        try container.encode(notes, forKey: .notes)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(diskClonePath, forKey: .diskClonePath)
+        try container.encodeIfPresent(memoryStatePath, forKey: .memoryStatePath)
+        try container.encode(virtualDiskBytes, forKey: .virtualDiskBytes)
+        try container.encode(allocatedDiskBytes, forKey: .allocatedDiskBytes)
+        try container.encode(apfsPrivateBytes, forKey: .apfsPrivateBytes)
+        try container.encode(memoryStateBytes, forKey: .memoryStateBytes)
+        try container.encode(specSnapshot, forKey: .specSnapshot)
+        try container.encode(agentActor, forKey: .agentActor)
+        try container.encodeIfPresent(triggerCommand, forKey: .triggerCommand)
+        try container.encode(isPinned, forKey: .isPinned)
+        try container.encode(tags, forKey: .tags)
     }
 
     public var hasLiveRAMState: Bool {

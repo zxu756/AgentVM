@@ -181,6 +181,7 @@ public struct FleetCreationSummary: Codable, Hashable, Sendable {
     public var rootSnapshot: SnapshotNode
     public var cloudInitISOPath: String?
     public var diskAllocation: DiskAllocationSummary?
+    public var diskSpaceMetrics: DiskFileSpaceMetrics?
     public var diskCloneStrategy: DiskCloneStrategyUsed
 
     public init(
@@ -188,12 +189,14 @@ public struct FleetCreationSummary: Codable, Hashable, Sendable {
         rootSnapshot: SnapshotNode,
         cloudInitISOPath: String?,
         diskAllocation: DiskAllocationSummary?,
+        diskSpaceMetrics: DiskFileSpaceMetrics? = nil,
         diskCloneStrategy: DiskCloneStrategyUsed = .apfsClonefile
     ) {
         self.vmRecord = vmRecord
         self.rootSnapshot = rootSnapshot
         self.cloudInitISOPath = cloudInitISOPath
         self.diskAllocation = diskAllocation
+        self.diskSpaceMetrics = diskSpaceMetrics
         self.diskCloneStrategy = diskCloneStrategy
     }
 }
@@ -204,19 +207,22 @@ public struct CoWBranchForkResult: Codable, Hashable, Sendable {
     public var forkPointSnapshot: SnapshotNode
     public var childInitialSnapshot: SnapshotNode
     public var cloneDurationMilliseconds: Double
+    public var diskCloneStrategy: DiskCloneStrategyUsed
 
     public init(
         parentVMID: VMID,
         childVM: VMInstanceRecord,
         forkPointSnapshot: SnapshotNode,
         childInitialSnapshot: SnapshotNode,
-        cloneDurationMilliseconds: Double
+        cloneDurationMilliseconds: Double,
+        diskCloneStrategy: DiskCloneStrategyUsed = .apfsClonefile
     ) {
         self.parentVMID = parentVMID
         self.childVM = childVM
         self.forkPointSnapshot = forkPointSnapshot
         self.childInitialSnapshot = childInitialSnapshot
         self.cloneDurationMilliseconds = cloneDurationMilliseconds
+        self.diskCloneStrategy = diskCloneStrategy
     }
 }
 

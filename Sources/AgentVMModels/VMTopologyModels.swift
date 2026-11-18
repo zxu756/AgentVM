@@ -574,9 +574,18 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
     public var balloonReclaimedMB: UInt64
     public var diskReadBytesTotal: UInt64
     public var diskWriteBytesTotal: UInt64
-    public var cowDirtyBytes: UInt64
+    /// Bytes on disk private to this VM's root disk and not shared with other APFS clones (`ATTR_CMNEXT_PRIVATESIZE`).
+    public var apfsPrivateBytes: UInt64
+    /// Physical allocated bytes on disk (`st_blocks * 512`) for this VM's root disk.
+    public var allocatedDiskBytes: UInt64
     public var netRxBytesTotal: UInt64
     public var netTxBytesTotal: UInt64
+
+    /// Legacy Swift alias preserved for source compatibility with pre-M3 callers.
+    public var cowDirtyBytes: UInt64 {
+        get { apfsPrivateBytes }
+        set { apfsPrivateBytes = newValue }
+    }
     public var netRxPackets: UInt64
     public var netTxPackets: UInt64
     public var firewallDroppedPackets: UInt64
@@ -606,6 +615,8 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         balloonReclaimedMB: UInt64 = 0,
         diskReadBytesTotal: UInt64 = 0,
         diskWriteBytesTotal: UInt64 = 0,
+        apfsPrivateBytes: UInt64? = nil,
+        allocatedDiskBytes: UInt64 = 0,
         cowDirtyBytes: UInt64 = 0,
         netRxBytesTotal: UInt64 = 0,
         netTxBytesTotal: UInt64 = 0,
@@ -630,7 +641,8 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         self.balloonReclaimedMB = balloonReclaimedMB
         self.diskReadBytesTotal = diskReadBytesTotal
         self.diskWriteBytesTotal = diskWriteBytesTotal
-        self.cowDirtyBytes = cowDirtyBytes
+        self.apfsPrivateBytes = apfsPrivateBytes ?? cowDirtyBytes
+        self.allocatedDiskBytes = allocatedDiskBytes
         self.netRxBytesTotal = netRxBytesTotal
         self.netTxBytesTotal = netTxBytesTotal
         self.netRxPackets = netRxPackets
@@ -656,7 +668,8 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         case balloonReclaimedMB
         case diskReadBytesTotal
         case diskWriteBytesTotal
-        case cowDirtyBytes
+        case apfsPrivateBytes
+        case allocatedDiskBytes
         case netRxBytesTotal
         case netTxBytesTotal
         case netRxPackets
@@ -683,7 +696,8 @@ public struct VMLiveTelemetry: Codable, Hashable, Sendable {
         self.balloonReclaimedMB = try container.decode(UInt64.self, forKey: .balloonReclaimedMB)
         self.diskReadBytesTotal = try container.decode(UInt64.self, forKey: .diskReadBytesTotal)
         self.diskWriteBytesTotal = try container.decode(UInt64.self, forKey: .diskWriteBytesTotal)
-        self.cowDirtyBytes = try container.decode(UInt64.self, forKey: .cowDirtyBytes)
+        self.apfsPrivateBytes = try container.decode(UInt64.self, forKey: .apfsPrivateBytes)
+        self.allocatedDiskBytes = try container.decode(UInt64.self, forKey: .allocatedDiskBytes)
         self.netRxBytesTotal = try container.decode(UInt64.self, forKey: .netRxBytesTotal)
         self.netTxBytesTotal = try container.decode(UInt64.self, forKey: .netTxBytesTotal)
         self.netRxPackets = try container.decode(UInt64.self, forKey: .netRxPackets)

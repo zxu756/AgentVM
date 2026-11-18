@@ -22,6 +22,32 @@ public enum SnapshotKind: String, Codable, Hashable, Sendable, CaseIterable {
     }
 }
 
+public struct DiskFileSpaceMetrics: Codable, Hashable, Sendable {
+    public var imagePath: String
+    public var virtualSizeBytes: UInt64
+    public var allocatedDiskBytes: UInt64
+    /// Bytes private to this file and not shared with any other APFS clone (`ATTR_CMNEXT_PRIVATESIZE`).
+    public var privateBytes: UInt64
+    public var filesystemBlockSize: UInt32
+    public var sampledAt: Date
+
+    public init(
+        imagePath: String,
+        virtualSizeBytes: UInt64,
+        allocatedDiskBytes: UInt64,
+        privateBytes: UInt64,
+        filesystemBlockSize: UInt32 = 4096,
+        sampledAt: Date = Date()
+    ) {
+        self.imagePath = imagePath
+        self.virtualSizeBytes = virtualSizeBytes
+        self.allocatedDiskBytes = allocatedDiskBytes
+        self.privateBytes = privateBytes
+        self.filesystemBlockSize = filesystemBlockSize
+        self.sampledAt = sampledAt
+    }
+}
+
 public struct SnapshotNode: Codable, Hashable, Sendable, Identifiable {
     public var id: SnapshotID
     public var vmID: VMID
@@ -35,13 +61,20 @@ public struct SnapshotNode: Codable, Hashable, Sendable, Identifiable {
     public var memoryStatePath: String?
     public var virtualDiskBytes: UInt64
     public var allocatedDiskBytes: UInt64
-    public var dirtyDeltaBytes: UInt64
+    /// Bytes on disk not shared with any other APFS clone (`ATTR_CMNEXT_PRIVATESIZE`).
+    public var apfsPrivateBytes: UInt64
     public var memoryStateBytes: UInt64
     public var specSnapshot: VMSpec
     public var agentActor: String
     public var triggerCommand: String?
     public var isPinned: Bool
     public var tags: [String]
+
+    /// Legacy Swift alias preserved for source compatibility with pre-M3 callers.
+    public var dirtyDeltaBytes: UInt64 {
+        get { apfsPrivateBytes }
+        set { apfsPrivateBytes = newValue }
+    }
 
     public init(
         id: SnapshotID = .generate(prefix: "snap"),
@@ -56,6 +89,7 @@ public struct SnapshotNode: Codable, Hashable, Sendable, Identifiable {
         memoryStatePath: String? = nil,
         virtualDiskBytes: UInt64,
         allocatedDiskBytes: UInt64,
+        apfsPrivateBytes: UInt64? = nil,
         dirtyDeltaBytes: UInt64 = 0,
         memoryStateBytes: UInt64 = 0,
         specSnapshot: VMSpec,
@@ -76,7 +110,7 @@ public struct SnapshotNode: Codable, Hashable, Sendable, Identifiable {
         self.memoryStatePath = memoryStatePath
         self.virtualDiskBytes = virtualDiskBytes
         self.allocatedDiskBytes = allocatedDiskBytes
-        self.dirtyDeltaBytes = dirtyDeltaBytes
+        self.apfsPrivateBytes = apfsPrivateBytes ?? dirtyDeltaBytes
         self.memoryStateBytes = memoryStateBytes
         self.specSnapshot = specSnapshot
         self.agentActor = agentActor
@@ -85,13 +119,35 @@ public struct SnapshotNode: Codable, Hashable, Sendable, Identifiable {
         self.tags = tags
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case vmID
+        case parentSnapshotID
+        case branchName
+        case title
+        case notes
+        case kind
+        case createdAt
+        case diskClonePath
+        case memoryStatePath
+        case virtualDiskBytes
+        case allocatedDiskBytes
+        case apfsPrivateBytes
+        case memoryStateBytes
+        case specSnapshot
+        case agentActor
+        case triggerCommand
+        case isPinned
+        case tags
+    }
+
     public var hasLiveRAMState: Bool {
         memoryStatePath != nil && memoryStateBytes > 0
     }
 
     public var spaceSavingsPercent: Double {
         guard virtualDiskBytes > 0 else { return 0 }
-        let used = min(virtualDiskBytes, dirtyDeltaBytes > 0 ? dirtyDeltaBytes : allocatedDiskBytes)
+        let used = min(virtualDiskBytes, apfsPrivateBytes > 0 ? apfsPrivateBytes : allocatedDiskBytes)
         return max(0.0, (1.0 - Double(used) / Double(virtualDiskBytes)) * 100.0)
     }
 }

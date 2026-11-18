@@ -195,17 +195,27 @@ public struct APFSCoWDiskEngine: Sendable {
     public let comparisonChunkBytes: Int
     public let zlibCompressionLevel: Int32
     public let forceCopyFallbackErrnoForTesting: Int32?
+    public let onExtentScanForTesting: (@Sendable (URL, URL?) -> Void)?
+    public let onDiskContentReadForTesting: (@Sendable (String) -> Void)?
 
     public init() {
         self.comparisonChunkBytes = Self.defaultComparisonChunkBytes
         self.zlibCompressionLevel = Z_DEFAULT_COMPRESSION
         self.forceCopyFallbackErrnoForTesting = nil
+        self.onExtentScanForTesting = nil
+        self.onDiskContentReadForTesting = nil
     }
 
-    public init(forceCopyFallbackErrnoForTesting: Int32?) {
+    public init(
+        forceCopyFallbackErrnoForTesting: Int32?,
+        onExtentScanForTesting: (@Sendable (URL, URL?) -> Void)? = nil,
+        onDiskContentReadForTesting: (@Sendable (String) -> Void)? = nil
+    ) {
         self.comparisonChunkBytes = Self.defaultComparisonChunkBytes
         self.zlibCompressionLevel = Z_DEFAULT_COMPRESSION
         self.forceCopyFallbackErrnoForTesting = forceCopyFallbackErrnoForTesting
+        self.onExtentScanForTesting = onExtentScanForTesting
+        self.onDiskContentReadForTesting = onDiskContentReadForTesting
     }
 
     public init(comparisonChunkBytes: Int, zlibCompressionLevel: Int32 = Z_DEFAULT_COMPRESSION) {
@@ -213,6 +223,22 @@ public struct APFSCoWDiskEngine: Sendable {
         self.comparisonChunkBytes = clampedChunk
         self.zlibCompressionLevel = min(max(zlibCompressionLevel, Z_NO_COMPRESSION), Z_BEST_COMPRESSION)
         self.forceCopyFallbackErrnoForTesting = nil
+        self.onExtentScanForTesting = nil
+        self.onDiskContentReadForTesting = nil
+    }
+
+    // MARK: - APFS Private Bytes & Allocated Space Metadata (`getattrlist` + `stat`)
+
+    public func readFileSpaceMetrics(at url: URL) throws -> DiskFileSpaceMetrics {
+        let summary = try scanSparseExtents(at: url)
+        return DiskFileSpaceMetrics(
+            imagePath: summary.imagePath,
+            virtualSizeBytes: summary.virtualSizeBytes,
+            allocatedDiskBytes: summary.physicalAllocatedBytes,
+            privateBytes: summary.uniqueDirtyBytes,
+            filesystemBlockSize: summary.filesystemBlockSize,
+            sampledAt: summary.scannedAt
+        )
     }
 
     // MARK: - Sparse Raw Disk Lifecycle
@@ -620,6 +646,7 @@ public struct APFSCoWDiskEngine: Sendable {
         compareAgainstParent parentURL: URL? = nil,
         computeChecksums: Bool = false
     ) throws -> DiskAllocationSummary {
+        onExtentScanForTesting?(url, parentURL)
         let targetPath = url.path
         let targetFD = Darwin.open(targetPath, O_RDONLY | O_CLOEXEC)
         guard targetFD >= 0 else {
@@ -725,6 +752,7 @@ public struct APFSCoWDiskEngine: Sendable {
             var pos = dataStart
             while pos < holeStart {
                 let chunkLen = Int(min(UInt64(chunkCap), holeStart - pos))
+                onDiskContentReadForTesting?(targetPath)
                 try Self.preadExact(fd: targetFD, path: targetPath, into: targetBuf, count: chunkLen, offset: pos)
                 let targetSlice = UnsafeRawBufferPointer(start: targetBuf, count: chunkLen)
                 let targetZero = Self.isAllZero(targetSlice)

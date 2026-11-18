@@ -49,16 +49,19 @@ map_module_to_filters() {
             echo "BilingualLocalizationTests"
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage6Tests"
+            echo "M3Stage1PrivateBytesTests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
             echo "CLIAndMCPDaemonStage3aTests"
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage6Tests"
+            echo "M3Stage1PrivateBytesTests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"
             echo "CLIAndMCPDaemonStage5Tests"
+            echo "M3Stage1PrivateBytesTests"
             ;;
         AgentVMNetSwitch|NetSwitch)
             echo "NetSwitchDissectorAndPCAPTests"
@@ -81,6 +84,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage5Tests"
             echo "CLIAndMCPDaemonStage6Tests"
+            echo "M3Stage1PrivateBytesTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -93,6 +97,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage4Tests"
             echo "CLIAndMCPDaemonStage5Tests"
             echo "CLIAndMCPDaemonStage6Tests"
+            echo "M3Stage1PrivateBytesTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -111,6 +116,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage5Tests"
             echo "CLIAndMCPDaemonStage6Tests"
             echo "StudioViewsHonestyTests"
+            echo "M3Stage1PrivateBytesTests"
             ;;
         *)
             echo "ERROR: Unknown module '$mod'" >&2

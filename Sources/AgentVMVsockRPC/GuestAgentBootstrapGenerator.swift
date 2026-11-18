@@ -95,6 +95,34 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
         return updated
     }
 
+    /// Strips any previously persisted guest-bootstrap `writeFiles` and `runCommands` (including legacy
+    /// v1.0–v1.3 entries) while keeping caller-supplied custom files and commands intact, then re-injects
+    /// the current bootstrap version. Used when synthesizing a forked child VM's `CloudInitSpec`.
+    public func refreshing(in spec: CloudInitSpec, includePythonAptPackage: Bool = false) -> CloudInitSpec {
+        guard spec.injectGuestVsockAgent else { return spec }
+        var stripped = spec
+        let managedWritePaths: Set<String> = [
+            modulesLoadPath,
+            daemonPath,
+            systemdUnitPath,
+            Self.defaultModulesLoadGuestPath,
+            Self.defaultDaemonGuestPath,
+            Self.defaultSystemdUnitGuestPath,
+            "/usr/local/bin/agentvm-guest-agent",
+            "/etc/systemd/system/agentvm-guest-agent.service"
+        ]
+        stripped.writeFiles.removeAll { managedWritePaths.contains($0.guestPath) }
+
+        var managedRunCommands = Set(cloudInitRunCommands())
+        managedRunCommands.insert("mkdir -p /workspace")
+        managedRunCommands.insert("modprobe virtio_vsock || modprobe vmw_vsock_virtio_transport || true")
+        managedRunCommands.insert("systemctl enable --now agentvm-guestd.service")
+        managedRunCommands.insert("systemctl enable --now agentvm-guest-agent.service")
+        stripped.runCommands.removeAll { managedRunCommands.contains($0) }
+
+        return applying(to: stripped, includePythonAptPackage: includePythonAptPackage)
+    }
+
     // MARK: Systemd Service & Kernel Module Templates
 
     public func kernelModulesConfig() -> String {

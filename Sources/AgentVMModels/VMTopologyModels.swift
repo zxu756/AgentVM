@@ -289,6 +289,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
     public var passwordHash: String?
     public var sshAuthorizedKeys: [String]
     public var aptPackages: [String]
+    public var bootCommands: [[String]]
     public var writeFiles: [CloudInitWriteFile]
     public var runCommands: [String]
     public var staticIPv4CIDR: String?
@@ -304,6 +305,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         passwordHash: String? = nil,
         sshAuthorizedKeys: [String] = [],
         aptPackages: [String] = [],
+        bootCommands: [[String]] = [],
         writeFiles: [CloudInitWriteFile] = [],
         runCommands: [String] = [],
         staticIPv4CIDR: String? = nil,
@@ -318,6 +320,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         self.passwordHash = passwordHash
         self.sshAuthorizedKeys = sshAuthorizedKeys
         self.aptPackages = aptPackages
+        self.bootCommands = bootCommands
         self.writeFiles = writeFiles
         self.runCommands = runCommands
         self.staticIPv4CIDR = staticIPv4CIDR
@@ -325,6 +328,102 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         self.nameservers = nameservers
         self.injectGuestVsockAgent = injectGuestVsockAgent
         self.timezone = timezone
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case instanceID
+        case hostname
+        case defaultUser
+        case passwordHash
+        case sshAuthorizedKeys
+        case aptPackages
+        case bootCommands
+        case writeFiles
+        case runCommands
+        case staticIPv4CIDR
+        case gatewayIPv4
+        case nameservers
+        case injectGuestVsockAgent
+        case timezone
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.instanceID = try container.decode(String.self, forKey: .instanceID)
+        self.hostname = try container.decode(String.self, forKey: .hostname)
+        self.defaultUser = try container.decodeIfPresent(String.self, forKey: .defaultUser) ?? "agent"
+        self.passwordHash = try container.decodeIfPresent(String.self, forKey: .passwordHash)
+        self.sshAuthorizedKeys = try container.decodeIfPresent([String].self, forKey: .sshAuthorizedKeys) ?? []
+        self.aptPackages = try container.decodeIfPresent([String].self, forKey: .aptPackages) ?? []
+        self.bootCommands = try container.decodeIfPresent([[String]].self, forKey: .bootCommands) ?? []
+        self.writeFiles = try container.decodeIfPresent([CloudInitWriteFile].self, forKey: .writeFiles) ?? []
+        self.runCommands = try container.decodeIfPresent([String].self, forKey: .runCommands) ?? []
+        self.staticIPv4CIDR = try container.decodeIfPresent(String.self, forKey: .staticIPv4CIDR)
+        self.gatewayIPv4 = try container.decodeIfPresent(String.self, forKey: .gatewayIPv4)
+        self.nameservers = try container.decodeIfPresent([String].self, forKey: .nameservers) ?? []
+        self.injectGuestVsockAgent = try container.decodeIfPresent(Bool.self, forKey: .injectGuestVsockAgent) ?? true
+        self.timezone = try container.decodeIfPresent(String.self, forKey: .timezone) ?? "UTC"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(instanceID, forKey: .instanceID)
+        try container.encode(hostname, forKey: .hostname)
+        try container.encode(defaultUser, forKey: .defaultUser)
+        try container.encodeIfPresent(passwordHash, forKey: .passwordHash)
+        try container.encode(sshAuthorizedKeys, forKey: .sshAuthorizedKeys)
+        try container.encode(aptPackages, forKey: .aptPackages)
+        try container.encode(bootCommands, forKey: .bootCommands)
+        try container.encode(writeFiles, forKey: .writeFiles)
+        try container.encode(runCommands, forKey: .runCommands)
+        try container.encodeIfPresent(staticIPv4CIDR, forKey: .staticIPv4CIDR)
+        try container.encodeIfPresent(gatewayIPv4, forKey: .gatewayIPv4)
+        try container.encode(nameservers, forKey: .nameservers)
+        try container.encode(injectGuestVsockAgent, forKey: .injectGuestVsockAgent)
+        try container.encode(timezone, forKey: .timezone)
+    }
+
+    /// Normalizes an arbitrary VM name into a valid RFC 1123 guest hostname label:
+    /// ASCII lowercase letters (`a-z`), digits (`0-9`), and hyphens (`-`) only;
+    /// underscores and non-ASCII / punctuation characters become `-`; no leading or trailing `-`;
+    /// maximum length 63 bytes (re-trimming any trailing `-` exposed by truncation).
+    public static func sanitizeHostname(_ raw: String) -> String {
+        let precomposed = raw.precomposedStringWithCanonicalMapping
+        var mapped: [UInt8] = []
+        mapped.reserveCapacity(min(precomposed.utf8.count, 64))
+        for scalar in precomposed.unicodeScalars {
+            let v = scalar.value
+            if v >= 0x61 && v <= 0x7A {
+                mapped.append(UInt8(v))
+            } else if v >= 0x41 && v <= 0x5A {
+                mapped.append(UInt8(v + 32))
+            } else if v >= 0x30 && v <= 0x39 {
+                mapped.append(UInt8(v))
+            } else {
+                mapped.append(0x2D)
+            }
+        }
+        var start = 0
+        while start < mapped.count && mapped[start] == 0x2D {
+            start += 1
+        }
+        var end = mapped.count
+        while end > start && mapped[end - 1] == 0x2D {
+            end -= 1
+        }
+        if start >= end {
+            return "sandbox"
+        }
+        if end - start > 63 {
+            end = start + 63
+            while end > start && mapped[end - 1] == 0x2D {
+                end -= 1
+            }
+        }
+        if start >= end {
+            return "sandbox"
+        }
+        return String(decoding: mapped[start..<end], as: UTF8.self)
     }
 }
 

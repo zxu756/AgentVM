@@ -1203,15 +1203,17 @@ public actor AgentVMFleetCoordinator {
         let resolvedIP = ipv4Address ?? "10.211.55.\(min(240, 10 + existingVMs.count))"
         let mac = MACAddress.deterministicGuestMAC(seed: vmID.rawValue).description
 
-        let rawCloudInit = cloudInitOverride ?? CloudInitSpec(
+        let guestHostname = CloudInitSpec.sanitizeHostname(name)
+        var rawCloudInit = cloudInitOverride ?? CloudInitSpec(
             instanceID: vmID.rawValue,
-            hostname: slug,
+            hostname: guestHostname,
             defaultUser: "agent",
             staticIPv4CIDR: ipv4Address.map { "\($0)/24" },
             gatewayIPv4: ipv4Address == nil ? nil : "10.211.55.1",
             nameservers: ipv4Address == nil ? [] : ["10.211.55.1"],
             injectGuestVsockAgent: true
         )
+        rawCloudInit.hostname = CloudInitSpec.sanitizeHostname(rawCloudInit.hostname)
         let enrichedCloudInit = rawCloudInit.injectGuestVsockAgent
             ? guestBootstrap.applying(to: rawCloudInit, includePythonAptPackage: false)
             : rawCloudInit
@@ -1404,9 +1406,10 @@ public actor AgentVMFleetCoordinator {
             ? randomMAC
             : MACAddress.deterministicGuestMAC(seed: vmID.rawValue).description
 
-        let rawCloudInit = cloudInitOverride ?? CloudInitSpec(
+        let guestHostname = CloudInitSpec.sanitizeHostname(name)
+        var rawCloudInit = cloudInitOverride ?? CloudInitSpec(
             instanceID: vmID.rawValue,
-            hostname: slug,
+            hostname: guestHostname,
             defaultUser: "agent",
             passwordHash: nil,
             sshAuthorizedKeys: [],
@@ -1416,6 +1419,7 @@ public actor AgentVMFleetCoordinator {
             nameservers: [],
             injectGuestVsockAgent: true
         )
+        rawCloudInit.hostname = CloudInitSpec.sanitizeHostname(rawCloudInit.hostname)
         let enrichedCloudInit = rawCloudInit.injectGuestVsockAgent
             ? guestBootstrap.applying(to: rawCloudInit, includePythonAptPackage: false)
             : rawCloudInit
@@ -3105,6 +3109,15 @@ public actor AgentVMFleetCoordinator {
         if childSpec.serialAndDisplay.serialLogPath != nil {
             childSpec.serialAndDisplay.serialLogPath = consoleLogURL(forVMName: branchName).path
         }
+        let (childCloudInit, childISOURL) = try synthesizeChildCloudInitAndISO(
+            parentSpec: parentRecord.spec,
+            childID: childID,
+            childBranchName: branchName,
+            childSlug: slug,
+            childStaticIPv4: childIP
+        )
+        childSpec.cloudInit = childCloudInit
+        childSpec.cloudInitISOPath = childISOURL.path
 
         let childSnapDiskURL = store.snapshotsDirectoryURL.appendingPathComponent("\(childID.rawValue)-head.raw")
         let childSnapStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
@@ -3203,6 +3216,53 @@ public actor AgentVMFleetCoordinator {
             cloneDurationMilliseconds: elapsedMs,
             diskCloneStrategy: effectiveStrategy
         )
+    }
+
+    private func synthesizeChildCloudInitAndISO(
+        parentSpec: VMSpec,
+        childID: VMID,
+        childBranchName: String,
+        childSlug: String,
+        childStaticIPv4: String?
+    ) throws -> (CloudInitSpec, URL) {
+        let childISOURL = store.isosDirectoryURL.appendingPathComponent("\(childSlug)-\(childID.rawValue)-cidata.iso")
+        let childHostname = CloudInitSpec.sanitizeHostname(childBranchName)
+
+        var childCI = parentSpec.cloudInit ?? CloudInitSpec(
+            instanceID: childID.rawValue,
+            hostname: childHostname,
+            defaultUser: "agent",
+            injectGuestVsockAgent: true
+        )
+        childCI.instanceID = childID.rawValue
+        childCI.hostname = childHostname
+
+        if parentSpec.networkInterfaces.first?.mode == .systemNAT {
+            childCI.staticIPv4CIDR = nil
+            childCI.gatewayIPv4 = nil
+            childCI.nameservers = []
+        } else if childCI.staticIPv4CIDR != nil, let ip = childStaticIPv4 {
+            childCI.staticIPv4CIDR = "\(ip)/24"
+        }
+
+        if childCI.injectGuestVsockAgent {
+            childCI = guestBootstrap.refreshing(in: childCI, includePythonAptPackage: false)
+        }
+
+        let workspaceBoot = ISO9660CloudInitBuilder.workspaceInitBootCommand
+        let machineIDBoot = ISO9660CloudInitBuilder.machineIDResetBootCommand
+        var customBootCommands = childCI.bootCommands.filter {
+            $0 != workspaceBoot && $0 != machineIDBoot
+        }
+        customBootCommands.insert(workspaceBoot, at: 0)
+        customBootCommands.append(machineIDBoot)
+        childCI.bootCommands = customBootCommands
+
+        _ = try isoBuilder.buildCloudInitISO(
+            from: childCI,
+            outputURL: childISOURL
+        )
+        return (childCI, childISOURL)
     }
 
     public func restoreToSnapshot(_ snapshotID: SnapshotID) async throws -> VMInstanceRecord {

@@ -91,6 +91,14 @@ public struct ISOInspectionReport: Codable, Hashable, Sendable {
 /// 2048-byte sector image synthesizer and parser for `NoCloud` (`cidata`) VM provisioning.
 public struct ISO9660CloudInitBuilder: Sendable {
     public static let sectorSize: Int = 2048
+    public static let workspaceInitBootCommand: [String] = [
+        "sh", "-c", "mkdir -p /workspace && chmod 0755 /workspace"
+    ]
+    public static let machineIDResetBootCommand: [String] = [
+        "cloud-init-per", "instance", "avm-machine-id",
+        "sh", "-c",
+        "rm -f /etc/machine-id /var/lib/dbus/machine-id && systemd-machine-id-setup && ln -sf /etc/machine-id /var/lib/dbus/machine-id"
+    ]
     private static let systemAreaSectors: Int = 16
     private static let pvdSectorIndex: Int = 16
     private static let vdstSectorIndex: Int = 17
@@ -368,16 +376,32 @@ public struct ISO9660CloudInitBuilder: Sendable {
     // MARK: - NoCloud YAML Synthesis Helpers
 
     private func renderMetaDataYAML(from spec: CloudInitSpec) -> String {
+        let host = CloudInitSpec.sanitizeHostname(spec.hostname)
         var lines: [String] = []
         lines.append("instance-id: \(Self.yamlScalar(spec.instanceID))")
-        lines.append("local-hostname: \(Self.yamlScalar(spec.hostname))")
+        lines.append("local-hostname: \(Self.yamlScalar(host))")
         return lines.joined(separator: "\n") + "\n"
     }
 
     private func renderUserDataYAML(from spec: CloudInitSpec, guestAgentScript: String?) -> String {
+        let host = CloudInitSpec.sanitizeHostname(spec.hostname)
         var lines: [String] = ["#cloud-config"]
-        lines.append("hostname: \(Self.yamlScalar(spec.hostname))")
-        lines.append("fqdn: \(Self.yamlScalar("\(spec.hostname).agentvm.local"))")
+        lines.append("hostname: \(Self.yamlScalar(host))")
+        lines.append("fqdn: \(Self.yamlScalar("\(host).agentvm.local"))")
+        if !spec.bootCommands.isEmpty {
+            lines.append("bootcmd:")
+            var effectiveBootCommands: [[String]] = [Self.workspaceInitBootCommand]
+            for cmd in spec.bootCommands where !cmd.isEmpty {
+                if cmd == Self.workspaceInitBootCommand {
+                    continue
+                }
+                effectiveBootCommands.append(cmd)
+            }
+            for cmd in effectiveBootCommands {
+                let renderedArgs = cmd.map { Self.yamlScalar($0) }.joined(separator: ", ")
+                lines.append("  - [\(renderedArgs)]")
+            }
+        }
         lines.append("manage_etc_hosts: true")
         lines.append("timezone: \(Self.yamlScalar(spec.timezone))")
 
@@ -477,6 +501,7 @@ public struct ISO9660CloudInitBuilder: Sendable {
             }
         } else {
             lines.append("    dhcp4: true")
+            lines.append("    dhcp-identifier: mac")
             if !spec.nameservers.isEmpty {
                 lines.append("    nameservers:")
                 lines.append("      addresses:")
@@ -490,12 +515,13 @@ public struct ISO9660CloudInitBuilder: Sendable {
     }
 
     private func renderVendorDataYAML(from spec: CloudInitSpec) -> String {
+        let host = CloudInitSpec.sanitizeHostname(spec.hostname)
         var lines: [String] = [
             "#cloud-config",
             "# Generated deterministically by AgentVM ISO9660CloudInitBuilder",
             "bootcmd:",
             "  - [ sh, -c, \"mkdir -p /workspace && chmod 0755 /workspace\" ]",
-            "final_message: \"AgentVM guest \(spec.hostname) (\(spec.instanceID)) ready after $UPTIME seconds\""
+            "final_message: \"AgentVM guest \(host) (\(spec.instanceID)) ready after $UPTIME seconds\""
         ]
         if spec.injectGuestVsockAgent {
             lines.insert("kernel_modules: [virtio_pci, virtio_blk, virtio_net, virtio_console, vsock, vmw_vsock_virtio_transport_common, vmw_vsock_virtio_transport]", at: 2)

@@ -84,10 +84,18 @@ struct M3Stage1PrivateBytesTests {
 
     private func darwinStatAllocatedBytes(at url: URL) throws -> UInt64 {
         var st = Darwin.stat()
-        guard Darwin.stat(url.path, &st) == 0 else {
+        guard stat(url.path, &st) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(Darwin.errno))
         }
         return UInt64(max(0, st.st_blocks)) * 512
+    }
+
+    private func makePatternData(count: Int, mul: Int, add: Int) -> Data {
+        var bytes = [UInt8](repeating: 0, count: count)
+        for i in 0..<count {
+            bytes[i] = UInt8((i * mul + add) & 0xFF)
+        }
+        return Data(bytes)
     }
 
     @Test("APFS private bytes read via product matches Darwin getattrlist(ATTR_CMNEXT_PRIVATESIZE): 0 after clonefile, block size after write")
@@ -103,7 +111,7 @@ struct M3Stage1PrivateBytesTests {
         let srcURL = tempDir.appendingPathComponent("origin.raw")
         let cloneURL = tempDir.appendingPathComponent("clone.raw")
         let initialSize = 256 * 1024
-        let nonZeroPattern = Data((0..<initialSize).map { UInt8(($0 * 31 + 7) & 0xFF) })
+        let nonZeroPattern = makePatternData(count: initialSize, mul: 31, add: 7)
         try nonZeroPattern.write(to: srcURL)
 
         let srcPrivInitial = try darwinGetattrlistPrivateBytes(at: srcURL)
@@ -160,7 +168,7 @@ struct M3Stage1PrivateBytesTests {
         let env = ["HOME": mockHome.path, "AGENTVM_IMAGE_CACHE": cacheDir.path]
 
         let imageID = "debian-12-bookworm-arm64"
-        let imgPayload = Data((0..<(1024 * 1024)).map { UInt8(($0 * 13 + 3) & 0xFF) })
+        let imgPayload = makePatternData(count: 1024 * 1024, mul: 13, add: 3)
         let entry = BaseImageCatalogEntry(
             id: imageID,
             displayName: "Debian 12 Test",
@@ -258,7 +266,7 @@ struct M3Stage1PrivateBytesTests {
         // Stage a 4 MiB non-zero base image in local cache
         let cacheDir = tempDir.appendingPathComponent("cache", isDirectory: true)
         let imageID = "debian-12-bookworm-arm64"
-        let imageBytes = Data((0..<(4 * 1024 * 1024)).map { UInt8(($0 * 19 + 11) & 0xFF) })
+        let imageBytes = makePatternData(count: 4 * 1024 * 1024, mul: 19, add: 11)
         let entry = BaseImageCatalogEntry(
             id: imageID,
             displayName: "Debian 12 NoScan Test",

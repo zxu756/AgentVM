@@ -331,6 +331,7 @@ public actor AgentVMFleetCoordinator {
     private var inFlightHardwareBoots: Set<VMID> = []
     private var vmLifecycleTails: [UUID: Task<Void, Never>] = [:]
     private var vmLifecycleQueueHeads: [VMID: UUID] = [:]
+    private var afterLineageCloneHookForTesting: (@Sendable (String, VMID) async -> Void)?
 
     private final class HardwareVZBox: NSObject, VZVirtualMachineDelegate, HardwareVMInstanceHandle, @unchecked Sendable {
         let queue: DispatchQueue
@@ -731,6 +732,12 @@ public actor AgentVMFleetCoordinator {
         HostHypervisorProbe.probeCapabilities(probeDirectoryURL: store.bundleURL)
     }
 
+    public func setAfterLineageCloneHookForTesting(
+        _ hook: (@Sendable (String, VMID) async -> Void)?
+    ) {
+        afterLineageCloneHookForTesting = hook
+    }
+
     public func currentExecutionBackend() -> HypervisorExecutionBackend {
         executionBackend
     }
@@ -1001,18 +1008,20 @@ public actor AgentVMFleetCoordinator {
         heldExecutionLocks[vmID] != nil || activeOneShotLocks.contains(vmID)
     }
 
-    private func rejectIfLockedByAnotherOwnerForLineage(
-        vmID: VMID,
-        vmName: String,
-        operation: String
-    ) throws {
-        guard !ownsExecutionLock(for: vmID) else { return }
-        if let holderPID = VMExecutionLock.readLiveHolderPID(at: lockFileURL(for: vmID)) {
-            throw AgentVMError.vmLockedForDeferredMilestone(
-                vmName: vmName,
-                holderPID: holderPID,
-                reason: .liveSnapshotBranchRestoreScheduledForM3(operation: operation)
-            )
+    /// Reconciles a stale hardware `running` record to `stopped` once this process has already acquired
+    /// the exclusive `VMExecutionLock` and confirmed no live hardware VM box is held in memory.
+    private func reconcileCrashedHardwareRunningAfterLockAcquired(
+        _ record: inout VMInstanceRecord
+    ) async throws {
+        guard !isSimulationBackend,
+              record.telemetry.state == .running,
+              !record.telemetry.simulated,
+              hardwareBoxes[record.id] == nil else {
+            return
+        }
+        let diag = makeVMRuntimeLostDiagnostic(for: record, language: .en)
+        if let reconciled = try await store.reconcileLostRunningVM(vmID: record.id, diagnostic: diag).record {
+            record = reconciled
         }
     }
 
@@ -2923,15 +2932,46 @@ public actor AgentVMFleetCoordinator {
         isPinned: Bool = false,
         triggerCommand: String? = nil
     ) async throws -> (snapshot: SnapshotNode, diskCloneStrategy: DiskCloneStrategyUsed) {
+        try await captureSnapshotInternal(
+            vmID: vmID,
+            title: title,
+            notes: notes,
+            kind: kind,
+            branchName: branchName,
+            isPinned: isPinned,
+            triggerCommand: triggerCommand,
+            acquireExecutionLock: true
+        )
+    }
+
+    private func captureSnapshotInternal(
+        vmID: VMID,
+        title: String,
+        notes: String = "",
+        kind: SnapshotKind = .liveMemoryAndDisk,
+        branchName: String? = nil,
+        isPinned: Bool = false,
+        triggerCommand: String? = nil,
+        acquireExecutionLock: Bool
+    ) async throws -> (snapshot: SnapshotNode, diskCloneStrategy: DiskCloneStrategyUsed) {
         guard let existing = try await store.fetchVM(vmID) else {
             throw AgentVMError.vmNotFound(vmID)
         }
-        try rejectIfLockedByAnotherOwnerForLineage(
-            vmID: vmID,
-            vmName: existing.spec.name,
-            operation: "snapshot"
-        )
+        let acquiredLock: VMExecutionLock?
+        if acquireExecutionLock {
+            acquiredLock = try VMExecutionLock.acquire(
+                at: lockFileURL(for: vmID),
+                vmName: existing.spec.name
+            )
+        } else {
+            acquiredLock = nil
+        }
+        defer {
+            acquiredLock?.release()
+        }
+
         var record = try await loadVMForOperation(vmID)
+        try await reconcileCrashedHardwareRunningAfterLockAcquired(&record)
         guard let bootDisk = record.spec.blockDevices.first else {
             throw AgentVMError.diskImageOperationFailed(
                 path: record.spec.name,
@@ -2948,6 +2988,9 @@ public actor AgentVMFleetCoordinator {
             to: cloneURL,
             overwrite: true
         )
+        if acquireExecutionLock, let hook = afterLineageCloneHookForTesting {
+            await hook("snapshot", vmID)
+        }
         let snapMetrics = try diskEngine.readFileSpaceMetrics(at: cloneURL)
         let rootMetrics = try diskEngine.readFileSpaceMetrics(at: sourceURL)
 
@@ -3019,20 +3062,23 @@ public actor AgentVMFleetCoordinator {
         fromVMID parentVMID: VMID,
         branchName: String,
         agentOwnerTag: String,
-        bootImmediately: Bool = true
+        bootImmediately: Bool = false
     ) async throws -> CoWBranchForkResult {
         guard let existingParent = try await store.fetchVM(parentVMID) else {
             throw AgentVMError.vmNotFound(parentVMID)
         }
-        try rejectIfLockedByAnotherOwnerForLineage(
-            vmID: parentVMID,
-            vmName: existingParent.spec.name,
-            operation: "branch"
+        let parentExecutionLock = try VMExecutionLock.acquire(
+            at: lockFileURL(for: parentVMID),
+            vmName: existingParent.spec.name
         )
-        // Elapsed duration is measured from passing/acquiring the parent VM lock gate to committing the child VM in SQLite.
+        defer {
+            parentExecutionLock.release()
+        }
+        // Elapsed duration is measured from acquiring the parent VM lock to committing the child VM in SQLite.
         let startNs = DispatchTime.now().uptimeNanoseconds
 
-        let parentRecord = try await loadVMForOperation(parentVMID)
+        var parentRecord = try await loadVMForOperation(parentVMID)
+        try await reconcileCrashedHardwareRunningAfterLockAcquired(&parentRecord)
         try await rejectDuplicateVMName(branchName)
         guard let parentDisk = parentRecord.spec.blockDevices.first else {
             throw AgentVMError.diskImageOperationFailed(
@@ -3042,11 +3088,12 @@ public actor AgentVMFleetCoordinator {
             )
         }
 
-        let (forkSnap, forkSnapStrategy) = try await captureSnapshotReportingStrategy(
+        let (forkSnap, forkSnapStrategy) = try await captureSnapshotInternal(
             vmID: parentVMID,
             title: "Branch Fork -> \(branchName)",
             kind: .branchForkPoint,
-            isPinned: true
+            isPinned: true,
+            acquireExecutionLock: false
         )
 
         let childID = VMID.generate(prefix: "vm")
@@ -3125,6 +3172,9 @@ public actor AgentVMFleetCoordinator {
             to: childSnapDiskURL,
             overwrite: true
         )
+        if let hook = afterLineageCloneHookForTesting {
+            await hook("branch", parentVMID)
+        }
         let effectiveStrategy: DiskCloneStrategyUsed = (
             forkSnapStrategy == .fullCopyFallback
             || childDiskStrategy == .fullCopyFallback
@@ -3174,10 +3224,6 @@ public actor AgentVMFleetCoordinator {
         try await undoRedo.execute(cmd, on: store)
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000.0
 
-        if bootImmediately {
-            childRecord = try await bootPersistentVM(childID)
-        }
-
         let privateFormatted = ByteMetricsFormatter.formatBytes(childDiskMetrics.privateBytes)
         let enDiag = String(
             format: "Forked CoW branch '%@' (@%@) in %.1f ms (%@ private bytes not shared with other clones).",
@@ -3207,6 +3253,12 @@ public actor AgentVMFleetCoordinator {
                 "message_zh": zhDiag
             ]
         ))
+
+        parentExecutionLock.release()
+
+        if bootImmediately {
+            childRecord = try await bootPersistentVM(childID)
+        }
 
         return CoWBranchForkResult(
             parentVMID: parentVMID,
@@ -3278,12 +3330,15 @@ public actor AgentVMFleetCoordinator {
         guard let existing = try await store.fetchVM(snap.vmID) else {
             throw AgentVMError.vmNotFound(snap.vmID)
         }
-        try rejectIfLockedByAnotherOwnerForLineage(
-            vmID: snap.vmID,
-            vmName: existing.spec.name,
-            operation: "restore"
+        let vmExecutionLock = try VMExecutionLock.acquire(
+            at: lockFileURL(for: snap.vmID),
+            vmName: existing.spec.name
         )
+        defer {
+            vmExecutionLock.release()
+        }
         var record = try await loadVMForOperation(snap.vmID)
+        try await reconcileCrashedHardwareRunningAfterLockAcquired(&record)
 
         let wasRunning = (record.telemetry.state == .running)
         if wasRunning {
@@ -3298,6 +3353,9 @@ public actor AgentVMFleetCoordinator {
                 to: bootURL,
                 overwrite: true
             )
+            if let hook = afterLineageCloneHookForTesting {
+                await hook("restore", snap.vmID)
+            }
             if let metrics = try? diskEngine.readFileSpaceMetrics(at: bootURL) {
                 record.telemetry.apfsPrivateBytes = metrics.privateBytes
                 record.telemetry.allocatedDiskBytes = metrics.allocatedDiskBytes

@@ -721,7 +721,7 @@ struct CLIAndMCPDaemonStage3aTests {
                 daemonSpawnOverride: forbiddenSpawn
             ).exitCode == 0)
 
-            // 1. CLI `snapshot`, `branch`, `restore` while daemon holds lock -> exit 1, ERR_VM_LOCKED, mentions M3 (EN & ZH).
+            // 1. CLI `snapshot`, `branch`, `restore` while daemon holds lock -> exit 1, ERR_VM_LOCKED, without outdated "M3" text (EN & ZH).
             for lang in ["en", "zh"] {
                 let snapRes = await cli.execute(
                     arguments: ["--lang", lang, "--workspace", wsURL.path, "snapshot", "t1", "live-attempt"],
@@ -730,7 +730,7 @@ struct CLIAndMCPDaemonStage3aTests {
                 )
                 #expect(snapRes.exitCode == 1, "snapshot (\(lang)) exited \(snapRes.exitCode): \(snapRes.stderr)")
                 #expect(snapRes.stderr.contains("ERR_VM_LOCKED"))
-                #expect(snapRes.stderr.contains("M3"))
+                #expect(!snapRes.stderr.contains("M3"))
 
                 let branchRes = await cli.execute(
                     arguments: ["--lang", lang, "--workspace", wsURL.path, "branch", "t1", "t1-child", "--no-boot"],
@@ -739,7 +739,7 @@ struct CLIAndMCPDaemonStage3aTests {
                 )
                 #expect(branchRes.exitCode == 1, "branch (\(lang)) exited \(branchRes.exitCode): \(branchRes.stderr)")
                 #expect(branchRes.stderr.contains("ERR_VM_LOCKED"))
-                #expect(branchRes.stderr.contains("M3"))
+                #expect(!branchRes.stderr.contains("M3"))
 
                 let restoreRes = await cli.execute(
                     arguments: ["--lang", lang, "--workspace", wsURL.path, "restore", baseSnapID.rawValue],
@@ -748,7 +748,7 @@ struct CLIAndMCPDaemonStage3aTests {
                 )
                 #expect(restoreRes.exitCode == 1, "restore (\(lang)) exited \(restoreRes.exitCode): \(restoreRes.stderr)")
                 #expect(restoreRes.stderr.contains("ERR_VM_LOCKED"))
-                #expect(restoreRes.stderr.contains("M3"))
+                #expect(!restoreRes.stderr.contains("M3"))
             }
 
             // Root disk inode and persisted running state must remain untouched!
@@ -792,12 +792,12 @@ struct CLIAndMCPDaemonStage3aTests {
             let dbRecAfterCoord = try #require(try await inspectStore.fetchVM(vmID))
             #expect(dbRecAfterCoord.telemetry.state == .running)
 
-            // 3. MCP JSON-RPC server (`AgentVMMCPServer`) rejects snapshot/branch/restore (M3) and exec (M4) with ERR_VM_LOCKED.
+            // 3. MCP JSON-RPC server (`AgentVMMCPServer`) rejects snapshot/branch/restore (no outdated M3 text) and exec (M4) with ERR_VM_LOCKED.
             let mcp = AgentVMMCPServer(coordinator: externalCoordinator)
-            let mcpCalls: [(String, [String: Any], String)] = [
-                ("agentvm_capture_snapshot", ["vmID": vmID.rawValue, "title": "mcp-snap"], "M3"),
-                ("agentvm_fork_cow_branch", ["parentVMID": vmID.rawValue, "branchName": "mcp-child", "bootImmediately": false], "M3"),
-                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue], "M3"),
+            let mcpCalls: [(String, [String: Any], String?)] = [
+                ("agentvm_capture_snapshot", ["vmID": vmID.rawValue, "title": "mcp-snap"], nil),
+                ("agentvm_fork_cow_branch", ["parentVMID": vmID.rawValue, "branchName": "mcp-child", "bootImmediately": false], nil),
+                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue], nil),
                 ("agentvm_exec_command", ["vmID": vmID.rawValue, "executable": "uname", "arguments": ["-r"]], "M4")
             ]
             for (idx, item) in mcpCalls.enumerated() {
@@ -818,7 +818,11 @@ struct CLIAndMCPDaemonStage3aTests {
                 let contentArr = try #require(resultObj["content"] as? [[String: Any]])
                 let text = contentArr.compactMap { $0["text"] as? String }.joined(separator: "\n")
                 #expect(text.contains("ERR_VM_LOCKED"), "MCP \(item.0) missing ERR_VM_LOCKED: \(text)")
-                #expect(text.contains(item.2), "MCP \(item.0) missing \(item.2): \(text)")
+                if let expectedMilestone = item.2 {
+                    #expect(text.contains(expectedMilestone), "MCP \(item.0) missing \(expectedMilestone): \(text)")
+                } else {
+                    #expect(!text.contains("M3"), "MCP \(item.0) must not contain outdated M3 wording: \(text)")
+                }
             }
 
             // Daemon still holds `t1` in `running` state and halts it cleanly.

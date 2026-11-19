@@ -483,8 +483,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             switch reason {
             case let .liveSnapshotBranchRestoreScheduledForM3(operation):
                 return isZh
-                    ? "虚拟机「\(vmName)」正由\(holderZh)持有运行中，无法执行「\(operation)」；运行中的快照、分叉与回滚安排在 M3 实现。请先执行 'agentvm halt \(vmName)' 停机后再操作。"
-                    : "VM '\(vmName)' is currently held running by \(holderEn); cannot perform '\(operation)' while running because live snapshot, branch, and restore are scheduled for M3. Run 'agentvm halt \(vmName)' first."
+                    ? "虚拟机「\(vmName)」正被\(holderZh)占用，当前进程无法直接执行「\(operation)」；同一时刻只能有一个进程使用同一台虚拟机。"
+                    : "VM '\(vmName)' is currently in use by \(holderEn) and cannot perform '\(operation)' from this process; only one process may use a VM at a time."
             case let .mcpAndStudioDaemonClientScheduledForM4(operation):
                 return isZh
                     ? "虚拟机「\(vmName)」正由\(holderZh)（工作区守护进程）持有，当前进程无法直接执行「\(operation)」；MCP 与桌面界面接入守护进程安排在 M4 实现。请改用命令行 'agentvm \(operation) \(vmName)' 操作。"
@@ -496,8 +496,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
                 : "'agentvm run' only executes commands on a real hardware VM and is not supported under --backend simulation (VM '\(vmName)' was not started and nothing was executed)."
         case let .persistentBootRequiresDaemon(vmName):
             return isZh
-                ? "常驻后台守护进程在 M2 之前尚未实现，无法通过 'agentvm up' 将虚拟机「\(vmName)」启动为常驻状态；请改用 'agentvm run \(vmName) -- <命令>' 执行命令。"
-                : "Persistent background VM lifecycle ('agentvm up') requires the M2 daemon and is not available yet for VM '\(vmName)'; use 'agentvm run \(vmName) -- <cmd>' instead."
+                ? "将虚拟机「\(vmName)」启动为常驻后台状态必须经由工作区守护进程执行，当前进程无法直接常驻开机；请运行 'agentvm up \(vmName)'，或改用 'agentvm run \(vmName) -- <命令>' 单次执行。"
+                : "Persistent background VM boot for '\(vmName)' must run inside the workspace daemon and cannot be started directly in this process; run 'agentvm up \(vmName)' (or use 'agentvm run \(vmName) -- <cmd>' for a one-shot command)."
         case let .airgapPolicyUnsupportedBeforeM5(vmName):
             return isZh
                 ? "当前工作区出口策略为 airgap，但在 M5 之前网络使用系统 NAT，做不到断网启动，已拒绝启动虚拟机「\(vmName)」。如需联网启动请先切换策略（如 'agentvm policy strict'）。"
@@ -648,14 +648,14 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case let .vmLockedForDeferredMilestone(vmName, _, reason):
             switch reason {
             case .liveSnapshotBranchRestoreScheduledForM3:
-                return "Run 'agentvm halt \(vmName)' first; live snapshot, branch, and restore on running VMs are scheduled for M3."
+                return "Wait for the process currently using '\(vmName)' to finish, or run 'agentvm halt \(vmName)' if it is running in the background."
             case let .mcpAndStudioDaemonClientScheduledForM4(operation):
                 return "Use the CLI ('agentvm \(operation) \(vmName)') while MCP and Studio UI daemon integration is scheduled for M4."
             }
         case .runUnsupportedInSimulation:
             return "Omit '--backend simulation' to run on a real hardware VM."
         case let .persistentBootRequiresDaemon(vmName):
-            return "Use 'agentvm run \(vmName) -- <cmd>' to boot, execute a command, and shut down cleanly."
+            return "Run 'agentvm up \(vmName)' to start the VM via the workspace daemon, or use 'agentvm run \(vmName) -- <cmd>' to boot, execute a command, and shut down cleanly."
         case .airgapPolicyUnsupportedBeforeM5:
             return "Run 'agentvm policy strict' to switch away from 'airgap' until M5 enforces L2 egress rules."
         case .cowCloneFailed:

@@ -248,12 +248,7 @@ public actor AgentVMMCPServer {
             }
             let owner = (arguments["owner"] as? String) ?? "mcp-branch"
             let parentID = VMID(parentStr)
-            let parentRecord = try await coordinator.store.fetchVM(parentID)
-            // Default: follow the parent only when its `running` state belongs to this process's backend.
-            let backendIsSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
-            let parentRunsOnThisBackend = (parentRecord?.telemetry.state == .running)
-                && (backendIsSimulation || parentRecord?.telemetry.simulated == false)
-            let bootNow = (arguments["bootImmediately"] as? Bool) ?? parentRunsOnThisBackend
+            let bootNow = (arguments["bootImmediately"] as? Bool) ?? false
             let forked = try await coordinator.forkCoWBranch(
                 fromVMID: parentID,
                 branchName: branchName,

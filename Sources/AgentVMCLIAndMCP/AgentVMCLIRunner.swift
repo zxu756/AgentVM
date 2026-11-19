@@ -767,6 +767,11 @@ public struct AgentVMCLIRunner: Sendable {
                     coordinator: coordinator,
                     parsed: parsed,
                     language: language,
+                    isSimulation: isSimulationFlagged,
+                    environment: environment,
+                    daemonSpawnOverride: daemonSpawnOverride,
+                    checkProcessEntitlement: hardwareBackendOverride == nil || hasEntitlementOverride != nil,
+                    hasEntitlementOverride: hasEntitlementOverride,
                     progressStderrCollector: streamedProgressStderr,
                     liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
                 )
@@ -843,7 +848,7 @@ public struct AgentVMCLIRunner: Sendable {
                 } else if case .diskSizeTooSmallForImage = err {
                     hintLine = "提示：请省略 --disk-size（默认等于镜像大小），或指定不小于镜像大小的容量（如 --disk-size 8G）。"
                 } else if case let .persistentBootRequiresDaemon(vmName) = err {
-                    hintLine = "提示：请改用 'agentvm run \(vmName) -- <命令>' 启动虚拟机、执行命令并关机。"
+                    hintLine = "提示：请运行 'agentvm up \(vmName)' 经工作区守护进程启动虚拟机，或改用 'agentvm run \(vmName) -- <命令>' 单次执行。"
                 } else if case .airgapPolicyUnsupportedBeforeM5 = err {
                     hintLine = "提示：请先运行 'agentvm policy strict' 切换出口策略，M5 之后才支持断网启动。"
                 } else if case .runUnsupportedInSimulation = err {
@@ -855,7 +860,7 @@ public struct AgentVMCLIRunner: Sendable {
                 } else if case let .vmLockedForDeferredMilestone(vmName, _, reason) = err {
                     switch reason {
                     case .liveSnapshotBranchRestoreScheduledForM3:
-                        hintLine = "提示：请先运行 'agentvm halt \(vmName)' 停机；运行中的快照、分叉与回滚将在 M3 支持。"
+                        hintLine = "提示：请等待当前占用该虚拟机的进程结束，或先运行 'agentvm halt \(vmName)' 停机。"
                     case let .mcpAndStudioDaemonClientScheduledForM4(operation):
                         hintLine = "提示：请改用命令行 'agentvm \(operation) \(vmName)'；MCP 与界面接入守护进程将在 M4 支持。"
                     }
@@ -1298,6 +1303,11 @@ public struct AgentVMCLIRunner: Sendable {
         coordinator: AgentVMFleetCoordinator,
         parsed: ParsedSubcommandArguments,
         language: AppLanguage,
+        isSimulation: Bool,
+        environment: [String: String],
+        daemonSpawnOverride: DaemonSpawnCommandOverride?,
+        checkProcessEntitlement: Bool,
+        hasEntitlementOverride: Bool?,
         progressStderrCollector: StreamedStderrCollector,
         liveStderrHandler: (@Sendable (String) -> Void)?
     ) async throws -> CLIExecutionOutcome {
@@ -1306,33 +1316,42 @@ public struct AgentVMCLIRunner: Sendable {
         guard positional.count >= 2 else {
             throw AgentVMError.cliUsageError(
                 detail: isZh
-                    ? "用法：agentvm branch <源虚拟机> <新分支名> [--owner <智能体>]"
-                    : "Usage: agentvm branch <source-vm> <new-branch-name> [--owner <agent>]"
+                    ? "用法：agentvm branch <源虚拟机> <新分支名> [--boot|--no-boot] [--owner <智能体>]"
+                    : "Usage: agentvm branch <source-vm> <new-branch-name> [--boot|--no-boot] [--owner <agent>]"
+            )
+        }
+        if parsed.flags.contains("--boot") && parsed.flags.contains("--no-boot") {
+            throw AgentVMError.cliUsageError(
+                detail: isZh
+                    ? "不能同时指定 --boot 和 --no-boot。"
+                    : "Cannot specify both --boot and --no-boot."
             )
         }
         let parentID = try await resolveVMID(positional[0], coordinator: coordinator)
         let branchName = positional[1]
         let owner = parsed.options["--owner"] ?? "branch-worker"
-        let parentRecord = try await coordinator.store.fetchVM(parentID)
-        let shouldBoot: Bool
-        if parsed.flags.contains("--no-boot") {
-            shouldBoot = false
-        } else if parsed.flags.contains("--boot") {
-            shouldBoot = true
-        } else {
-            // Follow the parent only when its `running` state belongs to the backend this process uses:
-            // a state the simulator wrote does not make the hardware backend boot the branch.
-            let parentTelemetry = parentRecord?.telemetry
-            let backendIsSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
-            shouldBoot = (parentTelemetry?.state == .running)
-                && (backendIsSimulation || parentTelemetry?.simulated == false)
+        // Decided Item 4 (A57): never follow parent state; without `--boot`, child always stays stopped.
+        let shouldBoot = parsed.flags.contains("--boot")
+
+        if shouldBoot && !isSimulation {
+            let entProvider: (@Sendable () -> Bool)?
+            if let explicitEnt = hasEntitlementOverride {
+                entProvider = { explicitEnt }
+            } else {
+                entProvider = nil
+            }
+            _ = try await coordinator.preflightPersistentBoot(
+                parentID,
+                checkProcessEntitlement: checkProcessEntitlement,
+                hasEntitlementOverride: entProvider
+            )
         }
 
         let fork = try await coordinator.forkCoWBranch(
             fromVMID: parentID,
             branchName: branchName,
             agentOwnerTag: owner,
-            bootImmediately: shouldBoot
+            bootImmediately: false
         )
         if fork.diskCloneStrategy == .fullCopyFallback {
             progressStderrCollector.emit(
@@ -1340,7 +1359,73 @@ public struct AgentVMCLIRunner: Sendable {
                 liveHandler: liveStderrHandler
             )
         }
-        let msg: String
+
+        var bootedChild: VMInstanceRecord?
+        if shouldBoot {
+            do {
+                if isSimulation {
+                    bootedChild = try await coordinator.bootPersistentVM(fork.childVM.id)
+                } else {
+                    _ = try await DaemonProcessLauncher.launchOrConnect(
+                        workspaceURL: coordinator.store.bundleURL,
+                        language: language,
+                        environment: environment,
+                        spawnOverride: daemonSpawnOverride
+                    )
+                    let params = DaemonRPCVMLifecycleParams(vm: fork.childVM.id.rawValue, lang: language)
+                    let rpcOutcome = try DaemonClient.performUnaryCall(
+                        workspaceURL: coordinator.store.bundleURL,
+                        call: .up(params),
+                        resultType: DaemonRPCVMLifecycleResult.self
+                    )
+                    switch rpcOutcome {
+                    case let .connected((_, lifeRes)):
+                        bootedChild = lifeRes.vm
+                    case .daemonNotRunning:
+                        let paths = DaemonWorkspacePaths(workspaceURL: coordinator.store.bundleURL)
+                        throw AgentVMError.ipcDaemonUnavailable(
+                            socketPath: paths.directSocketPath,
+                            detail: "Workspace daemon closed connection before completing 'up'."
+                        )
+                    }
+                }
+            } catch {
+                let errCode: String
+                let errDetail: String
+                if let avmErr = error as? AgentVMError {
+                    errCode = avmErr.errorCode
+                    errDetail = avmErr.localizedMessage(in: language)
+                } else if let rpcErr = error as? DaemonRPCError {
+                    errCode = rpcErr.errorCode
+                    errDetail = rpcErr.message
+                } else if let launchErr = error as? DaemonLaunchError {
+                    errCode = launchErr.errorCode
+                    errDetail = launchErr.localizedMessage(in: language)
+                } else if let protoErr = error as? DaemonRPCProtocolError {
+                    errCode = protoErr.errorCode
+                    errDetail = protoErr.localizedMessage(in: language)
+                } else {
+                    errCode = "ERR_DAEMON_IPC"
+                    errDetail = error.localizedDescription
+                }
+                let childName = fork.childVM.spec.name
+                let childID = fork.childVM.id.rawValue
+                let snapID = fork.forkPointSnapshot.id.rawValue
+                let failBody: String
+                if isZh {
+                    failBody = "[\(errCode)] 子机「\(childName)」（\(childID)，源自快照 \(snapID)）已建好并保留在「stopped」状态，没有开机：\(errDetail)\n提示：排查开机失败原因后，可运行 'agentvm up \(childName)' 启动该子机。\n"
+                } else {
+                    failBody = "[\(errCode)] Child VM '\(childName)' (\(childID), forked from snapshot \(snapID)) was created and kept in 'stopped' state without booting: \(errDetail)\nHint: Resolve the boot failure and run 'agentvm up \(childName)' to start the child VM.\n"
+                }
+                return CLIExecutionOutcome(
+                    exitCode: 1,
+                    stdoutData: Data(),
+                    stderrData: Data((progressStderrCollector.snapshot() + failBody).utf8)
+                )
+            }
+        }
+
+        var msg: String
         if isZh {
             msg = String(
                 format: "已通过 clonefile(2) 派生 CoW 分支「%@」（%@），耗时 %.2f ms，父快照 %@\n",
@@ -1357,6 +1442,14 @@ public struct AgentVMCLIRunner: Sendable {
                 fork.cloneDurationMilliseconds,
                 fork.forkPointSnapshot.id.rawValue
             )
+        }
+        if let bootedChild {
+            let stateText = bootedChild.telemetry.markedStateLabel(
+                localizedState: isZh ? Self.localizedStateLabelZh(bootedChild.telemetry.state) : nil
+            )
+            msg += isZh
+                ? "虚拟机「\(bootedChild.spec.name)」（\(bootedChild.id.rawValue)）-> \(stateText)\n"
+                : "VM '\(bootedChild.spec.name)' (\(bootedChild.id.rawValue)) -> \(stateText)\n"
         }
         return CLIExecutionOutcome(
             exitCode: 0,

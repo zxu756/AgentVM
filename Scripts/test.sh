@@ -51,6 +51,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
+            echo "M3Stage2bLocksAndBranchBootTests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
@@ -59,12 +60,14 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
+            echo "M3Stage2bLocksAndBranchBootTests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"
             echo "CLIAndMCPDaemonStage5Tests"
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
+            echo "M3Stage2bLocksAndBranchBootTests"
             ;;
         AgentVMNetSwitch|NetSwitch)
             echo "NetSwitchDissectorAndPCAPTests"
@@ -90,6 +93,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
+            echo "M3Stage2bLocksAndBranchBootTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -104,6 +108,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
+            echo "M3Stage2bLocksAndBranchBootTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -124,6 +129,7 @@ map_module_to_filters() {
             echo "StudioViewsHonestyTests"
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
+            echo "M3Stage2bLocksAndBranchBootTests"
             ;;
         *)
             echo "ERROR: Unknown module '$mod'" >&2

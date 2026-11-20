@@ -19,11 +19,11 @@ Usage:
 
   milestone <N> writes the acceptance logs to a temporary directory and leaves the working tree untouched.
   Pass --record to copy them into reports/ (the committed evidence the README refers to).
-  milestone 1 and milestone 2 require AGENTVM_REAL_VM=1 for real-VM rows; without it, real-VM rows are reported unrun and exit 2.
+  milestone 1, milestone 2, and milestone 3 require AGENTVM_REAL_VM=1 for real-VM rows; without it, real-VM rows are reported unrun and exit 2.
   No mode of this script launches the desktop UI.
 
 Environment:
-  AGENTVM_REAL_VM=1      enable real Virtualization.framework guest VM acceptance (m1-real-boot.sh, m2-daemon.sh)
+  AGENTVM_REAL_VM=1      enable real Virtualization.framework guest VM acceptance (m1-real-boot.sh, m2-daemon.sh, m3-fork.sh, m3-branch-bench.sh)
   AGENTVM_BUILD_JOBS=N   pass `-j N` to swift build / swift test
 
 Modules:
@@ -362,8 +362,100 @@ run_milestone() {
                 echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
             fi
             ;;
-        3|4|5|6)
-            echo "SKIPPED: Milestone M${m} acceptance script is scheduled for M${m} (current branch is M2)."
+        3)
+            echo "==> [AgentVM] Milestone M3: touched module unit scopes"
+            run_scope \
+                AgentVMModels \
+                AgentVMStore \
+                AgentVMStorageCoW \
+                AgentVMVsockRPC \
+                AgentVMPluginHost \
+                AgentVMHypervisor \
+                AgentVMCLIAndMCP \
+                AgentVM
+
+            local log_dir
+            log_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentvm-m3-logs.XXXXXX")"
+            echo "==> [AgentVM] Milestone M3: m0-acceptance.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/m0-acceptance.sh" "$log_dir/m0-acceptance.txt"
+            echo "==> [AgentVM] Milestone M3: readme-commands.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/readme-commands.sh" "$log_dir/readme-commands.txt"
+
+            echo "==> [AgentVM] Milestone M3: m3-fork.sh"
+            if [[ ! -x "$ROOT_DIR/Scripts/acceptance/m3-fork.sh" ]]; then
+                echo "ERROR: $ROOT_DIR/Scripts/acceptance/m3-fork.sh not found or not executable" >&2
+                exit 1
+            fi
+            set +e
+            AGENTVM_M3_FROM_MILESTONE3=1 "$ROOT_DIR/Scripts/acceptance/m3-fork.sh" 2>&1 | tee "$log_dir/m3-fork.txt"
+            local m3_fork_rc=${PIPESTATUS[0]}
+            set -e
+
+            echo "==> [AgentVM] Milestone M3: m3-branch-bench.sh"
+            if [[ ! -x "$ROOT_DIR/Scripts/acceptance/m3-branch-bench.sh" ]]; then
+                echo "ERROR: $ROOT_DIR/Scripts/acceptance/m3-branch-bench.sh not found or not executable" >&2
+                exit 1
+            fi
+            set +e
+            "$ROOT_DIR/Scripts/acceptance/m3-branch-bench.sh" --out-dir "$log_dir" 2>&1 | tee "$log_dir/m3-branch-bench.txt"
+            local m3_bench_rc=${PIPESTATUS[0]}
+            set -e
+
+            if [[ "${AGENTVM_REAL_VM:-}" != "1" ]]; then
+                if [[ $m3_fork_rc -ne 0 && $m3_fork_rc -ne 2 ]]; then
+                    echo "ERROR: m3-fork.sh failed (exit $m3_fork_rc); log kept at $log_dir/m3-fork.txt" >&2
+                    exit "$m3_fork_rc"
+                fi
+                if [[ $m3_bench_rc -ne 0 && $m3_bench_rc -ne 2 ]]; then
+                    echo "ERROR: m3-branch-bench.sh failed (exit $m3_bench_rc); log kept at $log_dir/m3-branch-bench.txt" >&2
+                    exit "$m3_bench_rc"
+                fi
+                echo "UNRUN: Milestone M3 real-VM rows in m3-fork.sh, m3-branch-bench.sh, m1-real-boot.sh, and m2-daemon.sh did not run because AGENTVM_REAL_VM=1 is not set; milestone 3 exits 2 (logs at $log_dir)." >&2
+                exit 2
+            fi
+
+            if [[ $m3_fork_rc -ne 0 ]]; then
+                echo "ERROR: m3-fork.sh failed or left mandatory rows unrun (exit $m3_fork_rc); log kept at $log_dir/m3-fork.txt" >&2
+                exit "$m3_fork_rc"
+            fi
+            if [[ $m3_bench_rc -ne 0 ]]; then
+                echo "ERROR: m3-branch-bench.sh failed (exit $m3_bench_rc); log kept at $log_dir/m3-branch-bench.txt" >&2
+                exit "$m3_bench_rc"
+            fi
+
+            echo "==> [AgentVM] Milestone M3: m1-real-boot.sh (regression guard)"
+            run_logged "$ROOT_DIR/Scripts/acceptance/m1-real-boot.sh" "$log_dir/m1-real-boot.txt"
+
+            echo "==> [AgentVM] Milestone M3: m2-daemon.sh (regression guard)"
+            if [[ ! -x "$ROOT_DIR/Scripts/acceptance/m2-daemon.sh" ]]; then
+                echo "ERROR: $ROOT_DIR/Scripts/acceptance/m2-daemon.sh not found or not executable" >&2
+                exit 1
+            fi
+            set +e
+            "$ROOT_DIR/Scripts/acceptance/m2-daemon.sh" 2>&1 | tee "$log_dir/m2-daemon.txt"
+            local m2_rc=${PIPESTATUS[0]}
+            set -e
+            if [[ $m2_rc -ne 0 && $m2_rc -ne 2 ]]; then
+                echo "ERROR: m2-daemon.sh failed (exit $m2_rc); log kept at $log_dir/m2-daemon.txt" >&2
+                exit "$m2_rc"
+            fi
+            if grep -qE '没跑 \[Row ([1-9]|[12][0-9]|3[0-467])\]' "$log_dir/m2-daemon.txt"; then
+                echo "ERROR: m2-daemon.sh left mandatory rows (1-34, 36, or 37) unrun despite AGENTVM_REAL_VM=1; log kept at $log_dir/m2-daemon.txt" >&2
+                exit 2
+            fi
+
+            if [[ $record -eq 1 ]]; then
+                mkdir -p "$ROOT_DIR/reports"
+                cp "$log_dir/m3-branch-bench.json" "$ROOT_DIR/reports/m3-branch-bench.json"
+                cp "$log_dir/m3-branch-bench.md" "$ROOT_DIR/reports/m3-branch-bench.md"
+                rm -rf "$log_dir"
+                echo "==> [AgentVM] Recorded reports/m3-branch-bench.json and reports/m3-branch-bench.md"
+            else
+                echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
+            fi
+            ;;
+        4|5|6)
+            echo "SKIPPED: Milestone M${m} acceptance script is scheduled for M${m} (current branch is M3)."
             exit 1
             ;;
         *)

@@ -173,6 +173,24 @@ public actor AgentVMMCPServer {
                         ),
                         "isError": true
                     ]
+                } catch let rpcErr as DaemonRPCError {
+                    resultObject = [
+                        "content": Self.markedContent(
+                            text: "[\(rpcErr.errorCode)] \(rpcErr.message)",
+                            isMachineReadableJSON: false,
+                            isSimulation: isSimulation
+                        ),
+                        "isError": true
+                    ]
+                } catch let protoErr as DaemonRPCProtocolError {
+                    resultObject = [
+                        "content": Self.markedContent(
+                            text: "[\(protoErr.errorCode)] \(protoErr.localizedMessage(in: .en))",
+                            isMachineReadableJSON: false,
+                            isSimulation: isSimulation
+                        ),
+                        "isError": true
+                    ]
                 }
             default:
                 return encodeError(id: idValue, code: -32601, message: "Method not found: \(method)")
@@ -247,14 +265,44 @@ public actor AgentVMMCPServer {
                 throw AgentVMError.cliUsageError(detail: "parentVMID and branchName are required.")
             }
             let owner = (arguments["owner"] as? String) ?? "mcp-branch"
-            let parentID = VMID(parentStr)
+            let parentID = try await resolveMCPVMID(parentStr)
             let bootNow = (arguments["bootImmediately"] as? Bool) ?? false
-            let forked = try await coordinator.forkCoWBranch(
-                fromVMID: parentID,
-                branchName: branchName,
-                agentOwnerTag: owner,
-                bootImmediately: bootNow
-            )
+            let isSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
+            let forked: CoWBranchForkResult
+            if !isSimulation,
+               try DaemonClient.isVMHeldByRunningDaemon(
+                   workspaceURL: coordinator.store.bundleURL,
+                   vmID: parentID,
+                   language: .en
+               ) {
+                let rpcOutcome = try DaemonClient.performUnaryCall(
+                    workspaceURL: coordinator.store.bundleURL,
+                    call: .branch(DaemonRPCBranchParams(vm: parentID.rawValue, branchName: branchName, owner: owner, lang: .en)),
+                    resultType: DaemonRPCBranchResult.self
+                )
+                switch rpcOutcome {
+                case let .connected((_, branchRes)):
+                    var resolvedFork = branchRes.fork
+                    if bootNow {
+                        resolvedFork.childVM = try await coordinator.bootPersistentVM(resolvedFork.childVM.id)
+                    }
+                    forked = resolvedFork
+                case .daemonNotRunning:
+                    forked = try await coordinator.forkCoWBranch(
+                        fromVMID: parentID,
+                        branchName: branchName,
+                        agentOwnerTag: owner,
+                        bootImmediately: bootNow
+                    )
+                }
+            } else {
+                forked = try await coordinator.forkCoWBranch(
+                    fromVMID: parentID,
+                    branchName: branchName,
+                    agentOwnerTag: owner,
+                    bootImmediately: bootNow
+                )
+            }
             return String(
                 format: "Forked CoW branch %@ ('%@') in %.2f ms from snapshot %@.",
                 forked.childVM.id.rawValue,
@@ -281,14 +329,61 @@ public actor AgentVMMCPServer {
                   let title = arguments["title"] as? String else {
                 throw AgentVMError.cliUsageError(detail: "vmID and title are required.")
             }
-            let snap = try await coordinator.captureSnapshot(vmID: VMID(vmIDStr), title: title)
+            let targetVMID = try await resolveMCPVMID(vmIDStr)
+            let isSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
+            let snap: SnapshotNode
+            if !isSimulation,
+               try DaemonClient.isVMHeldByRunningDaemon(
+                   workspaceURL: coordinator.store.bundleURL,
+                   vmID: targetVMID,
+                   language: .en
+               ) {
+                let rpcOutcome = try DaemonClient.performUnaryCall(
+                    workspaceURL: coordinator.store.bundleURL,
+                    call: .snapshot(DaemonRPCSnapshotParams(vm: targetVMID.rawValue, title: title, lang: .en)),
+                    resultType: DaemonRPCSnapshotResult.self
+                )
+                switch rpcOutcome {
+                case let .connected((_, snapRes)):
+                    snap = snapRes.snapshot
+                case .daemonNotRunning:
+                    snap = try await coordinator.captureSnapshot(vmID: targetVMID, title: title)
+                }
+            } else {
+                snap = try await coordinator.captureSnapshot(vmID: targetVMID, title: title)
+            }
             return "Snapshot \(snap.id.rawValue) ('\(snap.title)') created."
 
         case "agentvm_restore_snapshot":
             guard let snapStr = arguments["snapshotID"] as? String else {
                 throw AgentVMError.cliUsageError(detail: "snapshotID is required.")
             }
-            let vm = try await coordinator.restoreToSnapshot(SnapshotID(snapStr))
+            let snapID = SnapshotID(snapStr)
+            guard let snapNode = try await coordinator.store.fetchSnapshot(snapID) else {
+                throw AgentVMError.snapshotNotFound(snapID)
+            }
+            let isSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
+            let vm: VMInstanceRecord
+            if !isSimulation,
+               try DaemonClient.isVMHeldByRunningDaemon(
+                   workspaceURL: coordinator.store.bundleURL,
+                   vmID: snapNode.vmID,
+                   language: .en
+               ) {
+                let rpcOutcome = try DaemonClient.performUnaryCall(
+                    workspaceURL: coordinator.store.bundleURL,
+                    call: .restore(DaemonRPCRestoreParams(snapshotID: snapID.rawValue, lang: .en)),
+                    resultType: DaemonRPCRestoreResult.self
+                )
+                switch rpcOutcome {
+                case let .connected((_, restoreRes)):
+                    vm = restoreRes.vm
+                case .daemonNotRunning:
+                    vm = try await coordinator.restoreToSnapshot(snapID)
+                }
+            } else {
+                vm = try await coordinator.restoreToSnapshot(snapID)
+            }
             return "Restored VM \(vm.id.rawValue) to snapshot \(snapStr)."
 
         case "agentvm_query_wiretap":
@@ -325,6 +420,17 @@ public actor AgentVMMCPServer {
         default:
             throw AgentVMError.cliUsageError(detail: "Unknown MCP tool '\(name)'.")
         }
+    }
+
+    private func resolveMCPVMID(_ token: String) async throws -> VMID {
+        let vms = try await coordinator.store.listVMs()
+        if let exact = vms.first(where: { $0.id.rawValue == token }) {
+            return exact.id
+        }
+        if let byName = vms.first(where: { $0.spec.name.caseInsensitiveCompare(token) == .orderedSame }) {
+            return byName.id
+        }
+        return VMID(token)
     }
 
     private func encodeResult(id: Any?, result: [String: Any]) -> String {

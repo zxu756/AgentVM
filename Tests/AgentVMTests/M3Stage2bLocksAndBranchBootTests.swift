@@ -454,7 +454,8 @@ struct M3Stage2bLocksAndBranchBootTests {
         #expect(!zhDaemonMsg.contains("尚未实现"), "Outdated '尚未实现' in ZH persistentBootRequiresDaemon: \(zhDaemonMsg)")
         #expect(!enDaemonHint.contains("M2"))
 
-        // 2. When daemon holds `t1`, CLI `snapshot`/`branch`/`restore` still exit 1 with ERR_VM_LOCKED in Stage 2b, without saying 'M3'.
+        // 2. When a non-daemon lock holder holds `<t1>.lock` (no daemon running), CLI `snapshot`/`branch`/`restore`
+        //    exit 1 with ERR_VM_LOCKED without saying 'M3' (in Stage 3a, daemon-held VMs route via DaemonRPC instead).
         let realBase = try makePrivateTmpDirectory(prefix: "avm-m3-text")
         defer { try? FileManager.default.removeItem(atPath: realBase) }
         defer { Self.sweepDarwinUserTempSymlinks(pointingUnder: realBase) }
@@ -471,7 +472,6 @@ struct M3Stage2bLocksAndBranchBootTests {
             "AGENTVM_IMAGE_CACHE": cacheDir.path
         ]
         let cli = AgentVMCLIRunner()
-        let forbiddenSpawn = DaemonSpawnCommandOverride(executablePath: "/bin/sh", arguments: ["-c", "exit 97"], environment: env)
 
         #expect(await cli.execute(
             arguments: ["--lang", "en", "--workspace", wsURL.path, "create", "t1", "--image", entry.id],
@@ -482,59 +482,38 @@ struct M3Stage2bLocksAndBranchBootTests {
         let inspectStore = try AgentVMProjectStore(bundleURL: wsURL, createIfMissing: false)
         let t1 = try #require(try await inspectStore.listVMs().first(where: { $0.spec.name == "t1" }))
         let baseSnapID = try #require(t1.currentHeadSnapshotID)
+        let lockURL = wsURL.appendingPathComponent("locks/\(t1.id.rawValue).lock")
 
-        let mockBackend = M3Stage2bMockHardwareBackend()
-        defer { mockBackend.closeAllDescriptors() }
+        let externalLock = try VMExecutionLock.acquire(at: lockURL, vmName: "t1")
+        defer { externalLock.release() }
 
-        try await withStartedDaemonServer(
-            workspaceURL: wsURL,
-            imageCacheDirectoryURL: cacheDir,
-            curatedImageEntries: [entry],
-            hardwareBackendOverride: mockBackend
-        ) { _ in
-            #expect(await cli.execute(
-                arguments: ["--lang", "en", "--workspace", wsURL.path, "up", "t1"],
+        for lang in ["en", "zh"] {
+            let snapRes = await cli.execute(
+                arguments: ["--lang", lang, "--workspace", wsURL.path, "snapshot", "t1", "s1"],
                 curatedEntriesOverride: [entry],
-                environment: env,
-                hasEntitlementOverride: true,
-                daemonSpawnOverride: forbiddenSpawn
-            ).exitCode == 0)
+                environment: env
+            )
+            #expect(snapRes.exitCode == 1)
+            #expect(snapRes.stderr.contains("ERR_VM_LOCKED"))
+            #expect(!snapRes.stderr.contains("M3"), "Outdated M3 text in snapshot (\(lang)): \(snapRes.stderr)")
 
-            for lang in ["en", "zh"] {
-                let snapRes = await cli.execute(
-                    arguments: ["--lang", lang, "--workspace", wsURL.path, "snapshot", "t1", "s1"],
-                    curatedEntriesOverride: [entry],
-                    environment: env
-                )
-                #expect(snapRes.exitCode == 1)
-                #expect(snapRes.stderr.contains("ERR_VM_LOCKED"))
-                #expect(!snapRes.stderr.contains("M3"), "Outdated M3 text in snapshot (\(lang)): \(snapRes.stderr)")
-
-                let branchRes = await cli.execute(
-                    arguments: ["--lang", lang, "--workspace", wsURL.path, "branch", "t1", "t1-c"],
-                    curatedEntriesOverride: [entry],
-                    environment: env
-                )
-                #expect(branchRes.exitCode == 1)
-                #expect(branchRes.stderr.contains("ERR_VM_LOCKED"))
-                #expect(!branchRes.stderr.contains("M3"), "Outdated M3 text in branch (\(lang)): \(branchRes.stderr)")
-
-                let restoreRes = await cli.execute(
-                    arguments: ["--lang", lang, "--workspace", wsURL.path, "restore", baseSnapID.rawValue],
-                    curatedEntriesOverride: [entry],
-                    environment: env
-                )
-                #expect(restoreRes.exitCode == 1)
-                #expect(restoreRes.stderr.contains("ERR_VM_LOCKED"))
-                #expect(!restoreRes.stderr.contains("M3"), "Outdated M3 text in restore (\(lang)): \(restoreRes.stderr)")
-            }
-
-            #expect(await cli.execute(
-                arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "t1"],
+            let branchRes = await cli.execute(
+                arguments: ["--lang", lang, "--workspace", wsURL.path, "branch", "t1", "t1-c"],
                 curatedEntriesOverride: [entry],
-                environment: env,
-                daemonSpawnOverride: forbiddenSpawn
-            ).exitCode == 0)
+                environment: env
+            )
+            #expect(branchRes.exitCode == 1)
+            #expect(branchRes.stderr.contains("ERR_VM_LOCKED"))
+            #expect(!branchRes.stderr.contains("M3"), "Outdated M3 text in branch (\(lang)): \(branchRes.stderr)")
+
+            let restoreRes = await cli.execute(
+                arguments: ["--lang", lang, "--workspace", wsURL.path, "restore", baseSnapID.rawValue],
+                curatedEntriesOverride: [entry],
+                environment: env
+            )
+            #expect(restoreRes.exitCode == 1)
+            #expect(restoreRes.stderr.contains("ERR_VM_LOCKED"))
+            #expect(!restoreRes.stderr.contains("M3"), "Outdated M3 text in restore (\(lang)): \(restoreRes.stderr)")
         }
     }
 

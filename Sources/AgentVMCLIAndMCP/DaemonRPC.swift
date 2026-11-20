@@ -1,4 +1,6 @@
+import AgentVMHypervisor
 import AgentVMModels
+import AgentVMStorageCoW
 import Darwin
 import Foundation
 
@@ -19,6 +21,9 @@ public enum DaemonRPCMethod: String, Codable, Hashable, CaseIterable, Sendable {
     case pause
     case resume
     case exec
+    case snapshot
+    case branch
+    case restore
 }
 
 public enum DaemonRPCID: Codable, Hashable, Sendable, ExpressibleByIntegerLiteral, ExpressibleByStringLiteral {
@@ -448,6 +453,162 @@ public struct DaemonRPCExecResult: Codable, Hashable, Sendable {
     }
 }
 
+public struct DaemonRPCSnapshotParams: Codable, Hashable, Sendable {
+    public var vm: String
+    public var title: String
+    public var notes: String
+    public var kind: SnapshotKind?
+    public var branchName: String?
+    public var isPinned: Bool
+    public var triggerCommand: String?
+    public var lang: AppLanguage
+
+    public init(
+        vm: String,
+        title: String,
+        notes: String = "",
+        kind: SnapshotKind? = nil,
+        branchName: String? = nil,
+        isPinned: Bool = false,
+        triggerCommand: String? = nil,
+        lang: AppLanguage = .en
+    ) {
+        self.vm = vm
+        self.title = title
+        self.notes = notes
+        self.kind = kind
+        self.branchName = branchName
+        self.isPinned = isPinned
+        self.triggerCommand = triggerCommand
+        self.lang = lang
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case vm
+        case title
+        case notes
+        case kind
+        case branchName
+        case isPinned
+        case triggerCommand
+        case lang
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.vm = try container.decode(String.self, forKey: .vm)
+        self.title = try container.decode(String.self, forKey: .title)
+        self.notes = try container.decodeIfPresent(String.self, forKey: .notes) ?? ""
+        self.kind = try container.decodeIfPresent(SnapshotKind.self, forKey: .kind)
+        self.branchName = try container.decodeIfPresent(String.self, forKey: .branchName)
+        self.isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        self.triggerCommand = try container.decodeIfPresent(String.self, forKey: .triggerCommand)
+        self.lang = try container.decodeIfPresent(AppLanguage.self, forKey: .lang) ?? .en
+    }
+}
+
+public struct DaemonRPCSnapshotResult: Codable, Hashable, Sendable {
+    public var snapshot: SnapshotNode
+    public var diskCloneStrategy: DiskCloneStrategyUsed
+    public var pauseDurationMilliseconds: Double
+
+    public init(
+        snapshot: SnapshotNode,
+        diskCloneStrategy: DiskCloneStrategyUsed = .apfsClonefile,
+        pauseDurationMilliseconds: Double = 0
+    ) {
+        self.snapshot = snapshot
+        self.diskCloneStrategy = diskCloneStrategy
+        self.pauseDurationMilliseconds = pauseDurationMilliseconds
+    }
+}
+
+public struct DaemonRPCBranchParams: Codable, Hashable, Sendable {
+    public static let defaultOwner = "branch-worker"
+
+    public var vm: String
+    public var branchName: String
+    public var owner: String
+    public var lang: AppLanguage
+
+    public init(
+        vm: String,
+        branchName: String,
+        owner: String = Self.defaultOwner,
+        lang: AppLanguage = .en
+    ) {
+        self.vm = vm
+        self.branchName = branchName
+        self.owner = owner
+        self.lang = lang
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case vm
+        case branchName
+        case owner
+        case lang
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.vm = try container.decode(String.self, forKey: .vm)
+        self.branchName = try container.decode(String.self, forKey: .branchName)
+        self.owner = try container.decodeIfPresent(String.self, forKey: .owner) ?? Self.defaultOwner
+        self.lang = try container.decodeIfPresent(AppLanguage.self, forKey: .lang) ?? .en
+    }
+}
+
+public struct DaemonRPCBranchResult: Codable, Hashable, Sendable {
+    public var fork: CoWBranchForkResult
+    public var pauseDurationMilliseconds: Double
+
+    public init(
+        fork: CoWBranchForkResult,
+        pauseDurationMilliseconds: Double = 0
+    ) {
+        self.fork = fork
+        self.pauseDurationMilliseconds = pauseDurationMilliseconds
+    }
+}
+
+public struct DaemonRPCRestoreParams: Codable, Hashable, Sendable {
+    public var snapshotID: String
+    public var lang: AppLanguage
+
+    public init(snapshotID: String, lang: AppLanguage = .en) {
+        self.snapshotID = snapshotID
+        self.lang = lang
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case snapshotID
+        case lang
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.snapshotID = try container.decode(String.self, forKey: .snapshotID)
+        self.lang = try container.decodeIfPresent(AppLanguage.self, forKey: .lang) ?? .en
+    }
+}
+
+public struct DaemonRPCRestoreResult: Codable, Hashable, Sendable {
+    public var vm: VMInstanceRecord
+    public var preRestoreSnapshot: SnapshotNode?
+    public var diskCloneStrategy: DiskCloneStrategyUsed
+
+    public init(
+        vm: VMInstanceRecord,
+        preRestoreSnapshot: SnapshotNode? = nil,
+        diskCloneStrategy: DiskCloneStrategyUsed = .apfsClonefile
+    ) {
+        self.vm = vm
+        self.preRestoreSnapshot = preRestoreSnapshot
+        self.diskCloneStrategy = diskCloneStrategy
+    }
+}
+
 // MARK: - Strongly-Typed Request Envelopes
 
 public struct DaemonRPCRequest<Params: Codable & Sendable>: Codable, Sendable {
@@ -478,6 +639,9 @@ public enum DaemonRPCCall: Hashable, Sendable {
     case pause(DaemonRPCVMLifecycleParams)
     case resume(DaemonRPCVMLifecycleParams)
     case exec(DaemonRPCExecParams)
+    case snapshot(DaemonRPCSnapshotParams)
+    case branch(DaemonRPCBranchParams)
+    case restore(DaemonRPCRestoreParams)
 
     public var method: DaemonRPCMethod {
         switch self {
@@ -489,6 +653,9 @@ public enum DaemonRPCCall: Hashable, Sendable {
         case .pause: return .pause
         case .resume: return .resume
         case .exec: return .exec
+        case .snapshot: return .snapshot
+        case .branch: return .branch
+        case .restore: return .restore
         }
     }
 
@@ -502,6 +669,9 @@ public enum DaemonRPCCall: Hashable, Sendable {
         case let .pause(p): return p.lang
         case let .resume(p): return p.lang
         case let .exec(p): return p.lang
+        case let .snapshot(p): return p.lang
+        case let .branch(p): return p.lang
+        case let .restore(p): return p.lang
         }
     }
 }
@@ -560,6 +730,12 @@ public struct DaemonRPCRequestEnvelope: Codable, Hashable, Sendable {
             self.call = .resume(try container.decode(DaemonRPCVMLifecycleParams.self, forKey: .params))
         case .exec:
             self.call = .exec(try container.decode(DaemonRPCExecParams.self, forKey: .params))
+        case .snapshot:
+            self.call = .snapshot(try container.decode(DaemonRPCSnapshotParams.self, forKey: .params))
+        case .branch:
+            self.call = .branch(try container.decode(DaemonRPCBranchParams.self, forKey: .params))
+        case .restore:
+            self.call = .restore(try container.decode(DaemonRPCRestoreParams.self, forKey: .params))
         }
     }
 
@@ -577,6 +753,9 @@ public struct DaemonRPCRequestEnvelope: Codable, Hashable, Sendable {
         case let .pause(p): try container.encode(p, forKey: .params)
         case let .resume(p): try container.encode(p, forKey: .params)
         case let .exec(p): try container.encode(p, forKey: .params)
+        case let .snapshot(p): try container.encode(p, forKey: .params)
+        case let .branch(p): try container.encode(p, forKey: .params)
+        case let .restore(p): try container.encode(p, forKey: .params)
         }
     }
 }

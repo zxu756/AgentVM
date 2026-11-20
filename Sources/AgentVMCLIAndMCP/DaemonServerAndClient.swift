@@ -590,6 +590,15 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
 
             case let .exec(params):
                 await handleExecCall(id: envelope.id, params: params, conn: conn)
+
+            case let .snapshot(params):
+                await handleSnapshotCall(id: envelope.id, params: params, conn: conn)
+
+            case let .branch(params):
+                await handleBranchCall(id: envelope.id, params: params, conn: conn)
+
+            case let .restore(params):
+                await handleRestoreCall(id: envelope.id, params: params, conn: conn)
             }
         } catch {
             conn.close()
@@ -646,6 +655,124 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                 message: error.localizedDescription
             )
             let resp = DaemonRPCResponse<DaemonRPCVMLifecycleResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        }
+    }
+
+    private func handleSnapshotCall(
+        id: DaemonRPCID,
+        params: DaemonRPCSnapshotParams,
+        conn: DaemonSocketConnection
+    ) async {
+        defer { conn.close() }
+        do {
+            let vmID = try await resolveVMID(params.vm)
+            let snapRes = try await coordinator.captureSnapshotInDaemon(
+                vmID: vmID,
+                title: params.title,
+                notes: params.notes,
+                kind: params.kind,
+                branchName: params.branchName,
+                isPinned: params.isPinned,
+                triggerCommand: params.triggerCommand
+            )
+            let resp = DaemonRPCResponse<DaemonRPCSnapshotResult>.success(
+                id: id,
+                result: DaemonRPCSnapshotResult(
+                    snapshot: snapRes.snapshot,
+                    diskCloneStrategy: snapRes.diskCloneStrategy,
+                    pauseDurationMilliseconds: snapRes.pauseDurationMilliseconds
+                )
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch let err as AgentVMError {
+            let resp = DaemonRPCResponse<DaemonRPCSnapshotResult>.failure(
+                id: id,
+                agentVMError: err,
+                language: params.lang
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch {
+            let rpcErr = DaemonRPCError(
+                code: DaemonRPCError.internalErrorCode,
+                errorCode: "ERR_DAEMON_INTERNAL",
+                message: error.localizedDescription
+            )
+            let resp = DaemonRPCResponse<DaemonRPCSnapshotResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        }
+    }
+
+    private func handleBranchCall(
+        id: DaemonRPCID,
+        params: DaemonRPCBranchParams,
+        conn: DaemonSocketConnection
+    ) async {
+        defer { conn.close() }
+        do {
+            let parentID = try await resolveVMID(params.vm)
+            let branchRes = try await coordinator.forkBranchInDaemon(
+                fromVMID: parentID,
+                branchName: params.branchName,
+                agentOwnerTag: params.owner
+            )
+            let resp = DaemonRPCResponse<DaemonRPCBranchResult>.success(
+                id: id,
+                result: DaemonRPCBranchResult(
+                    fork: branchRes.fork,
+                    pauseDurationMilliseconds: branchRes.pauseDurationMilliseconds
+                )
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch let err as AgentVMError {
+            let resp = DaemonRPCResponse<DaemonRPCBranchResult>.failure(
+                id: id,
+                agentVMError: err,
+                language: params.lang
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch {
+            let rpcErr = DaemonRPCError(
+                code: DaemonRPCError.internalErrorCode,
+                errorCode: "ERR_DAEMON_INTERNAL",
+                message: error.localizedDescription
+            )
+            let resp = DaemonRPCResponse<DaemonRPCBranchResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        }
+    }
+
+    private func handleRestoreCall(
+        id: DaemonRPCID,
+        params: DaemonRPCRestoreParams,
+        conn: DaemonSocketConnection
+    ) async {
+        defer { conn.close() }
+        do {
+            let restoreRes = try await coordinator.restoreSnapshotInDaemon(SnapshotID(params.snapshotID))
+            let resp = DaemonRPCResponse<DaemonRPCRestoreResult>.success(
+                id: id,
+                result: DaemonRPCRestoreResult(
+                    vm: restoreRes.record,
+                    preRestoreSnapshot: restoreRes.preRestoreSnapshot,
+                    diskCloneStrategy: restoreRes.diskCloneStrategy
+                )
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch let err as AgentVMError {
+            let resp = DaemonRPCResponse<DaemonRPCRestoreResult>.failure(
+                id: id,
+                agentVMError: err,
+                language: params.lang
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch {
+            let rpcErr = DaemonRPCError(
+                code: DaemonRPCError.internalErrorCode,
+                errorCode: "ERR_DAEMON_INTERNAL",
+                message: error.localizedDescription
+            )
+            let resp = DaemonRPCResponse<DaemonRPCRestoreResult>.failure(id: id, error: rpcErr)
             try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
         }
     }
@@ -1241,6 +1368,22 @@ public enum DaemonClient {
             return .daemonNotRunning
         case let .connected((_, status)):
             return .connected(status)
+        }
+    }
+
+    /// Connect-only probe returning `true` iff a workspace daemon is currently running and holding `vmID` in memory.
+    /// Never spawns a daemon and never touches `<workspace>/locks/<vmID>.lock`.
+    public static func isVMHeldByRunningDaemon(
+        workspaceURL: URL,
+        vmID: VMID,
+        language: AppLanguage
+    ) throws -> Bool {
+        let statusOutcome = try queryStatus(workspaceURL: workspaceURL, language: language)
+        switch statusOutcome {
+        case .daemonNotRunning:
+            return false
+        case let .connected(status):
+            return status.vms.contains(where: { $0.id == vmID })
         }
     }
 

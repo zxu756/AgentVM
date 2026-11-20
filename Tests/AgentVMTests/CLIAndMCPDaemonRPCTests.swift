@@ -11,10 +11,10 @@ struct CLIAndMCPDaemonRPCTests {
 
     @Test("Item 1: DaemonRPCMethod set, hello handshake compatibility, localized errors independent of shared localizer, exec.output base64, and exec final response")
     func daemonRPCProtocolCodecAndHandshakeVersionCheck() async throws {
-        // 1. Method set matches 01-agentvm.md item 2 exactly.
+        // 1. Method set matches 01-agentvm.md M2 item 2 + M3 A61 (`snapshot`, `branch`, `restore`).
         #expect(
             DaemonRPCMethod.allCases.map(\.rawValue) == [
-                "status", "stop", "list", "up", "halt", "pause", "resume", "exec"
+                "status", "stop", "list", "up", "halt", "pause", "resume", "exec", "snapshot", "branch", "restore"
             ]
         )
 
@@ -94,7 +94,10 @@ struct CLIAndMCPDaemonRPCTests {
                 environment: ["FOO": "BAR"],
                 timeoutSeconds: 3600,
                 lang: .zhHans
-            )))
+            ))),
+            (.int(9), .snapshot(DaemonRPCSnapshotParams(vm: "t1", title: "s1", lang: .en))),
+            (.int(10), .branch(DaemonRPCBranchParams(vm: "t1", branchName: "c1", owner: "codex", lang: .zhHans))),
+            (.int(11), .restore(DaemonRPCRestoreParams(snapshotID: "snap-01", lang: .en)))
         ]
         for (id, call) in calls {
             let env = DaemonRPCRequestEnvelope(id: id, call: call)

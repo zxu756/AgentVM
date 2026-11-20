@@ -784,6 +784,7 @@ public struct AgentVMCLIRunner: Sendable {
                     coordinator: coordinator,
                     parsed: parsed,
                     language: language,
+                    isSimulation: isSimulationFlagged,
                     progressStderrCollector: streamedProgressStderr,
                     liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
                 )
@@ -792,6 +793,7 @@ public struct AgentVMCLIRunner: Sendable {
                     coordinator: coordinator,
                     parsed: parsed,
                     language: language,
+                    isSimulation: isSimulationFlagged,
                     progressStderrCollector: streamedProgressStderr,
                     liveStderrHandler: isSimulationFlagged ? nil : liveStderrHandler
                 )
@@ -857,6 +859,10 @@ public struct AgentVMCLIRunner: Sendable {
                     hintLine = "提示：请等待当前正在使用该虚拟机的进程结束，或创建另一台虚拟机。"
                 } else if case .execOutputBufferOverflow = err {
                     hintLine = "提示：请持续读取 'agentvm exec' 的标准输出/标准错误，或在客户机内将大输出重定向到文件。"
+                } else if case let .liveGuestSyncFailed(vmName, _, _) = err {
+                    hintLine = "提示：请检查虚拟机「\(vmName)」内客户机代理与根文件系统状态（如 'agentvm exec \(vmName) -- sync'），或先运行 'agentvm halt \(vmName)' 停机。"
+                } else if case let .liveRestoreNotImplemented(vmName, _) = err {
+                    hintLine = "提示：请先运行 'agentvm halt \(vmName)' 停机，再运行 'agentvm restore <快照ID>'。"
                 } else if case let .vmLockedForDeferredMilestone(vmName, _, reason) = err {
                     switch reason {
                     case .liveSnapshotBranchRestoreScheduledForM3:
@@ -1347,12 +1353,43 @@ public struct AgentVMCLIRunner: Sendable {
             )
         }
 
-        let fork = try await coordinator.forkCoWBranch(
-            fromVMID: parentID,
-            branchName: branchName,
-            agentOwnerTag: owner,
-            bootImmediately: false
-        )
+        let fork: CoWBranchForkResult
+        if !isSimulation,
+           try DaemonClient.isVMHeldByRunningDaemon(
+               workspaceURL: coordinator.store.bundleURL,
+               vmID: parentID,
+               language: language
+           ) {
+            let branchParams = DaemonRPCBranchParams(
+                vm: parentID.rawValue,
+                branchName: branchName,
+                owner: owner,
+                lang: language
+            )
+            let rpcOutcome = try DaemonClient.performUnaryCall(
+                workspaceURL: coordinator.store.bundleURL,
+                call: .branch(branchParams),
+                resultType: DaemonRPCBranchResult.self
+            )
+            switch rpcOutcome {
+            case let .connected((_, branchRes)):
+                fork = branchRes.fork
+            case .daemonNotRunning:
+                fork = try await coordinator.forkCoWBranch(
+                    fromVMID: parentID,
+                    branchName: branchName,
+                    agentOwnerTag: owner,
+                    bootImmediately: false
+                )
+            }
+        } else {
+            fork = try await coordinator.forkCoWBranch(
+                fromVMID: parentID,
+                branchName: branchName,
+                agentOwnerTag: owner,
+                bootImmediately: false
+            )
+        }
         if fork.diskCloneStrategy == .fullCopyFallback {
             progressStderrCollector.emit(
                 Self.cloneFallbackStderrNotice(language: language),
@@ -1462,6 +1499,7 @@ public struct AgentVMCLIRunner: Sendable {
         coordinator: AgentVMFleetCoordinator,
         parsed: ParsedSubcommandArguments,
         language: AppLanguage,
+        isSimulation: Bool,
         progressStderrCollector: StreamedStderrCollector,
         liveStderrHandler: (@Sendable (String) -> Void)?
     ) async throws -> CLIExecutionOutcome {
@@ -1489,7 +1527,34 @@ public struct AgentVMCLIRunner: Sendable {
         }
         let vmID = try await resolveVMID(positional[0], coordinator: coordinator)
         let title = parsed.options["--title"] ?? (positional.count > 1 ? positional[1] : (isZh ? "命令行检查点" : "CLI Checkpoint"))
-        let (snap, strategy) = try await coordinator.captureSnapshotReportingStrategy(vmID: vmID, title: title)
+        let snap: SnapshotNode
+        let strategy: DiskCloneStrategyUsed
+        if !isSimulation,
+           try DaemonClient.isVMHeldByRunningDaemon(
+               workspaceURL: coordinator.store.bundleURL,
+               vmID: vmID,
+               language: language
+           ) {
+            let snapParams = DaemonRPCSnapshotParams(
+                vm: vmID.rawValue,
+                title: title,
+                lang: language
+            )
+            let rpcOutcome = try DaemonClient.performUnaryCall(
+                workspaceURL: coordinator.store.bundleURL,
+                call: .snapshot(snapParams),
+                resultType: DaemonRPCSnapshotResult.self
+            )
+            switch rpcOutcome {
+            case let .connected((_, snapRes)):
+                snap = snapRes.snapshot
+                strategy = snapRes.diskCloneStrategy
+            case .daemonNotRunning:
+                (snap, strategy) = try await coordinator.captureSnapshotReportingStrategy(vmID: vmID, title: title)
+            }
+        } else {
+            (snap, strategy) = try await coordinator.captureSnapshotReportingStrategy(vmID: vmID, title: title)
+        }
         if strategy == .fullCopyFallback {
             progressStderrCollector.emit(
                 Self.cloneFallbackStderrNotice(language: language),
@@ -1510,6 +1575,7 @@ public struct AgentVMCLIRunner: Sendable {
         coordinator: AgentVMFleetCoordinator,
         parsed: ParsedSubcommandArguments,
         language: AppLanguage,
+        isSimulation: Bool,
         progressStderrCollector: StreamedStderrCollector,
         liveStderrHandler: (@Sendable (String) -> Void)?
     ) async throws -> CLIExecutionOutcome {
@@ -1519,7 +1585,37 @@ public struct AgentVMCLIRunner: Sendable {
                 detail: isZh ? "用法：agentvm restore <快照ID>" : "Usage: agentvm restore <snapshot-id>"
             )
         }
-        let (vm, strategy) = try await coordinator.restoreToSnapshotReportingStrategy(SnapshotID(snapRaw))
+        let snapID = SnapshotID(snapRaw)
+        guard let snap = try await coordinator.store.fetchSnapshot(snapID) else {
+            throw AgentVMError.snapshotNotFound(snapID)
+        }
+        let vm: VMInstanceRecord
+        let strategy: DiskCloneStrategyUsed
+        if !isSimulation,
+           try DaemonClient.isVMHeldByRunningDaemon(
+               workspaceURL: coordinator.store.bundleURL,
+               vmID: snap.vmID,
+               language: language
+           ) {
+            let restoreParams = DaemonRPCRestoreParams(
+                snapshotID: snapID.rawValue,
+                lang: language
+            )
+            let rpcOutcome = try DaemonClient.performUnaryCall(
+                workspaceURL: coordinator.store.bundleURL,
+                call: .restore(restoreParams),
+                resultType: DaemonRPCRestoreResult.self
+            )
+            switch rpcOutcome {
+            case let .connected((_, restoreRes)):
+                vm = restoreRes.vm
+                strategy = restoreRes.diskCloneStrategy
+            case .daemonNotRunning:
+                (vm, strategy) = try await coordinator.restoreToSnapshotReportingStrategy(snapID)
+            }
+        } else {
+            (vm, strategy) = try await coordinator.restoreToSnapshotReportingStrategy(snapID)
+        }
         if strategy == .fullCopyFallback {
             progressStderrCollector.emit(
                 Self.cloneFallbackStderrNotice(language: language),

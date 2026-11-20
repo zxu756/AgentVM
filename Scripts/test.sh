@@ -52,6 +52,7 @@ map_module_to_filters() {
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
+            echo "M3Stage3aDaemonLiveForkSnapshotTests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
@@ -61,6 +62,7 @@ map_module_to_filters() {
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
+            echo "M3Stage3aDaemonLiveForkSnapshotTests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"
@@ -68,6 +70,7 @@ map_module_to_filters() {
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
+            echo "M3Stage3aDaemonLiveForkSnapshotTests"
             ;;
         AgentVMNetSwitch|NetSwitch)
             echo "NetSwitchDissectorAndPCAPTests"
@@ -79,6 +82,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage5Tests"
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage2aChildIdentityTests"
+            echo "M3Stage3aDaemonLiveForkSnapshotTests"
             ;;
         AgentVMPluginHost|PluginHost)
             echo "PluginSandboxAndIACTests"
@@ -94,6 +98,7 @@ map_module_to_filters() {
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
+            echo "M3Stage3aDaemonLiveForkSnapshotTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -109,6 +114,7 @@ map_module_to_filters() {
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
+            echo "M3Stage3aDaemonLiveForkSnapshotTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -130,6 +136,7 @@ map_module_to_filters() {
             echo "M3Stage1PrivateBytesTests"
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
+            echo "M3Stage3aDaemonLiveForkSnapshotTests"
             ;;
         *)
             echo "ERROR: Unknown module '$mod'" >&2

@@ -721,33 +721,33 @@ struct CLIAndMCPDaemonStage3aTests {
                 daemonSpawnOverride: forbiddenSpawn
             ).exitCode == 0)
 
-            // 1. CLI `snapshot`, `branch`, `restore` while daemon holds lock -> exit 1, ERR_VM_LOCKED, without outdated "M3" text (EN & ZH).
+            // 1. M3 Stage 3a (A59/A61): while daemon holds `t1`, CLI `snapshot` and `branch` route through daemon RPC and exit 0
+            //    (parent disk inode & running state preserved), while live `restore` exits 1 explaining it is not implemented yet (no "M3").
             for lang in ["en", "zh"] {
                 let snapRes = await cli.execute(
-                    arguments: ["--lang", lang, "--workspace", wsURL.path, "snapshot", "t1", "live-attempt"],
+                    arguments: ["--lang", lang, "--workspace", wsURL.path, "snapshot", "t1", "live-attempt-\(lang)"],
                     curatedEntriesOverride: [entry],
-                    environment: env
+                    environment: env,
+                    daemonSpawnOverride: forbiddenSpawn
                 )
-                #expect(snapRes.exitCode == 1, "snapshot (\(lang)) exited \(snapRes.exitCode): \(snapRes.stderr)")
-                #expect(snapRes.stderr.contains("ERR_VM_LOCKED"))
-                #expect(!snapRes.stderr.contains("M3"))
+                #expect(snapRes.exitCode == 0, "snapshot (\(lang)) exited \(snapRes.exitCode): \(snapRes.stderr)")
 
                 let branchRes = await cli.execute(
-                    arguments: ["--lang", lang, "--workspace", wsURL.path, "branch", "t1", "t1-child", "--no-boot"],
+                    arguments: ["--lang", lang, "--workspace", wsURL.path, "branch", "t1", "t1-child-\(lang)", "--no-boot"],
                     curatedEntriesOverride: [entry],
-                    environment: env
+                    environment: env,
+                    daemonSpawnOverride: forbiddenSpawn
                 )
-                #expect(branchRes.exitCode == 1, "branch (\(lang)) exited \(branchRes.exitCode): \(branchRes.stderr)")
-                #expect(branchRes.stderr.contains("ERR_VM_LOCKED"))
-                #expect(!branchRes.stderr.contains("M3"))
+                #expect(branchRes.exitCode == 0, "branch (\(lang)) exited \(branchRes.exitCode): \(branchRes.stderr)")
 
                 let restoreRes = await cli.execute(
                     arguments: ["--lang", lang, "--workspace", wsURL.path, "restore", baseSnapID.rawValue],
                     curatedEntriesOverride: [entry],
-                    environment: env
+                    environment: env,
+                    daemonSpawnOverride: forbiddenSpawn
                 )
                 #expect(restoreRes.exitCode == 1, "restore (\(lang)) exited \(restoreRes.exitCode): \(restoreRes.stderr)")
-                #expect(restoreRes.stderr.contains("ERR_VM_LOCKED"))
+                #expect(restoreRes.stderr.contains("ERR_LIVE_RESTORE_UNIMPLEMENTED"))
                 #expect(!restoreRes.stderr.contains("M3"))
             }
 
@@ -792,15 +792,15 @@ struct CLIAndMCPDaemonStage3aTests {
             let dbRecAfterCoord = try #require(try await inspectStore.fetchVM(vmID))
             #expect(dbRecAfterCoord.telemetry.state == .running)
 
-            // 3. MCP JSON-RPC server (`AgentVMMCPServer`) rejects snapshot/branch/restore (no outdated M3 text) and exec (M4) with ERR_VM_LOCKED.
+            // 3. MCP JSON-RPC server (`AgentVMMCPServer`): in M3 Stage 3a, `snapshot` and `branch` route through daemon RPC and succeed,
+            //    `restore` routes through daemon RPC and fails with ERR_LIVE_RESTORE_UNIMPLEMENTED (no outdated M3 text),
+            //    and `exec` still rejects with ERR_VM_LOCKED mentioning M4.
             let mcp = AgentVMMCPServer(coordinator: externalCoordinator)
-            let mcpCalls: [(String, [String: Any], String?)] = [
-                ("agentvm_capture_snapshot", ["vmID": vmID.rawValue, "title": "mcp-snap"], nil),
-                ("agentvm_fork_cow_branch", ["parentVMID": vmID.rawValue, "branchName": "mcp-child", "bootImmediately": false], nil),
-                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue], nil),
-                ("agentvm_exec_command", ["vmID": vmID.rawValue, "executable": "uname", "arguments": ["-r"]], "M4")
+            let mcpSuccessCalls: [(String, [String: Any])] = [
+                ("agentvm_capture_snapshot", ["vmID": vmID.rawValue, "title": "mcp-snap"]),
+                ("agentvm_fork_cow_branch", ["parentVMID": vmID.rawValue, "branchName": "mcp-child", "bootImmediately": false])
             ]
-            for (idx, item) in mcpCalls.enumerated() {
+            for (idx, item) in mcpSuccessCalls.enumerated() {
                 let reqObj: [String: Any] = [
                     "jsonrpc": "2.0",
                     "id": idx + 1,
@@ -814,11 +814,32 @@ struct CLIAndMCPDaemonStage3aTests {
                 let respLine = try #require(await mcp.handleJSONRPCLine(reqLine))
                 let respObj = try #require(try JSONSerialization.jsonObject(with: Data(respLine.utf8)) as? [String: Any])
                 let resultObj = try #require(respObj["result"] as? [String: Any])
+                #expect((resultObj["isError"] as? Bool) == false, "Expected MCP \(item.0) to route via daemon and succeed: \(respLine)")
+            }
+
+            let mcpErrorCalls: [(String, [String: Any], String, String?)] = [
+                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue], "ERR_LIVE_RESTORE_UNIMPLEMENTED", nil),
+                ("agentvm_exec_command", ["vmID": vmID.rawValue, "executable": "uname", "arguments": ["-r"]], "ERR_VM_LOCKED", "M4")
+            ]
+            for (idx, item) in mcpErrorCalls.enumerated() {
+                let reqObj: [String: Any] = [
+                    "jsonrpc": "2.0",
+                    "id": idx + 10,
+                    "method": "tools/call",
+                    "params": [
+                        "name": item.0,
+                        "arguments": item.1
+                    ]
+                ]
+                let reqLine = String(decoding: try JSONSerialization.data(withJSONObject: reqObj), as: UTF8.self)
+                let respLine = try #require(await mcp.handleJSONRPCLine(reqLine))
+                let respObj = try #require(try JSONSerialization.jsonObject(with: Data(respLine.utf8)) as? [String: Any])
+                let resultObj = try #require(respObj["result"] as? [String: Any])
                 #expect((resultObj["isError"] as? Bool) == true, "Expected MCP \(item.0) to return isError=true")
                 let contentArr = try #require(resultObj["content"] as? [[String: Any]])
                 let text = contentArr.compactMap { $0["text"] as? String }.joined(separator: "\n")
-                #expect(text.contains("ERR_VM_LOCKED"), "MCP \(item.0) missing ERR_VM_LOCKED: \(text)")
-                if let expectedMilestone = item.2 {
+                #expect(text.contains(item.2), "MCP \(item.0) missing \(item.2): \(text)")
+                if let expectedMilestone = item.3 {
                     #expect(text.contains(expectedMilestone), "MCP \(item.0) missing \(expectedMilestone): \(text)")
                 } else {
                     #expect(!text.contains("M3"), "MCP \(item.0) must not contain outdated M3 wording: \(text)")
@@ -1291,6 +1312,7 @@ private final class Stage3aMockVMHandle: HardwareVMInstanceHandle, @unchecked Se
     private let stateLock = NSLock()
     private var hostFD: Int32 = -1
     private var peerFD: Int32 = -1
+    private var responderTask: Task<Void, Never>?
 
     init(
         owner: Stage3aMockHardwareBackend,
@@ -1309,29 +1331,115 @@ private final class Stage3aMockVMHandle: HardwareVMInstanceHandle, @unchecked Se
     func prematureStopReason() -> String? { nil }
 
     func connectVsock(port: UInt32) async throws -> HardwareVsockFDDescriptor {
+        await closeVsockConnection()
         var fds: [Int32] = [-1, -1]
         guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(Darwin.errno))
         }
-        stateLock.withLock {
-            if hostFD >= 0 { _ = Darwin.close(hostFD) }
-            if peerFD >= 0 { _ = Darwin.close(peerFD) }
-            hostFD = fds[0]
-            peerFD = fds[1]
+        var one: Int32 = 1
+        _ = Darwin.setsockopt(fds[0], SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        _ = Darwin.setsockopt(fds[1], SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        let hFD = fds[0]
+        let pFD = fds[1]
+
+        let task = Task.detached {
+            let codec = VsockWireCodec()
+            let acc = VsockStreamAccumulator(codec: codec)
+            var buf = [UInt8](repeating: 0, count: 65_536)
+            var execBuffers: [UInt32: Data] = [:]
+            var seq: UInt32 = 0
+
+            func writeFrame(channel: VsockChannelKind, flags: VsockFrameFlags, streamID: UInt32, payload: Data) {
+                seq &+= 1
+                guard let wire = try? codec.encodeFrame(
+                    channel: channel,
+                    flags: flags,
+                    streamID: streamID,
+                    sequence: seq,
+                    windowCredit: VsockWireConstants.defaultWindowCredit,
+                    payload: payload,
+                    compressIfBeneficial: false
+                ) else { return }
+                wire.withUnsafeBytes { rawBuf in
+                    guard let base = rawBuf.baseAddress else { return }
+                    var written = 0
+                    while written < rawBuf.count {
+                        let n = Darwin.write(pFD, base.advanced(by: written), rawBuf.count - written)
+                        if n > 0 {
+                            written += n
+                        } else if n < 0 && Darwin.errno == EINTR {
+                            continue
+                        } else {
+                            break
+                        }
+                    }
+                }
+            }
+
+            while !Task.isCancelled {
+                let n = Darwin.read(pFD, &buf, buf.count)
+                if n == 0 { break }
+                if n < 0 {
+                    if Darwin.errno == EINTR { continue }
+                    break
+                }
+                guard let frames = try? acc.ingest(Data(buf[0..<n])) else { break }
+                for (header, payload) in frames {
+                    switch header.channel {
+                    case .control:
+                        if let pongData = try? VsockWireJSON.encode(VsockControlEnvelope(kind: .pong, agentVersion: "2")) {
+                            writeFrame(channel: .control, flags: [.ack, .endOfMessage], streamID: 0, payload: pongData)
+                        }
+                    case .execProcess:
+                        if header.flags.contains(.rst) {
+                            execBuffers.removeValue(forKey: header.streamID)
+                            continue
+                        }
+                        if !payload.isEmpty {
+                            execBuffers[header.streamID, default: Data()].append(payload)
+                        }
+                        if header.flags.contains(.endOfMessage),
+                           let reqBytes = execBuffers.removeValue(forKey: header.streamID),
+                           let req = try? VsockWireJSON.decode(GuestExecRequest.self, from: reqBytes),
+                           let doneData = try? VsockWireJSON.encode(
+                               VsockExecCompletionEnvelope(requestID: req.id, exitCode: 0, durationMilliseconds: 1, timedOut: false)
+                           ) {
+                            writeFrame(channel: .execProcess, flags: [.fin, .endOfMessage], streamID: header.streamID, payload: doneData)
+                        }
+                    default:
+                        break
+                    }
+                }
+            }
         }
-        return HardwareVsockFDDescriptor(fileDescriptor: fds[0], closeWhenSessionEnds: false)
+
+        stateLock.withLock {
+            hostFD = hFD
+            peerFD = pFD
+            responderTask = task
+        }
+        return HardwareVsockFDDescriptor(fileDescriptor: hFD, closeWhenSessionEnds: false)
     }
 
     func closeVsockConnection() async {
-        let (h, p) = stateLock.withLock { () -> (Int32, Int32) in
+        let (h, p, t) = stateLock.withLock { () -> (Int32, Int32, Task<Void, Never>?) in
             let curH = hostFD
             let curP = peerFD
+            let curT = responderTask
             hostFD = -1
             peerFD = -1
-            return (curH, curP)
+            responderTask = nil
+            return (curH, curP, curT)
         }
-        if h >= 0 { _ = Darwin.close(h) }
-        if p >= 0 { _ = Darwin.close(p) }
+        t?.cancel()
+        if p >= 0 {
+            _ = Darwin.shutdown(p, SHUT_RDWR)
+            _ = Darwin.close(p)
+        }
+        if h >= 0 {
+            _ = Darwin.shutdown(h, SHUT_RDWR)
+            _ = Darwin.close(h)
+        }
     }
 
     func pause() async throws {

@@ -312,6 +312,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case persistentBootRequiresDaemon(vmName: String)
     case airgapPolicyUnsupportedBeforeM5(vmName: String)
     case guestAgentNotConnected(vmName: String, state: String)
+    case liveGuestSyncFailed(vmName: String, operation: String, detail: String)
+    case liveRestoreNotImplemented(vmName: String, state: String)
     case guestVsockConnectTimedOut(
         vmName: String,
         port: UInt32,
@@ -370,6 +372,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .persistentBootRequiresDaemon: return "ERR_DAEMON_REQUIRED"
         case .airgapPolicyUnsupportedBeforeM5: return "ERR_AIRGAP_UNSUPPORTED"
         case .guestAgentNotConnected: return "ERR_GUEST_AGENT_UNAVAILABLE"
+        case .liveGuestSyncFailed: return "ERR_GUEST_SYNC_FAILED"
+        case .liveRestoreNotImplemented: return "ERR_LIVE_RESTORE_UNIMPLEMENTED"
         case .guestVsockConnectTimedOut: return "ERR_VSOCK_CONNECT_TIMEOUT"
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
         case .vmNotFound: return "ERR_VM_NOT_FOUND"
@@ -506,6 +510,14 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "虚拟机「\(vmName)」当前状态为 \(state)，尚未连接真实客户机代理（agentvm-guestd），无法执行客户机命令。"
                 : "VM '\(vmName)' is in state '\(state)' with no live guest agent connection; cannot execute guest command."
+        case let .liveGuestSyncFailed(vmName, operation, detail):
+            return isZh
+                ? "对运行中的虚拟机「\(vmName)」执行「\(operation)」前，经客户机代理执行 sync 失败；未暂停虚拟机，未创建任何克隆（\(detail)）。"
+                : "Guest 'sync' via guestd failed before live '\(operation)' on running VM '\(vmName)'; the VM was not paused and nothing was cloned (\(detail))."
+        case let .liveRestoreNotImplemented(vmName, state):
+            return isZh
+                ? "虚拟机「\(vmName)」当前正在运行（状态「\(state)」），运行中的快照回滚尚未实现；请先运行 'agentvm halt \(vmName)' 停机后再执行回滚。"
+                : "Restoring a snapshot while VM '\(vmName)' is running (state '\(state)') is not implemented yet; stop the VM with 'agentvm halt \(vmName)' before restoring."
         case let .guestVsockConnectTimedOut(vmName, port, timeoutSeconds, consoleLogPath, detail):
             return isZh
                 ? "虚拟机「\(vmName)」已启动，但在 \(timeoutSeconds) 秒内未能连上客户机 vsock 端口 \(port)（\(detail)），已停止虚拟机。串口日志：\(consoleLogPath)"
@@ -671,6 +683,10 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
                 return "Resume the VM first with 'agentvm resume \(vmName)'."
             }
             return "Start the VM first with 'agentvm up \(vmName)'."
+        case let .liveGuestSyncFailed(vmName, _, _):
+            return "Check guest agent and disk health inside '\(vmName)' (e.g. 'agentvm exec \(vmName) -- sync'), or stop the VM with 'agentvm halt \(vmName)' first."
+        case let .liveRestoreNotImplemented(vmName, _):
+            return "Stop the VM first with 'agentvm halt \(vmName)', then run 'agentvm restore <snapshot-id>'."
         case .execOutputBufferOverflow:
             return "Drain stdout/stderr from 'agentvm exec' continuously or redirect large outputs to a file inside the guest."
         default:

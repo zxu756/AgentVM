@@ -5,6 +5,7 @@ import Foundation
 public enum SnapshotKind: String, Codable, Hashable, Sendable, CaseIterable {
     case baseGoldenImage = "base-golden"
     case coldDiskOnly = "cold-disk"
+    case liveDisk = "live-disk"
     case liveMemoryAndDisk = "live-ram-disk"
     case branchForkPoint = "cow-branch-fork"
     case autoPreCommandCheckpoint = "auto-pre-cmd"
@@ -14,6 +15,7 @@ public enum SnapshotKind: String, Codable, Hashable, Sendable, CaseIterable {
         switch self {
         case .baseGoldenImage: return "Golden Base"
         case .coldDiskOnly: return "Cold Disk Snapshot"
+        case .liveDisk: return "Live Disk Snapshot"
         case .liveMemoryAndDisk: return "Live RAM + Disk"
         case .branchForkPoint: return "CoW Branch Fork"
         case .autoPreCommandCheckpoint: return "Pre-Exec Checkpoint"
@@ -150,7 +152,8 @@ public struct SnapshotNode: Codable, Hashable, Sendable, Identifiable {
         self.branchName = try container.decodeIfPresent(String.self, forKey: .branchName) ?? "main"
         self.title = try container.decode(String.self, forKey: .title)
         self.notes = try container.decodeIfPresent(String.self, forKey: .notes) ?? ""
-        self.kind = try container.decode(SnapshotKind.self, forKey: .kind)
+        let rawKind = try container.decode(String.self, forKey: .kind)
+        self.kind = SnapshotKind(rawValue: rawKind) ?? .coldDiskOnly
         self.createdAt = try container.decode(Date.self, forKey: .createdAt)
         self.diskClonePath = try container.decode(String.self, forKey: .diskClonePath)
         self.memoryStatePath = try container.decodeIfPresent(String.self, forKey: .memoryStatePath)

@@ -281,6 +281,7 @@ extension SnapshotKind {
         switch self {
         case .baseGoldenImage: return L("Golden Base", "黄金基线")
         case .coldDiskOnly: return L("Cold Disk Snapshot", "冷磁盘快照")
+        case .liveDisk: return L("Live Disk Snapshot", "运行中磁盘快照")
         case .liveMemoryAndDisk: return L("Live RAM + Disk", "实时内存 + 磁盘")
         case .branchForkPoint: return L("CoW Branch Fork", "CoW 分支点")
         case .autoPreCommandCheckpoint: return L("Pre-Exec Checkpoint", "执行前自动快照")
@@ -293,6 +294,7 @@ extension SnapshotKind {
         switch self {
         case .baseGoldenImage: return L("BASE", "基线")
         case .coldDiskOnly: return L("DISK", "磁盘")
+        case .liveDisk: return L("LIVE-DISK", "热盘")
         case .liveMemoryAndDisk: return L("LIVE", "内存")
         case .branchForkPoint: return L("FORK", "分叉")
         case .autoPreCommandCheckpoint: return L("AUTO", "自动")

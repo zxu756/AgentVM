@@ -226,6 +226,51 @@ public struct CoWBranchForkResult: Codable, Hashable, Sendable {
     }
 }
 
+public struct LiveDaemonSnapshotResult: Codable, Hashable, Sendable {
+    public var snapshot: SnapshotNode
+    public var diskCloneStrategy: DiskCloneStrategyUsed
+    public var pauseDurationMilliseconds: Double
+
+    public init(
+        snapshot: SnapshotNode,
+        diskCloneStrategy: DiskCloneStrategyUsed,
+        pauseDurationMilliseconds: Double
+    ) {
+        self.snapshot = snapshot
+        self.diskCloneStrategy = diskCloneStrategy
+        self.pauseDurationMilliseconds = pauseDurationMilliseconds
+    }
+}
+
+public struct LiveDaemonBranchResult: Codable, Hashable, Sendable {
+    public var fork: CoWBranchForkResult
+    public var pauseDurationMilliseconds: Double
+
+    public init(
+        fork: CoWBranchForkResult,
+        pauseDurationMilliseconds: Double
+    ) {
+        self.fork = fork
+        self.pauseDurationMilliseconds = pauseDurationMilliseconds
+    }
+}
+
+public struct LiveDaemonRestoreResult: Codable, Hashable, Sendable {
+    public var record: VMInstanceRecord
+    public var preRestoreSnapshot: SnapshotNode?
+    public var diskCloneStrategy: DiskCloneStrategyUsed
+
+    public init(
+        record: VMInstanceRecord,
+        preRestoreSnapshot: SnapshotNode? = nil,
+        diskCloneStrategy: DiskCloneStrategyUsed = .apfsClonefile
+    ) {
+        self.record = record
+        self.preRestoreSnapshot = preRestoreSnapshot
+        self.diskCloneStrategy = diskCloneStrategy
+    }
+}
+
 public struct HardwareVsockFDDescriptor: Sendable {
     public var fileDescriptor: Int32
     public var closeWhenSessionEnds: Bool
@@ -2994,22 +3039,6 @@ public actor AgentVMFleetCoordinator {
         let snapMetrics = try diskEngine.readFileSpaceMetrics(at: cloneURL)
         let rootMetrics = try diskEngine.readFileSpaceMetrics(at: sourceURL)
 
-        var ramPath: String?
-        var ramBytes: UInt64 = 0
-        if kind == .liveMemoryAndDisk && record.telemetry.state == .running {
-            let stateFileURL = store.snapshotsDirectoryURL.appendingPathComponent("\(vmID.rawValue)-\(snapID.rawValue).vzstate")
-            if #available(macOS 14.0, *), let box = hardwareBoxes[vmID] {
-                try? await box.saveMachineState(to: stateFileURL)
-            }
-            // The simulation backend has no guest RAM. It records a disk-only snapshot and writes no
-            // placeholder memory-state file, so nothing simulated ends up in the snapshot lineage.
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: stateFileURL.path),
-               let sz = attrs[.size] as? UInt64 {
-                ramPath = stateFileURL.path
-                ramBytes = sz
-            }
-        }
-
         let resolvedBranch: String
         if let branchName {
             resolvedBranch = branchName
@@ -3020,9 +3049,9 @@ public actor AgentVMFleetCoordinator {
             resolvedBranch = "main"
         }
 
-        // "Live RAM + Disk" is recorded only when a guest memory state was actually saved. A request for it
-        // on a stopped VM, or under the simulator, yields a disk snapshot and is labelled as one.
-        let recordedKind: SnapshotKind = (kind == .liveMemoryAndDisk && ramPath == nil) ? .coldDiskOnly : kind
+        // Decided Item 1: M3 captures disk-only snapshots and never saves `.vzstate` guest memory files.
+        // Local/stopped/simulation snapshots record `.coldDiskOnly` unless an explicit lineage/auto kind was requested.
+        let recordedKind: SnapshotKind = (kind == .liveMemoryAndDisk || kind == .liveDisk) ? .coldDiskOnly : kind
 
         let node = SnapshotNode(
             id: snapID,
@@ -3033,11 +3062,11 @@ public actor AgentVMFleetCoordinator {
             notes: notes,
             kind: recordedKind,
             diskClonePath: cloneURL.path,
-            memoryStatePath: ramPath,
+            memoryStatePath: nil,
             virtualDiskBytes: snapMetrics.virtualSizeBytes,
             allocatedDiskBytes: snapMetrics.allocatedDiskBytes,
             apfsPrivateBytes: snapMetrics.privateBytes,
-            memoryStateBytes: ramBytes,
+            memoryStateBytes: 0,
             specSnapshot: record.spec,
             agentActor: record.spec.agentOwnerTag,
             triggerCommand: triggerCommand,
@@ -3315,6 +3344,643 @@ public actor AgentVMFleetCoordinator {
             outputURL: childISOURL
         )
         return (childCI, childISOURL)
+    }
+
+    public static let defaultLiveSnapshotSyncTimeoutSeconds: TimeInterval = 30.0
+
+    public func captureSnapshotInDaemon(
+        vmID: VMID,
+        title: String,
+        notes: String = "",
+        kind: SnapshotKind? = nil,
+        branchName: String? = nil,
+        isPinned: Bool = false,
+        triggerCommand: String? = nil
+    ) async throws -> LiveDaemonSnapshotResult {
+        try await enqueueVMLifecycleOperation(for: vmID) {
+            try await self.captureSnapshotInDaemonUnlocked(
+                vmID: vmID,
+                title: title,
+                notes: notes,
+                kind: kind,
+                branchName: branchName,
+                isPinned: isPinned,
+                triggerCommand: triggerCommand
+            )
+        }
+    }
+
+    private func captureSnapshotInDaemonUnlocked(
+        vmID: VMID,
+        title: String,
+        notes: String,
+        kind: SnapshotKind?,
+        branchName: String?,
+        isPinned: Bool,
+        triggerCommand: String?
+    ) async throws -> LiveDaemonSnapshotResult {
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        guard let box = hardwareBoxes[vmID] else {
+            let fallback = try await captureSnapshotReportingStrategy(
+                vmID: vmID,
+                title: title,
+                notes: notes,
+                kind: kind ?? .coldDiskOnly,
+                branchName: branchName,
+                isPinned: isPinned,
+                triggerCommand: triggerCommand
+            )
+            return LiveDaemonSnapshotResult(
+                snapshot: fallback.snapshot,
+                diskCloneStrategy: fallback.diskCloneStrategy,
+                pauseDurationMilliseconds: 0
+            )
+        }
+        guard existing.telemetry.state == .running, box.prematureStopReason() == nil else {
+            throw AgentVMError.invalidLifecycleTransition(
+                vmID: vmID,
+                from: existing.telemetry.state.rawValue,
+                requested: "snapshot"
+            )
+        }
+        guard let session = vsockSessions[vmID] else {
+            throw AgentVMError.guestAgentNotConnected(
+                vmName: existing.spec.name,
+                state: existing.telemetry.state.rawValue
+            )
+        }
+        guard let bootDisk = existing.spec.blockDevices.first else {
+            throw AgentVMError.diskImageOperationFailed(
+                path: existing.spec.name,
+                errnoCode: EINVAL,
+                detail: "VM has no primary block device to snapshot."
+            )
+        }
+
+        let prePauseSyncMs = try await performGuestSyncBeforeLiveClone(
+            session: session,
+            vmName: existing.spec.name,
+            operation: "snapshot"
+        )
+
+        let snapID = SnapshotID.generate(prefix: "snap")
+        let cloneURL = store.snapshotsDirectoryURL.appendingPathComponent("\(vmID.rawValue)-\(snapID.rawValue).raw")
+        let sourceURL = URL(fileURLWithPath: bootDisk.imagePath)
+
+        var didPause = false
+        var resumeCompleted = false
+        let pauseStartNs = DispatchTime.now().uptimeNanoseconds
+        let pauseEndNs: UInt64
+        let cloneStrategy: DiskCloneStrategyUsed
+        do {
+            try await box.pause()
+            didPause = true
+            cloneStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+                from: sourceURL,
+                to: cloneURL,
+                overwrite: true
+            )
+            try await box.resume()
+            resumeCompleted = true
+            pauseEndNs = DispatchTime.now().uptimeNanoseconds
+        } catch {
+            if didPause && !resumeCompleted {
+                try? await box.resume()
+            }
+            try? FileManager.default.removeItem(at: cloneURL)
+            throw error
+        }
+
+        let pauseMs = Double(pauseEndNs &- pauseStartNs) / 1_000_000.0
+        do {
+            let snapMetrics = try diskEngine.readFileSpaceMetrics(at: cloneURL)
+            let rootMetrics = try diskEngine.readFileSpaceMetrics(at: sourceURL)
+
+            var latestRecord = (try await store.fetchVM(vmID)) ?? existing
+            let resolvedBranch: String
+            if let branchName {
+                resolvedBranch = branchName
+            } else if let headID = latestRecord.currentHeadSnapshotID,
+                      let headSnap = try await store.fetchSnapshot(headID) {
+                resolvedBranch = headSnap.branchName
+            } else {
+                resolvedBranch = "main"
+            }
+
+            let recordedKind: SnapshotKind
+            if let explicitKind = kind,
+               explicitKind != .coldDiskOnly && explicitKind != .liveMemoryAndDisk {
+                recordedKind = explicitKind
+            } else {
+                recordedKind = .liveDisk
+            }
+
+            let node = SnapshotNode(
+                id: snapID,
+                vmID: vmID,
+                parentSnapshotID: latestRecord.currentHeadSnapshotID,
+                branchName: resolvedBranch,
+                title: title,
+                notes: notes,
+                kind: recordedKind,
+                diskClonePath: cloneURL.path,
+                memoryStatePath: nil,
+                virtualDiskBytes: snapMetrics.virtualSizeBytes,
+                allocatedDiskBytes: snapMetrics.allocatedDiskBytes,
+                apfsPrivateBytes: snapMetrics.privateBytes,
+                memoryStateBytes: 0,
+                specSnapshot: latestRecord.spec,
+                agentActor: latestRecord.spec.agentOwnerTag,
+                triggerCommand: triggerCommand,
+                isPinned: isPinned
+            )
+
+            latestRecord.currentHeadSnapshotID = snapID
+            latestRecord.telemetry.apfsPrivateBytes = rootMetrics.privateBytes
+            latestRecord.telemetry.allocatedDiskBytes = rootMetrics.allocatedDiskBytes
+
+            let cmd = CompositeWorkspaceCommand(
+                title: "Capture Live Snapshot '\(title)'",
+                commands: [
+                    RegisterSnapshotCommand(snapshot: node),
+                    UpsertVMCommand(record: latestRecord)
+                ]
+            )
+            try await undoRedo.execute(cmd, on: store)
+
+            let enMsg = String(
+                format: "Paused VM '%@' for %.3f ms to capture live disk snapshot '%@' (%@; guest sync %.3f ms).",
+                latestRecord.spec.name,
+                pauseMs,
+                title,
+                snapID.rawValue,
+                prePauseSyncMs
+            )
+            let zhMsg = String(
+                format: "为捕获运行中磁盘快照「%@」（%@）暂停虚拟机「%@」%.3f ms（客户机 sync 耗时 %.3f ms）。",
+                title,
+                snapID.rawValue,
+                latestRecord.spec.name,
+                pauseMs,
+                prePauseSyncMs
+            )
+            try await store.appendDiagnostic(DiagnosticEvent(
+                severity: .info,
+                subsystem: "Hypervisor",
+                vmID: vmID,
+                code: "VM_PAUSED_FOR_SNAPSHOT",
+                message: enMsg,
+                metadata: [
+                    "vmName": latestRecord.spec.name,
+                    "operation": "snapshot",
+                    "snapshotID": snapID.rawValue,
+                    "pauseMs": String(format: "%.3f", pauseMs),
+                    "pauseMilliseconds": String(format: "%.3f", pauseMs),
+                    "syncMs": String(format: "%.3f", prePauseSyncMs),
+                    "message_en": enMsg,
+                    "message_zh": zhMsg
+                ]
+            ))
+
+            return LiveDaemonSnapshotResult(
+                snapshot: node,
+                diskCloneStrategy: cloneStrategy,
+                pauseDurationMilliseconds: pauseMs
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: cloneURL)
+            throw error
+        }
+    }
+
+    public func forkBranchInDaemon(
+        fromVMID parentVMID: VMID,
+        branchName: String,
+        agentOwnerTag: String
+    ) async throws -> LiveDaemonBranchResult {
+        try await enqueueVMLifecycleOperation(for: parentVMID) {
+            try await self.forkBranchInDaemonUnlocked(
+                fromVMID: parentVMID,
+                branchName: branchName,
+                agentOwnerTag: agentOwnerTag
+            )
+        }
+    }
+
+    private func forkBranchInDaemonUnlocked(
+        fromVMID parentVMID: VMID,
+        branchName: String,
+        agentOwnerTag: String
+    ) async throws -> LiveDaemonBranchResult {
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        guard let parentRecord = try await store.fetchVM(parentVMID) else {
+            throw AgentVMError.vmNotFound(parentVMID)
+        }
+        guard let box = hardwareBoxes[parentVMID] else {
+            let coldFork = try await forkCoWBranch(
+                fromVMID: parentVMID,
+                branchName: branchName,
+                agentOwnerTag: agentOwnerTag,
+                bootImmediately: false
+            )
+            return LiveDaemonBranchResult(fork: coldFork, pauseDurationMilliseconds: 0)
+        }
+        try await rejectDuplicateVMName(branchName)
+        guard parentRecord.telemetry.state == .running, box.prematureStopReason() == nil else {
+            throw AgentVMError.invalidLifecycleTransition(
+                vmID: parentVMID,
+                from: parentRecord.telemetry.state.rawValue,
+                requested: "branch"
+            )
+        }
+        guard let session = vsockSessions[parentVMID] else {
+            throw AgentVMError.guestAgentNotConnected(
+                vmName: parentRecord.spec.name,
+                state: parentRecord.telemetry.state.rawValue
+            )
+        }
+        guard let parentDisk = parentRecord.spec.blockDevices.first else {
+            throw AgentVMError.diskImageOperationFailed(
+                path: parentRecord.spec.name,
+                errnoCode: EINVAL,
+                detail: "Parent VM has no boot disk to clone."
+            )
+        }
+
+        let prePauseSyncMs = try await performGuestSyncBeforeLiveClone(
+            session: session,
+            vmName: parentRecord.spec.name,
+            operation: "branch"
+        )
+
+        let forkSnapID = SnapshotID.generate(prefix: "snap")
+        let forkSnapURL = store.snapshotsDirectoryURL.appendingPathComponent("\(parentVMID.rawValue)-\(forkSnapID.rawValue).raw")
+        let childID = VMID.generate(prefix: "vm")
+        let slug = sanitizeFilename(branchName)
+        let childDiskURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(childID.rawValue).raw")
+        let childNvramURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(childID.rawValue).nvram")
+        let childMachineIDURL = store.disksDirectoryURL.appendingPathComponent("\(slug)-\(childID.rawValue).machineid")
+        let childSnapDiskURL = store.snapshotsDirectoryURL.appendingPathComponent("\(childID.rawValue)-head.raw")
+        let parentRootDiskURL = URL(fileURLWithPath: parentDisk.imagePath)
+
+        var didPause = false
+        var resumeCompleted = false
+        var clonedParentNvram = false
+        var nvramStrategy: DiskCloneStrategyUsed = .apfsClonefile
+        let forkSnapStrategy: DiskCloneStrategyUsed
+        let pauseStartNs = DispatchTime.now().uptimeNanoseconds
+        let pauseEndNs: UInt64
+
+        do {
+            try await box.pause()
+            didPause = true
+            forkSnapStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+                from: parentRootDiskURL,
+                to: forkSnapURL,
+                overwrite: true
+            )
+            if case let .efiBoot(parentNvramPath, _) = parentRecord.spec.bootLoader,
+               FileManager.default.fileExists(atPath: parentNvramPath) {
+                nvramStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+                    from: URL(fileURLWithPath: parentNvramPath),
+                    to: childNvramURL,
+                    overwrite: true
+                )
+                clonedParentNvram = true
+            }
+            try await box.resume()
+            resumeCompleted = true
+            pauseEndNs = DispatchTime.now().uptimeNanoseconds
+        } catch {
+            if didPause && !resumeCompleted {
+                try? await box.resume()
+            }
+            try? FileManager.default.removeItem(at: forkSnapURL)
+            try? FileManager.default.removeItem(at: childNvramURL)
+            throw error
+        }
+
+        let pauseMs = Double(pauseEndNs &- pauseStartNs) / 1_000_000.0
+        var createdISOURL: URL?
+        do {
+            let childDiskStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+                from: forkSnapURL,
+                to: childDiskURL,
+                overwrite: true
+            )
+            let childSnapStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
+                from: childDiskURL,
+                to: childSnapDiskURL,
+                overwrite: true
+            )
+
+            let allVMs = try await store.listVMs()
+            let childIP = "10.211.55.\(min(245, 10 + allVMs.count))"
+            let childMAC = MACAddress.deterministicGuestMAC(seed: childID.rawValue).description
+
+            var childSpec = parentRecord.spec
+            childSpec.id = childID
+            childSpec.name = branchName
+            childSpec.agentOwnerTag = agentOwnerTag
+            childSpec.parentVMID = parentVMID
+            childSpec.forkedFromSnapshotID = forkSnapID
+            childSpec.createdAt = Date()
+            childSpec.updatedAt = Date()
+            childSpec.blockDevices[0] = BlockDeviceSpec(
+                label: "root-cow",
+                imagePath: childDiskURL.path,
+                virtualSizeBytes: parentDisk.virtualSizeBytes,
+                format: parentDisk.format,
+                readOnly: false,
+                isBootVolume: true,
+                parentCoWImagePath: forkSnapURL.path
+            )
+            if case .efiBoot = parentRecord.spec.bootLoader {
+                if !clonedParentNvram {
+                    _ = try VZEFIVariableStore(creatingVariableStoreAt: childNvramURL)
+                }
+                childSpec.bootLoader = .efiBoot(variableStorePath: childNvramURL.path, createVariableStoreIfMissing: true)
+            }
+            try VZGenericMachineIdentifier().dataRepresentation.write(to: childMachineIDURL, options: [.atomic])
+            childSpec.machineIdentifierPath = childMachineIDURL.path
+            if !childSpec.networkInterfaces.isEmpty {
+                if childSpec.networkInterfaces[0].mode == .systemNAT {
+                    childSpec.networkInterfaces[0].ipv4Address = "dhcp"
+                } else {
+                    childSpec.networkInterfaces[0].ipv4Address = childIP
+                }
+                childSpec.networkInterfaces[0].macAddress = childMAC
+            }
+            childSpec.portForwards = []
+            if childSpec.serialAndDisplay.serialLogPath != nil {
+                childSpec.serialAndDisplay.serialLogPath = consoleLogURL(forVMName: branchName).path
+            }
+            let (childCloudInit, childISOURL) = try synthesizeChildCloudInitAndISO(
+                parentSpec: parentRecord.spec,
+                childID: childID,
+                childBranchName: branchName,
+                childSlug: slug,
+                childStaticIPv4: childIP
+            )
+            createdISOURL = childISOURL
+            childSpec.cloudInit = childCloudInit
+            childSpec.cloudInitISOPath = childISOURL.path
+
+            let effectiveStrategy: DiskCloneStrategyUsed = (
+                forkSnapStrategy == .fullCopyFallback
+                || nvramStrategy == .fullCopyFallback
+                || childDiskStrategy == .fullCopyFallback
+                || childSnapStrategy == .fullCopyFallback
+            ) ? .fullCopyFallback : .apfsClonefile
+
+            let forkSnapMetrics = try diskEngine.readFileSpaceMetrics(at: forkSnapURL)
+            let parentRootMetrics = try diskEngine.readFileSpaceMetrics(at: parentRootDiskURL)
+            let childDiskMetrics = try diskEngine.readFileSpaceMetrics(at: childDiskURL)
+            let childSnapMetrics = try diskEngine.readFileSpaceMetrics(at: childSnapDiskURL)
+
+            var latestParent = (try await store.fetchVM(parentVMID)) ?? parentRecord
+            let resolvedParentBranch: String
+            if let headID = latestParent.currentHeadSnapshotID,
+               let headSnap = try await store.fetchSnapshot(headID) {
+                resolvedParentBranch = headSnap.branchName
+            } else {
+                resolvedParentBranch = "main"
+            }
+
+            let forkSnap = SnapshotNode(
+                id: forkSnapID,
+                vmID: parentVMID,
+                parentSnapshotID: latestParent.currentHeadSnapshotID,
+                branchName: resolvedParentBranch,
+                title: "Branch Fork -> \(branchName)",
+                notes: "Live guest-synced fork point",
+                kind: .branchForkPoint,
+                diskClonePath: forkSnapURL.path,
+                memoryStatePath: nil,
+                virtualDiskBytes: forkSnapMetrics.virtualSizeBytes,
+                allocatedDiskBytes: forkSnapMetrics.allocatedDiskBytes,
+                apfsPrivateBytes: forkSnapMetrics.privateBytes,
+                memoryStateBytes: 0,
+                specSnapshot: latestParent.spec,
+                agentActor: latestParent.spec.agentOwnerTag,
+                isPinned: true
+            )
+
+            let childRootSnap = SnapshotNode(
+                id: SnapshotID.generate(prefix: "snap"),
+                vmID: childID,
+                parentSnapshotID: forkSnapID,
+                branchName: branchName,
+                title: "CoW Head (\(branchName))",
+                notes: effectiveStrategy == .apfsClonefile
+                    ? "Zero-copy clonefile(2) live fork from \(latestParent.spec.name)"
+                    : "Full-copy fallback live fork from \(latestParent.spec.name)",
+                kind: .branchForkPoint,
+                diskClonePath: childSnapDiskURL.path,
+                memoryStatePath: nil,
+                virtualDiskBytes: childSnapMetrics.virtualSizeBytes,
+                allocatedDiskBytes: childSnapMetrics.allocatedDiskBytes,
+                apfsPrivateBytes: childSnapMetrics.privateBytes,
+                memoryStateBytes: 0,
+                specSnapshot: childSpec,
+                agentActor: agentOwnerTag
+            )
+
+            let childRecord = VMInstanceRecord(
+                spec: childSpec,
+                currentHeadSnapshotID: childRootSnap.id,
+                telemetry: VMLiveTelemetry(
+                    vmID: childID,
+                    state: .stopped,
+                    apfsPrivateBytes: childDiskMetrics.privateBytes,
+                    allocatedDiskBytes: childDiskMetrics.allocatedDiskBytes
+                )
+            )
+
+            latestParent.currentHeadSnapshotID = forkSnapID
+            latestParent.telemetry.apfsPrivateBytes = parentRootMetrics.privateBytes
+            latestParent.telemetry.allocatedDiskBytes = parentRootMetrics.allocatedDiskBytes
+
+            let cmd = CompositeWorkspaceCommand(
+                title: "Fork CoW Branch '\(branchName)' from '\(latestParent.spec.name)'",
+                commands: [
+                    RegisterSnapshotCommand(snapshot: forkSnap),
+                    UpsertVMCommand(record: latestParent),
+                    UpsertVMCommand(record: childRecord),
+                    RegisterSnapshotCommand(snapshot: childRootSnap)
+                ]
+            )
+            try await undoRedo.execute(cmd, on: store)
+            let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000.0
+
+            let pauseEnMsg = String(
+                format: "Paused VM '%@' for %.3f ms to fork CoW branch '%@' (%@; snapshot %@, guest sync %.3f ms).",
+                latestParent.spec.name,
+                pauseMs,
+                branchName,
+                childID.rawValue,
+                forkSnapID.rawValue,
+                prePauseSyncMs
+            )
+            let pauseZhMsg = String(
+                format: "为派生 CoW 分支「%@」（%@，快照 %@）暂停虚拟机「%@」%.3f ms（客户机 sync 耗时 %.3f ms）。",
+                branchName,
+                childID.rawValue,
+                forkSnapID.rawValue,
+                latestParent.spec.name,
+                pauseMs,
+                prePauseSyncMs
+            )
+            try await store.appendDiagnostic(DiagnosticEvent(
+                severity: .info,
+                subsystem: "Hypervisor",
+                vmID: parentVMID,
+                code: "VM_PAUSED_FOR_SNAPSHOT",
+                message: pauseEnMsg,
+                metadata: [
+                    "vmName": latestParent.spec.name,
+                    "operation": "branch",
+                    "snapshotID": forkSnapID.rawValue,
+                    "childName": branchName,
+                    "childVMID": childID.rawValue,
+                    "pauseMs": String(format: "%.3f", pauseMs),
+                    "pauseMilliseconds": String(format: "%.3f", pauseMs),
+                    "syncMs": String(format: "%.3f", prePauseSyncMs),
+                    "message_en": pauseEnMsg,
+                    "message_zh": pauseZhMsg
+                ]
+            ))
+
+            let privateFormatted = ByteMetricsFormatter.formatBytes(childDiskMetrics.privateBytes)
+            let enDiag = String(
+                format: "Forked CoW branch '%@' (@%@) in %.1f ms (pause %.3f ms; %@ private bytes not shared with other clones).",
+                branchName,
+                agentOwnerTag,
+                elapsedMs,
+                pauseMs,
+                privateFormatted
+            )
+            let zhDiag = String(
+                format: "已分叉 CoW 分支 '%@' (@%@) · 耗时 %.1f ms（暂停 %.3f ms；%@ 私有字节，不与其他克隆共享）",
+                branchName,
+                agentOwnerTag,
+                elapsedMs,
+                pauseMs,
+                privateFormatted
+            )
+            try await store.appendDiagnostic(DiagnosticEvent(
+                severity: .info,
+                subsystem: "StorageCoW",
+                vmID: childID,
+                code: "COW_BRANCH_FORKED",
+                message: enDiag,
+                metadata: [
+                    "apfsPrivateBytes": String(childDiskMetrics.privateBytes),
+                    "allocatedDiskBytes": String(childDiskMetrics.allocatedDiskBytes),
+                    "pauseMs": String(format: "%.3f", pauseMs),
+                    "cloneStrategy": effectiveStrategy.rawValue,
+                    "message_en": enDiag,
+                    "message_zh": zhDiag
+                ]
+            ))
+
+            let forkResult = CoWBranchForkResult(
+                parentVMID: parentVMID,
+                childVM: childRecord,
+                forkPointSnapshot: forkSnap,
+                childInitialSnapshot: childRootSnap,
+                cloneDurationMilliseconds: elapsedMs,
+                diskCloneStrategy: effectiveStrategy
+            )
+            return LiveDaemonBranchResult(fork: forkResult, pauseDurationMilliseconds: pauseMs)
+        } catch {
+            try? FileManager.default.removeItem(at: forkSnapURL)
+            try? FileManager.default.removeItem(at: childDiskURL)
+            try? FileManager.default.removeItem(at: childNvramURL)
+            try? FileManager.default.removeItem(at: childMachineIDURL)
+            try? FileManager.default.removeItem(at: childSnapDiskURL)
+            if let createdISOURL {
+                try? FileManager.default.removeItem(at: createdISOURL)
+            }
+            throw error
+        }
+    }
+
+    public func restoreSnapshotInDaemon(_ snapshotID: SnapshotID) async throws -> LiveDaemonRestoreResult {
+        guard let snap = try await store.fetchSnapshot(snapshotID) else {
+            throw AgentVMError.snapshotNotFound(snapshotID)
+        }
+        return try await enqueueVMLifecycleOperation(for: snap.vmID) {
+            try await self.restoreSnapshotInDaemonUnlocked(snapshotID, vmID: snap.vmID)
+        }
+    }
+
+    private func restoreSnapshotInDaemonUnlocked(
+        _ snapshotID: SnapshotID,
+        vmID: VMID
+    ) async throws -> LiveDaemonRestoreResult {
+        guard let existing = try await store.fetchVM(vmID) else {
+            throw AgentVMError.vmNotFound(vmID)
+        }
+        if hardwareBoxes[vmID] != nil {
+            throw AgentVMError.liveRestoreNotImplemented(
+                vmName: existing.spec.name,
+                state: existing.telemetry.state.rawValue
+            )
+        }
+        let cold = try await restoreToSnapshotReportingStrategy(snapshotID)
+        return LiveDaemonRestoreResult(
+            record: cold.record,
+            preRestoreSnapshot: nil,
+            diskCloneStrategy: cold.diskCloneStrategy
+        )
+    }
+
+    private func performGuestSyncBeforeLiveClone(
+        session: VsockMultiplexSession,
+        vmName: String,
+        operation: String
+    ) async throws -> Double {
+        let syncStartNs = DispatchTime.now().uptimeNanoseconds
+        let syncReq = GuestExecRequest(
+            executable: "/bin/sync",
+            arguments: [],
+            workingDirectory: "/",
+            runAsUser: "root",
+            timeoutSeconds: Self.defaultLiveSnapshotSyncTimeoutSeconds
+        )
+        let syncRes: GuestExecResult
+        do {
+            syncRes = try await session.executeCommand(syncReq)
+        } catch {
+            throw AgentVMError.liveGuestSyncFailed(
+                vmName: vmName,
+                operation: operation,
+                detail: error.localizedDescription
+            )
+        }
+        let syncEndNs = DispatchTime.now().uptimeNanoseconds
+        if syncRes.timedOut {
+            throw AgentVMError.liveGuestSyncFailed(
+                vmName: vmName,
+                operation: operation,
+                detail: "timed out after \(Int(Self.defaultLiveSnapshotSyncTimeoutSeconds))s"
+            )
+        }
+        if syncRes.exitCode != 0 {
+            let trimmedStderr = syncRes.stderrUTF8.trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = trimmedStderr.isEmpty
+                ? "exitCode=\(syncRes.exitCode)"
+                : "exitCode=\(syncRes.exitCode), stderr: \(trimmedStderr)"
+            throw AgentVMError.liveGuestSyncFailed(
+                vmName: vmName,
+                operation: operation,
+                detail: detail
+            )
+        }
+        return Double(syncEndNs &- syncStartNs) / 1_000_000.0
     }
 
     public func restoreToSnapshot(_ snapshotID: SnapshotID) async throws -> VMInstanceRecord {

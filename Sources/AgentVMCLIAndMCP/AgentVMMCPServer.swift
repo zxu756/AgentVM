@@ -364,6 +364,7 @@ public actor AgentVMMCPServer {
             }
             let isSimulation = await coordinator.currentExecutionBackend() == .deterministicSimulation
             let vm: VMInstanceRecord
+            let preRestoreSnapshot: SnapshotNode
             if !isSimulation,
                try DaemonClient.isVMHeldByRunningDaemon(
                    workspaceURL: coordinator.store.bundleURL,
@@ -378,13 +379,25 @@ public actor AgentVMMCPServer {
                 switch rpcOutcome {
                 case let .connected((_, restoreRes)):
                     vm = restoreRes.vm
+                    guard let capturedPre = restoreRes.preRestoreSnapshot else {
+                        throw DaemonRPCProtocolError.malformedEnvelope(
+                            detail: "Daemon restore result omitted required preRestoreSnapshot."
+                        )
+                    }
+                    preRestoreSnapshot = capturedPre
                 case .daemonNotRunning:
-                    vm = try await coordinator.restoreToSnapshot(snapID)
+                    (vm, preRestoreSnapshot, _) = try await coordinator.restoreToSnapshotReportingStrategy(
+                        snapID,
+                        language: .en
+                    )
                 }
             } else {
-                vm = try await coordinator.restoreToSnapshot(snapID)
+                (vm, preRestoreSnapshot, _) = try await coordinator.restoreToSnapshotReportingStrategy(
+                    snapID,
+                    language: .en
+                )
             }
-            return "Restored VM \(vm.id.rawValue) to snapshot \(snapStr)."
+            return "Restored VM \(vm.id.rawValue) to snapshot \(snapStr) (pre-restore snapshot: \(preRestoreSnapshot.id.rawValue))."
 
         case "agentvm_query_wiretap":
             let filter = arguments["filter"] as? String

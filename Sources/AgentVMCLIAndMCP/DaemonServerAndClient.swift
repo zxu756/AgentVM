@@ -749,7 +749,10 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
     ) async {
         defer { conn.close() }
         do {
-            let restoreRes = try await coordinator.restoreSnapshotInDaemon(SnapshotID(params.snapshotID))
+            let restoreRes = try await coordinator.restoreSnapshotInDaemon(
+                SnapshotID(params.snapshotID),
+                language: params.lang
+            )
             let resp = DaemonRPCResponse<DaemonRPCRestoreResult>.success(
                 id: id,
                 result: DaemonRPCRestoreResult(

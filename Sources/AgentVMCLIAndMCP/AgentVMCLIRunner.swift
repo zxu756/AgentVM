@@ -861,8 +861,13 @@ public struct AgentVMCLIRunner: Sendable {
                     hintLine = "提示：请持续读取 'agentvm exec' 的标准输出/标准错误，或在客户机内将大输出重定向到文件。"
                 } else if case let .liveGuestSyncFailed(vmName, _, _) = err {
                     hintLine = "提示：请检查虚拟机「\(vmName)」内客户机代理与根文件系统状态（如 'agentvm exec \(vmName) -- sync'），或先运行 'agentvm halt \(vmName)' 停机。"
-                } else if case let .liveRestoreNotImplemented(vmName, _) = err {
-                    hintLine = "提示：请先运行 'agentvm halt \(vmName)' 停机，再运行 'agentvm restore <快照ID>'。"
+                } else if case let .restoreOperationFailed(vmName, _, _, _, _, outcome) = err {
+                    switch outcome {
+                    case .stoppedOriginalDiskUntouched, .restartedOnOriginalDisk:
+                        hintLine = "提示：请检查工作区 snapshots/ 与 disks/ 目录权限及可用空间后重试 'agentvm restore <快照ID>'。"
+                    case .stoppedOriginalDiskRebootFailed, .stoppedAfterDiskRestored:
+                        hintLine = "提示：请排查配置或串口日志后运行 'agentvm up \(vmName)' 重新启动虚拟机。"
+                    }
                 } else if case let .vmLockedForDeferredMilestone(vmName, _, reason) = err {
                     switch reason {
                     case .liveSnapshotBranchRestoreScheduledForM3:
@@ -1590,6 +1595,7 @@ public struct AgentVMCLIRunner: Sendable {
             throw AgentVMError.snapshotNotFound(snapID)
         }
         let vm: VMInstanceRecord
+        let preRestoreSnapshot: SnapshotNode
         let strategy: DiskCloneStrategyUsed
         if !isSimulation,
            try DaemonClient.isVMHeldByRunningDaemon(
@@ -1609,12 +1615,25 @@ public struct AgentVMCLIRunner: Sendable {
             switch rpcOutcome {
             case let .connected((_, restoreRes)):
                 vm = restoreRes.vm
+                if let capturedPre = restoreRes.preRestoreSnapshot {
+                    preRestoreSnapshot = capturedPre
+                } else {
+                    throw DaemonRPCProtocolError.malformedEnvelope(
+                        detail: "Daemon restore result omitted required preRestoreSnapshot."
+                    )
+                }
                 strategy = restoreRes.diskCloneStrategy
             case .daemonNotRunning:
-                (vm, strategy) = try await coordinator.restoreToSnapshotReportingStrategy(snapID)
+                (vm, preRestoreSnapshot, strategy) = try await coordinator.restoreToSnapshotReportingStrategy(
+                    snapID,
+                    language: language
+                )
             }
         } else {
-            (vm, strategy) = try await coordinator.restoreToSnapshotReportingStrategy(snapID)
+            (vm, preRestoreSnapshot, strategy) = try await coordinator.restoreToSnapshotReportingStrategy(
+                snapID,
+                language: language
+            )
         }
         if strategy == .fullCopyFallback {
             progressStderrCollector.emit(
@@ -1623,8 +1642,8 @@ public struct AgentVMCLIRunner: Sendable {
             )
         }
         let msg = isZh
-            ? "已将「\(vm.spec.name)」恢复至快照 \(snapRaw)\n"
-            : "Restored '\(vm.spec.name)' to snapshot \(snapRaw)\n"
+            ? "已将「\(vm.spec.name)」恢复至快照 \(snapRaw)（回滚前快照：\(preRestoreSnapshot.id.rawValue)）\n"
+            : "Restored '\(vm.spec.name)' to snapshot \(snapRaw) (pre-restore snapshot: \(preRestoreSnapshot.id.rawValue))\n"
         return CLIExecutionOutcome(
             exitCode: 0,
             stdout: msg,

@@ -53,6 +53,7 @@ map_module_to_filters() {
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
+            echo "M3Stage3bRestoreTests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
@@ -63,6 +64,7 @@ map_module_to_filters() {
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
+            echo "M3Stage3bRestoreTests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"
@@ -71,6 +73,7 @@ map_module_to_filters() {
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
+            echo "M3Stage3bRestoreTests"
             ;;
         AgentVMNetSwitch|NetSwitch)
             echo "NetSwitchDissectorAndPCAPTests"
@@ -83,6 +86,7 @@ map_module_to_filters() {
             echo "CLIAndMCPDaemonStage6Tests"
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
+            echo "M3Stage3bRestoreTests"
             ;;
         AgentVMPluginHost|PluginHost)
             echo "PluginSandboxAndIACTests"
@@ -99,6 +103,7 @@ map_module_to_filters() {
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
+            echo "M3Stage3bRestoreTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -115,6 +120,7 @@ map_module_to_filters() {
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
+            echo "M3Stage3bRestoreTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -125,6 +131,7 @@ map_module_to_filters() {
         AgentVM)
             echo "CLIAndMCPTests"
             echo "CLIAndMCPSimulationHonestyTests"
+            echo "BilingualLocalizationTests"
             echo "CLIAndMCPDaemonRPCTests"
             echo "CLIAndMCPDaemonStage2Tests"
             echo "CLIAndMCPDaemonStage3aTests"
@@ -137,6 +144,7 @@ map_module_to_filters() {
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
+            echo "M3Stage3bRestoreTests"
             ;;
         *)
             echo "ERROR: Unknown module '$mod'" >&2

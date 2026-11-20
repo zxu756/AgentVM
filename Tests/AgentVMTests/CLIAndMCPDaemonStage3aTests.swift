@@ -721,8 +721,8 @@ struct CLIAndMCPDaemonStage3aTests {
                 daemonSpawnOverride: forbiddenSpawn
             ).exitCode == 0)
 
-            // 1. M3 Stage 3a (A59/A61): while daemon holds `t1`, CLI `snapshot` and `branch` route through daemon RPC and exit 0
-            //    (parent disk inode & running state preserved), while live `restore` exits 1 explaining it is not implemented yet (no "M3").
+            // 1. M3 Stage 3a/3b (A59/A60/A61): while daemon holds `t1`, CLI `snapshot`, `branch`, and `restore` all route through daemon RPC and exit 0:
+            //    `snapshot` and `branch` keep parent root disk inode untouched; `restore` halts, saves pre-restore snapshot, swaps disk, and boots `t1` back to `running`.
             for lang in ["en", "zh"] {
                 let snapRes = await cli.execute(
                     arguments: ["--lang", lang, "--workspace", wsURL.path, "snapshot", "t1", "live-attempt-\(lang)"],
@@ -739,24 +739,32 @@ struct CLIAndMCPDaemonStage3aTests {
                     daemonSpawnOverride: forbiddenSpawn
                 )
                 #expect(branchRes.exitCode == 0, "branch (\(lang)) exited \(branchRes.exitCode): \(branchRes.stderr)")
+            }
 
+            // Root disk inode must remain untouched across live `snapshot` and `branch`!
+            var diskStatAfterSnapBranch = Darwin.stat()
+            #expect(stat(rootDiskPath, &diskStatAfterSnapBranch) == 0)
+            #expect(diskStatAfterSnapBranch.st_ino == diskStatBefore.st_ino)
+
+            for lang in ["en", "zh"] {
                 let restoreRes = await cli.execute(
                     arguments: ["--lang", lang, "--workspace", wsURL.path, "restore", baseSnapID.rawValue],
                     curatedEntriesOverride: [entry],
                     environment: env,
                     daemonSpawnOverride: forbiddenSpawn
                 )
-                #expect(restoreRes.exitCode == 1, "restore (\(lang)) exited \(restoreRes.exitCode): \(restoreRes.stderr)")
-                #expect(restoreRes.stderr.contains("ERR_LIVE_RESTORE_UNIMPLEMENTED"))
+                #expect(restoreRes.exitCode == 0, "restore (\(lang)) exited \(restoreRes.exitCode): \(restoreRes.stderr)")
+                #expect(restoreRes.stdout.contains("snap-"))
                 #expect(!restoreRes.stderr.contains("M3"))
             }
 
-            // Root disk inode and persisted running state must remain untouched!
+            // Root disk inode was swapped by live `restore`, and `t1` is booted back to `running`!
             var diskStatAfter = Darwin.stat()
             #expect(stat(rootDiskPath, &diskStatAfter) == 0)
-            #expect(diskStatAfter.st_ino == diskStatBefore.st_ino)
+            #expect(diskStatAfter.st_ino != diskStatBefore.st_ino)
             let dbRecAfterCLI = try #require(try await inspectStore.fetchVM(vmID))
             #expect(dbRecAfterCLI.telemetry.state == .running)
+            #expect(dbRecAfterCLI.telemetry.guestAgentConnected == true)
 
             // 2. Separate non-daemon AgentVMFleetCoordinator (used by Studio UI & MCP, no GUI started):
             //    `bootPersistentVM` (up), `haltVM` (halt), `pauseVM` (pause), `resumeVM` (resume), `executeInGuest` (exec)
@@ -792,13 +800,13 @@ struct CLIAndMCPDaemonStage3aTests {
             let dbRecAfterCoord = try #require(try await inspectStore.fetchVM(vmID))
             #expect(dbRecAfterCoord.telemetry.state == .running)
 
-            // 3. MCP JSON-RPC server (`AgentVMMCPServer`): in M3 Stage 3a, `snapshot` and `branch` route through daemon RPC and succeed,
-            //    `restore` routes through daemon RPC and fails with ERR_LIVE_RESTORE_UNIMPLEMENTED (no outdated M3 text),
-            //    and `exec` still rejects with ERR_VM_LOCKED mentioning M4.
+            // 3. MCP JSON-RPC server (`AgentVMMCPServer`): in M3 Stage 3b, `snapshot`, `branch`, and `restore` all route through daemon RPC and succeed,
+            //    while `exec` still rejects with ERR_VM_LOCKED mentioning M4.
             let mcp = AgentVMMCPServer(coordinator: externalCoordinator)
             let mcpSuccessCalls: [(String, [String: Any])] = [
                 ("agentvm_capture_snapshot", ["vmID": vmID.rawValue, "title": "mcp-snap"]),
-                ("agentvm_fork_cow_branch", ["parentVMID": vmID.rawValue, "branchName": "mcp-child", "bootImmediately": false])
+                ("agentvm_fork_cow_branch", ["parentVMID": vmID.rawValue, "branchName": "mcp-child", "bootImmediately": false]),
+                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue])
             ]
             for (idx, item) in mcpSuccessCalls.enumerated() {
                 let reqObj: [String: Any] = [
@@ -818,7 +826,6 @@ struct CLIAndMCPDaemonStage3aTests {
             }
 
             let mcpErrorCalls: [(String, [String: Any], String, String?)] = [
-                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue], "ERR_LIVE_RESTORE_UNIMPLEMENTED", nil),
                 ("agentvm_exec_command", ["vmID": vmID.rawValue, "executable": "uname", "arguments": ["-r"]], "ERR_VM_LOCKED", "M4")
             ]
             for (idx, item) in mcpErrorCalls.enumerated() {

@@ -723,7 +723,7 @@ struct M3Stage3aDaemonLiveForkSnapshotTests {
 
     // MARK: - 2. Daemon-Held VM Routes `snapshot` / `branch` / `restore` Through RPC Without Local Lock
 
-    @Test("A61 & A59: when daemon holds running VM, CLI and MCP snapshot/branch route via RPC without local lock, record live-disk, keep parent running, and restore exits 1 explaining live restore is unimplemented")
+    @Test("A61, A59 & A60: when daemon holds running VM, CLI and MCP snapshot/branch/restore all route via RPC without local lock, record live-disk, and keep VM running")
     func routingWhenDaemonHoldsVMUsesRPCWithoutLocalLockAndKeepsParentRunning() async throws {
         let realBase = try makePrivateTmpDirectory(prefix: "avm-m3-rpc")
         defer { try? FileManager.default.removeItem(atPath: realBase) }
@@ -866,7 +866,7 @@ struct M3Stage3aDaemonLiveForkSnapshotTests {
             let c3Rec = try #require(try await inspectStore.listVMs().first(where: { $0.spec.name == "c3-mcp" }))
             #expect(c3Rec.telemetry.state == .stopped)
 
-            // 4. CLI & MCP `restore` on running `p` -> exit 1 / isError=true, explains live restore is not implemented yet (EN & ZH, no milestone or version strings)
+            // 4. M3 Stage 3b (A60): CLI & MCP `restore` on running `p` now route via daemon RPC, save pre-restore snapshot, swap disk, and reboot `p` to running (exit 0 / isError=false)
             for lang in ["en", "zh"] {
                 let restoreRes = await cli.execute(
                     arguments: ["--lang", lang, "--workspace", wsURL.path, "restore", s1Node.id.rawValue],
@@ -874,26 +874,23 @@ struct M3Stage3aDaemonLiveForkSnapshotTests {
                     environment: env,
                     daemonSpawnOverride: forbiddenSpawn
                 )
-                #expect(restoreRes.exitCode == 1, "Expected live restore (\(lang)) to exit 1")
-                #expect(!restoreRes.stderr.contains("ERR_VM_LOCKED"), "Live restore must route to daemon rather than failing local lock: \(restoreRes.stderr)")
-                #expect(!restoreRes.stderr.contains("M3") && !restoreRes.stderr.contains("M4") && !restoreRes.stderr.contains("3b") && !restoreRes.stderr.contains("1.4"))
-                if lang == "en" {
-                    #expect(restoreRes.stderr.lowercased().contains("not implemented"))
-                } else {
-                    #expect(restoreRes.stderr.contains("尚未实现") || restoreRes.stderr.contains("还没实现") || restoreRes.stderr.contains("未实现"))
-                }
+                #expect(restoreRes.exitCode == 0, "Expected live restore (\(lang)) to exit 0: \(restoreRes.stderr)")
+                #expect(restoreRes.stdout.contains("snap-"))
+                #expect(!restoreRes.stderr.contains("ERR_VM_LOCKED"))
+                #expect(!restoreRes.stderr.contains("ERR_LIVE_RESTORE_UNIMPLEMENTED"))
             }
             let mcpRestore = try await invokeMCPTool(mcp, id: 3, name: "agentvm_restore_snapshot", arguments: [
                 "snapshotID": s1Node.id.rawValue
             ])
-            #expect(mcpRestore.isError == true)
-            #expect(mcpRestore.text.lowercased().contains("not implemented"))
+            #expect(mcpRestore.isError == false, "Expected MCP live restore to succeed: \(mcpRestore.text)")
+            #expect(mcpRestore.text.contains("snap-"))
             #expect(!mcpRestore.text.contains("ERR_VM_LOCKED"))
-            #expect(!mcpRestore.text.contains("M3") && !mcpRestore.text.contains("3b"))
+            #expect(!mcpRestore.text.contains("ERR_LIVE_RESTORE_UNIMPLEMENTED"))
 
-            // Parent `p` is still running!
+            // Parent `p` is running and guestd is connected after live restore!
             let pFinal = try #require(try await inspectStore.fetchVM(pID))
             #expect(pFinal.telemetry.state == .running)
+            #expect(pFinal.telemetry.guestAgentConnected == true)
 
             #expect(await cli.execute(
                 arguments: ["--lang", "en", "--workspace", wsURL.path, "halt", "p"],

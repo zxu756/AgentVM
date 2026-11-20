@@ -3033,58 +3033,63 @@ public actor AgentVMFleetCoordinator {
             to: cloneURL,
             overwrite: true
         )
-        if acquireExecutionLock, let hook = afterLineageCloneHookForTesting {
-            await hook("snapshot", vmID)
+        do {
+            if acquireExecutionLock, let hook = afterLineageCloneHookForTesting {
+                await hook("snapshot", vmID)
+            }
+            let snapMetrics = try diskEngine.readFileSpaceMetrics(at: cloneURL)
+            let rootMetrics = try diskEngine.readFileSpaceMetrics(at: sourceURL)
+
+            let resolvedBranch: String
+            if let branchName {
+                resolvedBranch = branchName
+            } else if let headID = record.currentHeadSnapshotID,
+                      let headSnap = try await store.fetchSnapshot(headID) {
+                resolvedBranch = headSnap.branchName
+            } else {
+                resolvedBranch = "main"
+            }
+
+            // Decided Item 1: M3 captures disk-only snapshots and never saves `.vzstate` guest memory files.
+            // Local/stopped/simulation snapshots record `.coldDiskOnly` unless an explicit lineage/auto kind was requested.
+            let recordedKind: SnapshotKind = (kind == .liveMemoryAndDisk || kind == .liveDisk) ? .coldDiskOnly : kind
+
+            let node = SnapshotNode(
+                id: snapID,
+                vmID: vmID,
+                parentSnapshotID: record.currentHeadSnapshotID,
+                branchName: resolvedBranch,
+                title: title,
+                notes: notes,
+                kind: recordedKind,
+                diskClonePath: cloneURL.path,
+                memoryStatePath: nil,
+                virtualDiskBytes: snapMetrics.virtualSizeBytes,
+                allocatedDiskBytes: snapMetrics.allocatedDiskBytes,
+                apfsPrivateBytes: snapMetrics.privateBytes,
+                memoryStateBytes: 0,
+                specSnapshot: record.spec,
+                agentActor: record.spec.agentOwnerTag,
+                triggerCommand: triggerCommand,
+                isPinned: isPinned
+            )
+
+            record.currentHeadSnapshotID = snapID
+            record.telemetry.apfsPrivateBytes = rootMetrics.privateBytes
+            record.telemetry.allocatedDiskBytes = rootMetrics.allocatedDiskBytes
+            let cmd = CompositeWorkspaceCommand(
+                title: "Capture Snapshot '\(title)'",
+                commands: [
+                    RegisterSnapshotCommand(snapshot: node),
+                    UpsertVMCommand(record: record)
+                ]
+            )
+            try await undoRedo.execute(cmd, on: store)
+            return (node, cloneStrategy)
+        } catch {
+            try? FileManager.default.removeItem(at: cloneURL)
+            throw error
         }
-        let snapMetrics = try diskEngine.readFileSpaceMetrics(at: cloneURL)
-        let rootMetrics = try diskEngine.readFileSpaceMetrics(at: sourceURL)
-
-        let resolvedBranch: String
-        if let branchName {
-            resolvedBranch = branchName
-        } else if let headID = record.currentHeadSnapshotID,
-                  let headSnap = try await store.fetchSnapshot(headID) {
-            resolvedBranch = headSnap.branchName
-        } else {
-            resolvedBranch = "main"
-        }
-
-        // Decided Item 1: M3 captures disk-only snapshots and never saves `.vzstate` guest memory files.
-        // Local/stopped/simulation snapshots record `.coldDiskOnly` unless an explicit lineage/auto kind was requested.
-        let recordedKind: SnapshotKind = (kind == .liveMemoryAndDisk || kind == .liveDisk) ? .coldDiskOnly : kind
-
-        let node = SnapshotNode(
-            id: snapID,
-            vmID: vmID,
-            parentSnapshotID: record.currentHeadSnapshotID,
-            branchName: resolvedBranch,
-            title: title,
-            notes: notes,
-            kind: recordedKind,
-            diskClonePath: cloneURL.path,
-            memoryStatePath: nil,
-            virtualDiskBytes: snapMetrics.virtualSizeBytes,
-            allocatedDiskBytes: snapMetrics.allocatedDiskBytes,
-            apfsPrivateBytes: snapMetrics.privateBytes,
-            memoryStateBytes: 0,
-            specSnapshot: record.spec,
-            agentActor: record.spec.agentOwnerTag,
-            triggerCommand: triggerCommand,
-            isPinned: isPinned
-        )
-
-        record.currentHeadSnapshotID = snapID
-        record.telemetry.apfsPrivateBytes = rootMetrics.privateBytes
-        record.telemetry.allocatedDiskBytes = rootMetrics.allocatedDiskBytes
-        let cmd = CompositeWorkspaceCommand(
-            title: "Capture Snapshot '\(title)'",
-            commands: [
-                RegisterSnapshotCommand(snapshot: node),
-                UpsertVMCommand(record: record)
-            ]
-        )
-        try await undoRedo.execute(cmd, on: store)
-        return (node, cloneStrategy)
     }
 
     public func forkCoWBranch(
@@ -3908,33 +3913,248 @@ public actor AgentVMFleetCoordinator {
         }
     }
 
-    public func restoreSnapshotInDaemon(_ snapshotID: SnapshotID) async throws -> LiveDaemonRestoreResult {
+    public static func autoPreRestoreSnapshotTitle(for targetSnapshotID: SnapshotID) -> String {
+        "auto: before restore \(targetSnapshotID.rawValue)"
+    }
+
+    private static func describeUnderlyingRestoreError(
+        _ error: Error,
+        language: AppLanguage
+    ) -> (code: String, detail: String) {
+        if let avmErr = error as? AgentVMError {
+            return (avmErr.errorCode, avmErr.localizedMessage(in: language))
+        }
+        return ("ERR_INTERNAL", error.localizedDescription)
+    }
+
+    /// Stages a CoW clone of `snap.diskClonePath` to a sibling file in `disks/` and atomically `rename(2)`s
+    /// it onto `bootDiskURL` so a mid-swap failure never unlinks or corrupts the existing root disk.
+    private func swapRootDiskAtomicallyFromSnapshot(
+        snap: SnapshotNode,
+        bootDiskURL: URL
+    ) throws -> DiskCloneStrategyUsed {
+        let srcURL = URL(fileURLWithPath: snap.diskClonePath)
+        var srcStat = Darwin.stat()
+        var dstStat = Darwin.stat()
+        if stat(srcURL.path, &srcStat) == 0,
+           stat(bootDiskURL.path, &dstStat) == 0,
+           srcStat.st_dev == dstStat.st_dev,
+           srcStat.st_ino == dstStat.st_ino {
+            throw AgentVMError.cowCloneFailed(
+                source: srcURL.path,
+                destination: bootDiskURL.path,
+                errnoCode: EINVAL
+            )
+        }
+        let parentDir = bootDiskURL.deletingLastPathComponent()
+        let stagingURL = parentDir.appendingPathComponent(
+            ".\(bootDiskURL.lastPathComponent).restore-\(UUID().uuidString).tmp"
+        )
+        let strategy: DiskCloneStrategyUsed
+        do {
+            strategy = try diskEngine.cloneDiskCoWReportingStrategy(
+                from: srcURL,
+                to: stagingURL,
+                overwrite: true
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: stagingURL)
+            throw error
+        }
+        if Darwin.rename(stagingURL.path, bootDiskURL.path) != 0 {
+            let err = Darwin.errno
+            try? FileManager.default.removeItem(at: stagingURL)
+            throw AgentVMError.cowCloneFailed(
+                source: srcURL.path,
+                destination: bootDiskURL.path,
+                errnoCode: err
+            )
+        }
+        let dirFD = Darwin.open(parentDir.path, O_RDONLY | O_CLOEXEC)
+        if dirFD >= 0 {
+            _ = Darwin.fsync(dirFD)
+            _ = Darwin.close(dirFD)
+        }
+        return strategy
+    }
+
+    private func rebootOriginalDiskAfterLiveRestoreFailure(
+        vmID: VMID,
+        language: AppLanguage
+    ) async -> RestoreFailureOutcomeState {
+        do {
+            _ = try await bootVMInternal(
+                vmID,
+                persistRunningState: true,
+                acquireExecutionLock: false
+            )
+            return .restartedOnOriginalDisk
+        } catch {
+            if hardwareBoxes[vmID] == nil {
+                heldExecutionLocks.removeValue(forKey: vmID)?.release()
+            }
+            let (code, detail) = Self.describeUnderlyingRestoreError(error, language: language)
+            return .stoppedOriginalDiskRebootFailed(rebootDetail: "[\(code)] \(detail)")
+        }
+    }
+
+    public func restoreSnapshotInDaemon(
+        _ snapshotID: SnapshotID,
+        language: AppLanguage = .en
+    ) async throws -> LiveDaemonRestoreResult {
         guard let snap = try await store.fetchSnapshot(snapshotID) else {
             throw AgentVMError.snapshotNotFound(snapshotID)
         }
         return try await enqueueVMLifecycleOperation(for: snap.vmID) {
-            try await self.restoreSnapshotInDaemonUnlocked(snapshotID, vmID: snap.vmID)
+            try await self.restoreSnapshotInDaemonUnlocked(
+                snapshotID,
+                snap: snap,
+                vmID: snap.vmID,
+                language: language
+            )
         }
     }
 
     private func restoreSnapshotInDaemonUnlocked(
         _ snapshotID: SnapshotID,
-        vmID: VMID
+        snap: SnapshotNode,
+        vmID: VMID,
+        language: AppLanguage
     ) async throws -> LiveDaemonRestoreResult {
         guard let existing = try await store.fetchVM(vmID) else {
             throw AgentVMError.vmNotFound(vmID)
         }
-        if hardwareBoxes[vmID] != nil {
-            throw AgentVMError.liveRestoreNotImplemented(
-                vmName: existing.spec.name,
-                state: existing.telemetry.state.rawValue
+        guard hardwareBoxes[vmID] != nil else {
+            let cold = try await restoreToSnapshotReportingStrategy(snapshotID, language: language)
+            return LiveDaemonRestoreResult(
+                record: cold.record,
+                preRestoreSnapshot: cold.preRestoreSnapshot,
+                diskCloneStrategy: cold.diskCloneStrategy
             )
         }
-        let cold = try await restoreToSnapshotReportingStrategy(snapshotID)
+
+        // Step 1: halt (graceful shutdown up to gracefulStopTimeoutNanoseconds [30s], then hard-stop),
+        // keeping the per-VM execution lock held across the entire restore sequence.
+        do {
+            _ = try await haltVMUnlocked(
+                vmID,
+                releaseHeldLock: false,
+                recordStopDiagnostic: true,
+                language: language
+            )
+        } catch {
+            if hardwareBoxes[vmID] == nil {
+                heldExecutionLocks.removeValue(forKey: vmID)?.release()
+            }
+            let (code, detail) = Self.describeUnderlyingRestoreError(error, language: language)
+            throw AgentVMError.restoreOperationFailed(
+                vmName: existing.spec.name,
+                targetSnapshotID: snap.id,
+                stage: .halt,
+                underlyingErrorCode: code,
+                detail: detail,
+                outcome: .stoppedOriginalDiskUntouched
+            )
+        }
+
+        // Step 2: capture pre-restore cold-disk snapshot (`auto: before restore <target-snapshot-id>`).
+        let preSnap: SnapshotNode
+        let preSnapStrategy: DiskCloneStrategyUsed
+        do {
+            (preSnap, preSnapStrategy) = try await captureSnapshotInternal(
+                vmID: vmID,
+                title: Self.autoPreRestoreSnapshotTitle(for: snap.id),
+                kind: .coldDiskOnly,
+                triggerCommand: "agentvm restore \(snap.id.rawValue)",
+                acquireExecutionLock: false
+            )
+        } catch {
+            let (code, detail) = Self.describeUnderlyingRestoreError(error, language: language)
+            let outcome = await rebootOriginalDiskAfterLiveRestoreFailure(vmID: vmID, language: language)
+            throw AgentVMError.restoreOperationFailed(
+                vmName: existing.spec.name,
+                targetSnapshotID: snap.id,
+                stage: .preRestoreSnapshot,
+                underlyingErrorCode: code,
+                detail: detail,
+                outcome: outcome
+            )
+        }
+
+        // Step 3: atomically swap root disk from `snap` (leaving cidata ISO, MAC, machineIdentifier untouched).
+        var haltedRecord = try await loadVMForOperation(vmID)
+        let swapStrategy: DiskCloneStrategyUsed
+        do {
+            guard let bootDisk = haltedRecord.spec.blockDevices.first else {
+                throw AgentVMError.diskImageOperationFailed(
+                    path: haltedRecord.spec.name,
+                    errnoCode: EINVAL,
+                    detail: "VM has no primary block device to restore."
+                )
+            }
+            let bootURL = URL(fileURLWithPath: bootDisk.imagePath)
+            swapStrategy = try swapRootDiskAtomicallyFromSnapshot(snap: snap, bootDiskURL: bootURL)
+            if let metrics = try? diskEngine.readFileSpaceMetrics(at: bootURL) {
+                haltedRecord.telemetry.apfsPrivateBytes = metrics.privateBytes
+                haltedRecord.telemetry.allocatedDiskBytes = metrics.allocatedDiskBytes
+            } else {
+                haltedRecord.telemetry.apfsPrivateBytes = snap.apfsPrivateBytes
+                haltedRecord.telemetry.allocatedDiskBytes = snap.allocatedDiskBytes
+            }
+        } catch {
+            let (code, detail) = Self.describeUnderlyingRestoreError(error, language: language)
+            let outcome = await rebootOriginalDiskAfterLiveRestoreFailure(vmID: vmID, language: language)
+            throw AgentVMError.restoreOperationFailed(
+                vmName: haltedRecord.spec.name,
+                targetSnapshotID: snap.id,
+                stage: .diskSwap,
+                underlyingErrorCode: code,
+                detail: detail,
+                outcome: outcome
+            )
+        }
+
+        // Step 4: persist new head snapshot ID, boot VM, and wait until guestd connects over vsock.
+        let bootedRecord: VMInstanceRecord
+        do {
+            haltedRecord.currentHeadSnapshotID = snap.id
+            try await store.upsertVM(haltedRecord)
+            bootedRecord = try await bootVMInternal(
+                vmID,
+                persistRunningState: true,
+                acquireExecutionLock: false
+            )
+        } catch {
+            if hardwareBoxes[vmID] == nil {
+                heldExecutionLocks.removeValue(forKey: vmID)?.release()
+            }
+            let (code, detail) = Self.describeUnderlyingRestoreError(error, language: language)
+            throw AgentVMError.restoreOperationFailed(
+                vmName: haltedRecord.spec.name,
+                targetSnapshotID: snap.id,
+                stage: .reboot,
+                underlyingErrorCode: code,
+                detail: detail,
+                outcome: .stoppedAfterDiskRestored(preRestoreSnapshotID: preSnap.id)
+            )
+        }
+
+        try await store.appendDiagnostic(DiagnosticEvent(
+            severity: .notice,
+            subsystem: "SnapshotDAG",
+            vmID: bootedRecord.id,
+            code: "SNAPSHOT_RESTORED",
+            message: "Rolled back running VM '\(bootedRecord.spec.name)' to snapshot '\(snap.title)' (\(snap.id.rawValue)); saved pre-restore snapshot \(preSnap.id.rawValue)."
+        ))
+
+        let combinedStrategy: DiskCloneStrategyUsed =
+            (preSnapStrategy == .fullCopyFallback || swapStrategy == .fullCopyFallback)
+            ? .fullCopyFallback
+            : .apfsClonefile
         return LiveDaemonRestoreResult(
-            record: cold.record,
-            preRestoreSnapshot: nil,
-            diskCloneStrategy: cold.diskCloneStrategy
+            record: bootedRecord,
+            preRestoreSnapshot: preSnap,
+            diskCloneStrategy: combinedStrategy
         )
     }
 
@@ -3984,12 +4204,17 @@ public actor AgentVMFleetCoordinator {
     }
 
     public func restoreToSnapshot(_ snapshotID: SnapshotID) async throws -> VMInstanceRecord {
-        try await restoreToSnapshotReportingStrategy(snapshotID).record
+        try await restoreToSnapshotReportingStrategy(snapshotID, language: .en).record
     }
 
     public func restoreToSnapshotReportingStrategy(
-        _ snapshotID: SnapshotID
-    ) async throws -> (record: VMInstanceRecord, diskCloneStrategy: DiskCloneStrategyUsed) {
+        _ snapshotID: SnapshotID,
+        language: AppLanguage = .en
+    ) async throws -> (
+        record: VMInstanceRecord,
+        preRestoreSnapshot: SnapshotNode,
+        diskCloneStrategy: DiskCloneStrategyUsed
+    ) {
         guard let snap = try await store.fetchSnapshot(snapshotID) else {
             throw AgentVMError.snapshotNotFound(snapshotID)
         }
@@ -4011,14 +4236,46 @@ public actor AgentVMFleetCoordinator {
             record = try await haltVM(record.id)
         }
 
-        var cloneStrategy: DiskCloneStrategyUsed = .apfsClonefile
-        if let bootDisk = record.spec.blockDevices.first {
-            let bootURL = URL(fileURLWithPath: bootDisk.imagePath)
-            cloneStrategy = try diskEngine.cloneDiskCoWReportingStrategy(
-                from: URL(fileURLWithPath: snap.diskClonePath),
-                to: bootURL,
-                overwrite: true
+        let preSnap: SnapshotNode
+        let preSnapStrategy: DiskCloneStrategyUsed
+        do {
+            (preSnap, preSnapStrategy) = try await captureSnapshotInternal(
+                vmID: record.id,
+                title: Self.autoPreRestoreSnapshotTitle(for: snap.id),
+                kind: .coldDiskOnly,
+                triggerCommand: "agentvm restore \(snap.id.rawValue)",
+                acquireExecutionLock: false
             )
+        } catch {
+            let (code, detail) = Self.describeUnderlyingRestoreError(error, language: language)
+            var outcome: RestoreFailureOutcomeState = .stoppedOriginalDiskUntouched
+            if wasRunning {
+                if (try? await bootPersistentVM(record.id)) != nil {
+                    outcome = .restartedOnOriginalDisk
+                }
+            }
+            throw AgentVMError.restoreOperationFailed(
+                vmName: record.spec.name,
+                targetSnapshotID: snap.id,
+                stage: .preRestoreSnapshot,
+                underlyingErrorCode: code,
+                detail: detail,
+                outcome: outcome
+            )
+        }
+
+        record = try await loadVMForOperation(snap.vmID)
+        let swapStrategy: DiskCloneStrategyUsed
+        do {
+            guard let bootDisk = record.spec.blockDevices.first else {
+                throw AgentVMError.diskImageOperationFailed(
+                    path: record.spec.name,
+                    errnoCode: EINVAL,
+                    detail: "VM has no primary block device to restore."
+                )
+            }
+            let bootURL = URL(fileURLWithPath: bootDisk.imagePath)
+            swapStrategy = try swapRootDiskAtomicallyFromSnapshot(snap: snap, bootDiskURL: bootURL)
             if let hook = afterLineageCloneHookForTesting {
                 await hook("restore", snap.vmID)
             }
@@ -4029,9 +4286,22 @@ public actor AgentVMFleetCoordinator {
                 record.telemetry.apfsPrivateBytes = snap.apfsPrivateBytes
                 record.telemetry.allocatedDiskBytes = snap.allocatedDiskBytes
             }
-        } else {
-            record.telemetry.apfsPrivateBytes = snap.apfsPrivateBytes
-            record.telemetry.allocatedDiskBytes = snap.allocatedDiskBytes
+        } catch {
+            let (code, detail) = Self.describeUnderlyingRestoreError(error, language: language)
+            var outcome: RestoreFailureOutcomeState = .stoppedOriginalDiskUntouched
+            if wasRunning {
+                if (try? await bootPersistentVM(record.id)) != nil {
+                    outcome = .restartedOnOriginalDisk
+                }
+            }
+            throw AgentVMError.restoreOperationFailed(
+                vmName: record.spec.name,
+                targetSnapshotID: snap.id,
+                stage: .diskSwap,
+                underlyingErrorCode: code,
+                detail: detail,
+                outcome: outcome
+            )
         }
 
         record.currentHeadSnapshotID = snap.id
@@ -4046,9 +4316,13 @@ public actor AgentVMFleetCoordinator {
             subsystem: "SnapshotDAG",
             vmID: record.id,
             code: "SNAPSHOT_RESTORED",
-            message: "Rolled back '\(record.spec.name)' to snapshot '\(snap.title)' (\(snap.id.rawValue))."
+            message: "Rolled back '\(record.spec.name)' to snapshot '\(snap.title)' (\(snap.id.rawValue)); saved pre-restore snapshot \(preSnap.id.rawValue)."
         ))
-        return (record, cloneStrategy)
+        let combinedStrategy: DiskCloneStrategyUsed =
+            (preSnapStrategy == .fullCopyFallback || swapStrategy == .fullCopyFallback)
+            ? .fullCopyFallback
+            : .apfsClonefile
+        return (record, preSnap, combinedStrategy)
     }
 
     // MARK: - Guarded Guest Command Execution & Network Packet Processing

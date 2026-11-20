@@ -299,6 +299,20 @@ public enum VMLockedDeferredMilestoneReason: Sendable, Equatable {
     case mcpAndStudioDaemonClientScheduledForM4(operation: String)
 }
 
+public enum RestoreFailureStage: String, Codable, Hashable, Sendable {
+    case halt = "halt"
+    case preRestoreSnapshot = "pre-restore-snapshot"
+    case diskSwap = "disk-swap"
+    case reboot = "up"
+}
+
+public enum RestoreFailureOutcomeState: Codable, Hashable, Sendable {
+    case stoppedOriginalDiskUntouched
+    case restartedOnOriginalDisk
+    case stoppedOriginalDiskRebootFailed(rebootDetail: String)
+    case stoppedAfterDiskRestored(preRestoreSnapshotID: SnapshotID)
+}
+
 public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case virtualizationUnsupported(reason: String)
     case virtualizationEntitlementMissing
@@ -313,7 +327,14 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case airgapPolicyUnsupportedBeforeM5(vmName: String)
     case guestAgentNotConnected(vmName: String, state: String)
     case liveGuestSyncFailed(vmName: String, operation: String, detail: String)
-    case liveRestoreNotImplemented(vmName: String, state: String)
+    case restoreOperationFailed(
+        vmName: String,
+        targetSnapshotID: SnapshotID,
+        stage: RestoreFailureStage,
+        underlyingErrorCode: String,
+        detail: String,
+        outcome: RestoreFailureOutcomeState
+    )
     case guestVsockConnectTimedOut(
         vmName: String,
         port: UInt32,
@@ -373,7 +394,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .airgapPolicyUnsupportedBeforeM5: return "ERR_AIRGAP_UNSUPPORTED"
         case .guestAgentNotConnected: return "ERR_GUEST_AGENT_UNAVAILABLE"
         case .liveGuestSyncFailed: return "ERR_GUEST_SYNC_FAILED"
-        case .liveRestoreNotImplemented: return "ERR_LIVE_RESTORE_UNIMPLEMENTED"
+        case .restoreOperationFailed: return "ERR_RESTORE_FAILED"
         case .guestVsockConnectTimedOut: return "ERR_VSOCK_CONNECT_TIMEOUT"
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
         case .vmNotFound: return "ERR_VM_NOT_FOUND"
@@ -514,10 +535,32 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "对运行中的虚拟机「\(vmName)」执行「\(operation)」前，经客户机代理执行 sync 失败；未暂停虚拟机，未创建任何克隆（\(detail)）。"
                 : "Guest 'sync' via guestd failed before live '\(operation)' on running VM '\(vmName)'; the VM was not paused and nothing was cloned (\(detail))."
-        case let .liveRestoreNotImplemented(vmName, state):
-            return isZh
-                ? "虚拟机「\(vmName)」当前正在运行（状态「\(state)」），运行中的快照回滚尚未实现；请先运行 'agentvm halt \(vmName)' 停机后再执行回滚。"
-                : "Restoring a snapshot while VM '\(vmName)' is running (state '\(state)') is not implemented yet; stop the VM with 'agentvm halt \(vmName)' before restoring."
+        case let .restoreOperationFailed(vmName, targetSnapshotID, stage, underlyingErrorCode, detail, outcome):
+            let stageZh: String
+            switch stage {
+            case .halt: stageZh = "关机（halt）"
+            case .preRestoreSnapshot: stageZh = "保存回滚前快照"
+            case .diskSwap: stageZh = "替换根磁盘"
+            case .reboot: stageZh = "启动（up）"
+            }
+            switch outcome {
+            case .stoppedOriginalDiskUntouched:
+                return isZh
+                    ? "将虚拟机「\(vmName)」恢复至快照 \(targetSnapshotID.rawValue) 时在「\(stageZh)」阶段失败（[\(underlyingErrorCode)] \(detail)）；未替换根磁盘，虚拟机保持已停止状态。"
+                    : "Restore of VM '\(vmName)' to snapshot \(targetSnapshotID.rawValue) failed during '\(stage.rawValue)' ([\(underlyingErrorCode)] \(detail)); root disk was not replaced and VM '\(vmName)' remains stopped."
+            case .restartedOnOriginalDisk:
+                return isZh
+                    ? "将运行中的虚拟机「\(vmName)」恢复至快照 \(targetSnapshotID.rawValue) 时在「\(stageZh)」阶段失败（[\(underlyingErrorCode)] \(detail)）；未替换根磁盘，已使用原根磁盘重新启动「\(vmName)」并恢复客户机代理连接。"
+                    : "Live restore of VM '\(vmName)' to snapshot \(targetSnapshotID.rawValue) failed during '\(stage.rawValue)' ([\(underlyingErrorCode)] \(detail)); root disk was not replaced and VM '\(vmName)' was restarted on its original disk."
+            case let .stoppedOriginalDiskRebootFailed(rebootDetail):
+                return isZh
+                    ? "将运行中的虚拟机「\(vmName)」恢复至快照 \(targetSnapshotID.rawValue) 时在「\(stageZh)」阶段失败（[\(underlyingErrorCode)] \(detail)），随后使用原根磁盘重启也失败（\(rebootDetail)）；未替换根磁盘，虚拟机现已停止并释放锁。"
+                    : "Live restore of VM '\(vmName)' to snapshot \(targetSnapshotID.rawValue) failed during '\(stage.rawValue)' ([\(underlyingErrorCode)] \(detail)), and restarting on the original disk also failed (\(rebootDetail)); root disk was not replaced and VM '\(vmName)' is now stopped."
+            case let .stoppedAfterDiskRestored(preSnapID):
+                return isZh
+                    ? "已将虚拟机「\(vmName)」根磁盘恢复至快照 \(targetSnapshotID.rawValue)（回滚前快照：\(preSnapID.rawValue)），但重新启动失败（[\(underlyingErrorCode)] \(detail)）；虚拟机现已停止并释放锁。"
+                    : "Restored root disk of VM '\(vmName)' to snapshot \(targetSnapshotID.rawValue) (pre-restore snapshot: \(preSnapID.rawValue)), but booting failed ([\(underlyingErrorCode)] \(detail)); VM '\(vmName)' is now stopped."
+            }
         case let .guestVsockConnectTimedOut(vmName, port, timeoutSeconds, consoleLogPath, detail):
             return isZh
                 ? "虚拟机「\(vmName)」已启动，但在 \(timeoutSeconds) 秒内未能连上客户机 vsock 端口 \(port)（\(detail)），已停止虚拟机。串口日志：\(consoleLogPath)"
@@ -685,8 +728,13 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return "Start the VM first with 'agentvm up \(vmName)'."
         case let .liveGuestSyncFailed(vmName, _, _):
             return "Check guest agent and disk health inside '\(vmName)' (e.g. 'agentvm exec \(vmName) -- sync'), or stop the VM with 'agentvm halt \(vmName)' first."
-        case let .liveRestoreNotImplemented(vmName, _):
-            return "Stop the VM first with 'agentvm halt \(vmName)', then run 'agentvm restore <snapshot-id>'."
+        case let .restoreOperationFailed(vmName, _, _, _, _, outcome):
+            switch outcome {
+            case .stoppedOriginalDiskUntouched, .restartedOnOriginalDisk:
+                return "Inspect workspace disk/snapshots permissions and free space, then retry 'agentvm restore <snapshot-id>'."
+            case .stoppedOriginalDiskRebootFailed, .stoppedAfterDiskRestored:
+                return "Inspect workspace configuration or serial console log, then run 'agentvm up \(vmName)'."
+            }
         case .execOutputBufferOverflow:
             return "Drain stdout/stderr from 'agentvm exec' continuously or redirect large outputs to a file inside the guest."
         default:

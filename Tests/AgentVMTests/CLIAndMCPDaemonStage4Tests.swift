@@ -977,9 +977,9 @@ struct CLIAndMCPDaemonStage4Tests {
         }
     }
 
-    // MARK: - Item 5 (A44 & Plugins): Secret Leak Veto Active, Auto-Checkpoint Skipped on Daemon VM with M3 Diagnostic, `onTelemetry` Unwired
+    // MARK: - Item 5 (A44 & Plugins): Secret Leak Veto Active, Auto-Checkpoint Captures Live Snapshot on Daemon VM in M3, `onTelemetry` Unwired
 
-    @Test("Item 5 (A44): daemon 'exec' vetoes inline secrets via secret-leak-guard, skips pre-destructive auto-checkpoint on hardware VM writing M3 diagnostic each time, and never invokes onTelemetry")
+    @Test("Item 5 (A44): daemon 'exec' vetoes inline secrets via secret-leak-guard, captures live autoPreCommandCheckpoint on hardware VM without writing AUTO_CHECKPOINT_SKIPPED_UNTIL_M3, and never invokes onTelemetry")
     func daemonExecPluginsVetoInlineSecretsSkipAutoCheckpointWithM3DiagnosticAndNeverCallOnTelemetry() async throws {
         let realBase = try makePrivateTmpDirectory(prefix: "avm-s4-i5")
         defer { try? FileManager.default.removeItem(atPath: realBase) }
@@ -1074,8 +1074,9 @@ struct CLIAndMCPDaemonStage4Tests {
             #expect(vetoRes.stderr.contains("GitHub PAT"))
             #expect(mockBackend.execCount == 0, "Vetoed secret-leaking command must never reach guest")
 
-            // 2. Destructive commands (`rm -rf`, `apt-get install`) execute WITHOUT creating snapshots on running daemon VM,
-            //    and EACH skipped checkpoint writes a diagnostic mentioning M3 (in both English and Chinese).
+            // 2. M3 Item 8 (Decided Item 6a, A44): Destructive commands (`rm -rf`, `apt-get install`) capture live guest-synced
+            //    `autoPreCommandCheckpoint` snapshots before executing on the running daemon VM, record `VM_PAUSED_FOR_SNAPSHOT`,
+            //    and never emit `AUTO_CHECKPOINT_SKIPPED_UNTIL_M3`.
             let rmRes = await cli.execute(
                 arguments: ["--lang", "en", "--workspace", wsURL.path, "exec", "t1", "--", "rm", "-rf", "/workspace/tmp"],
                 curatedEntriesOverride: [entry],
@@ -1093,14 +1094,18 @@ struct CLIAndMCPDaemonStage4Tests {
             )
             #expect(aptRes.exitCode == 0)
             #expect(aptRes.stdout == "apt-done\n")
-            #expect(mockBackend.execCount == 2)
+            // 2 guest `/bin/sync` frames + 2 user destructive command frames (`rm`, `apt-get`) = 4 exec frames
+            #expect(mockBackend.execCount == 4)
 
             let snapsAfter = try await server.coordinator.store.listSnapshots(forVM: vmID)
-            #expect(snapsAfter.count == snapsBefore.count, "Auto-checkpoint must NOT capture snapshots on running hardware VM before M3")
-            #expect(snapsAfter.allSatisfy { $0.kind != .autoPreCommandCheckpoint })
+            #expect(snapsAfter.count == snapsBefore.count + 2, "Auto-checkpoint must capture one live snapshot before each destructive command in M3")
+            let autoSnaps = snapsAfter.filter { $0.kind == .autoPreCommandCheckpoint }
+            #expect(autoSnaps.count == 2)
+            #expect(autoSnaps.allSatisfy { $0.memoryStatePath == nil && $0.memoryStateBytes == 0 })
 
             let history = try await server.coordinator.store.listExecResults(limit: 10)
-            #expect(history.allSatisfy { $0.preCheckpointSnapshotID == nil })
+            #expect(history.count == 2)
+            #expect(Set(history.compactMap(\.preCheckpointSnapshotID)) == Set(autoSnaps.map(\.id)))
 
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
@@ -1114,10 +1119,9 @@ struct CLIAndMCPDaemonStage4Tests {
             #expect(eventsEnRes.exitCode == 0)
             let eventsEn = try decoder.decode([DiagnosticEvent].self, from: Data(eventsEnRes.stdout.utf8))
             let skipDiagsEn = eventsEn.filter { $0.code == "AUTO_CHECKPOINT_SKIPPED_UNTIL_M3" }
-            #expect(skipDiagsEn.count == 2, "Each skipped pre-destructive checkpoint must append one diagnostic (expected 2, got \(skipDiagsEn.count))")
-            #expect(skipDiagsEn.allSatisfy { $0.message.contains("M3") })
-            #expect(skipDiagsEn.contains { $0.message.contains("rm -rf /workspace/tmp") })
-            #expect(skipDiagsEn.contains { $0.message.contains("apt-get install -y jq") })
+            #expect(skipDiagsEn.isEmpty, "M3 must never emit AUTO_CHECKPOINT_SKIPPED_UNTIL_M3")
+            let pauseDiagsEn = eventsEn.filter { $0.code == "VM_PAUSED_FOR_SNAPSHOT" }
+            #expect(pauseDiagsEn.count == 2)
 
             let eventsZhRes = await cli.execute(
                 arguments: ["--lang", "zh", "--workspace", wsURL.path, "events", "--vm", "t1", "--json"],
@@ -1128,8 +1132,9 @@ struct CLIAndMCPDaemonStage4Tests {
             #expect(eventsZhRes.exitCode == 0)
             let eventsZh = try decoder.decode([DiagnosticEvent].self, from: Data(eventsZhRes.stdout.utf8))
             let skipDiagsZh = eventsZh.filter { $0.code == "AUTO_CHECKPOINT_SKIPPED_UNTIL_M3" }
-            #expect(skipDiagsZh.count == 2)
-            #expect(skipDiagsZh.allSatisfy { $0.message.contains("M3") })
+            #expect(skipDiagsZh.isEmpty)
+            let pauseDiagsZh = eventsZh.filter { $0.code == "VM_PAUSED_FOR_SNAPSHOT" }
+            #expect(pauseDiagsZh.count == 2)
 
             // 3. `onTelemetry` hook is NOT wired in M2: even after high-uptime heartbeats and `ps`, runaway-budget-breaker has 0 invocations and VM stays running.
             let psRes = await cli.execute(

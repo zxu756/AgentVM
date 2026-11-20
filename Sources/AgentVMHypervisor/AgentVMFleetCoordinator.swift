@@ -3360,7 +3360,10 @@ public actor AgentVMFleetCoordinator {
         kind: SnapshotKind? = nil,
         branchName: String? = nil,
         isPinned: Bool = false,
-        triggerCommand: String? = nil
+        triggerCommand: String? = nil,
+        tags: [String] = [],
+        requireLiveHardwareBox: Bool = false,
+        language: AppLanguage = .en
     ) async throws -> LiveDaemonSnapshotResult {
         try await enqueueVMLifecycleOperation(for: vmID) {
             try await self.captureSnapshotInDaemonUnlocked(
@@ -3370,7 +3373,10 @@ public actor AgentVMFleetCoordinator {
                 kind: kind,
                 branchName: branchName,
                 isPinned: isPinned,
-                triggerCommand: triggerCommand
+                triggerCommand: triggerCommand,
+                tags: tags,
+                requireLiveHardwareBox: requireLiveHardwareBox,
+                language: language
             )
         }
     }
@@ -3382,12 +3388,22 @@ public actor AgentVMFleetCoordinator {
         kind: SnapshotKind?,
         branchName: String?,
         isPinned: Bool,
-        triggerCommand: String?
+        triggerCommand: String?,
+        tags: [String],
+        requireLiveHardwareBox: Bool,
+        language: AppLanguage
     ) async throws -> LiveDaemonSnapshotResult {
         guard let existing = try await store.fetchVM(vmID) else {
             throw AgentVMError.vmNotFound(vmID)
         }
         guard let box = hardwareBoxes[vmID] else {
+            if requireLiveHardwareBox {
+                throw AgentVMError.execRequiresRunningVM(
+                    vmName: existing.spec.name,
+                    vmID: vmID,
+                    currentState: existing.telemetry.state == .running ? .stopped : existing.telemetry.state
+                )
+            }
             let fallback = try await captureSnapshotReportingStrategy(
                 vmID: vmID,
                 title: title,
@@ -3499,7 +3515,8 @@ public actor AgentVMFleetCoordinator {
                 specSnapshot: latestRecord.spec,
                 agentActor: latestRecord.spec.agentOwnerTag,
                 triggerCommand: triggerCommand,
-                isPinned: isPinned
+                isPinned: isPinned,
+                tags: tags
             )
 
             latestRecord.currentHeadSnapshotID = snapID
@@ -3536,7 +3553,7 @@ public actor AgentVMFleetCoordinator {
                 subsystem: "Hypervisor",
                 vmID: vmID,
                 code: "VM_PAUSED_FOR_SNAPSHOT",
-                message: enMsg,
+                message: (language == .zhHans) ? zhMsg : enMsg,
                 metadata: [
                     "vmName": latestRecord.spec.name,
                     "operation": "snapshot",
@@ -4338,7 +4355,7 @@ public actor AgentVMFleetCoordinator {
         )
         var record = try await loadVMForOperation(vmID)
         if record.telemetry.state != .running {
-            _ = try await bootPersistentVM(vmID)
+            record = try await bootPersistentVM(vmID)
         } else if executionBackend == .deterministicSimulation && vsockSessions[vmID] == nil {
             // Only the explicit simulation backend may answer with the simulated responder. A `running`
             // record under the hardware backend with no live session falls through to ERR_GUEST_AGENT_UNAVAILABLE.
@@ -4353,19 +4370,19 @@ public actor AgentVMFleetCoordinator {
             }
         }
 
-        // Dispatch JavaScriptCore pre-exec plugins (Secret Leak Veto + Auto Pre-Destructive Checkpoint)
-        let preCheckpointID = try await evaluateBeforeExecPlugins(
-            for: record,
-            request: request,
-            language: .en
-        )
-
         guard let session = vsockSessions[vmID] else {
             throw AgentVMError.guestAgentNotConnected(
                 vmName: record.spec.name,
                 state: record.telemetry.state.rawValue
             )
         }
+
+        // Dispatch JavaScriptCore pre-exec plugins (Secret Leak Veto + Auto Pre-Destructive Checkpoint)
+        let preCheckpointID = try await evaluateBeforeExecPlugins(
+            for: record,
+            request: request,
+            language: .en
+        )
 
         let tty = ensureTerminalBuffer(for: vmID)
         tty.feed("\(request.commandLineSummary)\r\n")
@@ -4497,26 +4514,55 @@ public actor AgentVMFleetCoordinator {
                 )
                 return snap.id
             }
-            // Decided Item 2 (a) / Fixes A44: on running hardware VMs (daemon-held machines), skip pre-destructive
-            // auto-checkpoint and append a diagnostic explaining consistent live snapshots are scheduled for M3.
-            let zhMsg = "已在运行中的虚拟机「\(record.spec.name)」上跳过破坏性命令前的自动检查点（\(reason)）：运行中做一致快照将在 M3 实现（命令：\(request.commandLineSummary)）。"
-            let enMsg = "Skipped pre-destructive auto-checkpoint (\(reason)) on running VM '\(record.spec.name)': consistent live snapshots while running are scheduled for M3 (command: \(request.commandLineSummary))."
-            try await store.appendDiagnostic(DiagnosticEvent(
-                severity: .notice,
-                subsystem: "PluginHost",
-                vmID: record.id,
-                code: "AUTO_CHECKPOINT_SKIPPED_UNTIL_M3",
-                message: (language == .zhHans) ? zhMsg : enMsg,
-                metadata: [
-                    "vmName": record.spec.name,
-                    "reason": reason,
-                    "commandLine": request.commandLineSummary,
-                    "milestone": "M3",
-                    "message_zh": zhMsg,
-                    "message_en": enMsg
-                ]
-            ))
-            return nil
+            // M3 Item 8 (Decided Item 6a, Fixes A44): capture a live guest-synced disk-only checkpoint
+            // (`sync` -> `pause` -> `clonefile` -> `resume`, recording `autoPreCommandCheckpoint` and `VM_PAUSED_FOR_SNAPSHOT`).
+            // If snapshot capture fails, `captureSnapshotInDaemon` guarantees `resume()` ran first; proceed with guest
+            // command execution and append a diagnostic explaining the failure reason.
+            do {
+                let liveSnap = try await captureSnapshotInDaemon(
+                    vmID: record.id,
+                    title: reason,
+                    notes: "Live guest-synced pre-exec checkpoint",
+                    kind: .autoPreCommandCheckpoint,
+                    triggerCommand: request.commandLineSummary,
+                    tags: ["live-disk"],
+                    requireLiveHardwareBox: true,
+                    language: language
+                )
+                return liveSnap.snapshot.id
+            } catch {
+                let errorCode: String
+                let enDetail: String
+                let zhDetail: String
+                if let avmErr = error as? AgentVMError {
+                    errorCode = avmErr.errorCode
+                    enDetail = avmErr.localizedMessage(in: .en)
+                    zhDetail = avmErr.localizedMessage(in: .zhHans)
+                } else {
+                    errorCode = "ERR_AUTO_CHECKPOINT_CAPTURE"
+                    enDetail = error.localizedDescription
+                    zhDetail = error.localizedDescription
+                }
+                let enMsg = "Failed to capture pre-destructive auto-checkpoint (\(reason)) on running VM '\(record.spec.name)' before executing '\(request.commandLineSummary)': [\(errorCode)] \(enDetail). Proceeding with command execution without pre-command checkpoint."
+                let zhMsg = "在运行中的虚拟机「\(record.spec.name)」上执行「\(request.commandLineSummary)」前捕获破坏性命令自动检查点（\(reason)）失败：[\(errorCode)] \(zhDetail)。将继续执行该客户机命令（未生成前置检查点）。"
+                try? await store.appendDiagnostic(DiagnosticEvent(
+                    severity: .warning,
+                    subsystem: "PluginHost",
+                    vmID: record.id,
+                    code: "AUTO_CHECKPOINT_CAPTURE_FAILED",
+                    message: (language == .zhHans) ? zhMsg : enMsg,
+                    metadata: [
+                        "vmName": record.spec.name,
+                        "reason": reason,
+                        "commandLine": request.commandLineSummary,
+                        "errorCode": errorCode,
+                        "error": enDetail,
+                        "message_zh": zhMsg,
+                        "message_en": enMsg
+                    ]
+                ))
+                return nil
+            }
         }
     }
 

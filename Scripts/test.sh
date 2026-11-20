@@ -54,6 +54,7 @@ map_module_to_filters() {
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
+            echo "M3Stage4AutoCheckpointTests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
@@ -65,6 +66,7 @@ map_module_to_filters() {
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
+            echo "M3Stage4AutoCheckpointTests"
             ;;
         AgentVMStorageCoW|StorageCoW)
             echo "StorageCoWIsoAndGPTTests"
@@ -74,6 +76,7 @@ map_module_to_filters() {
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
+            echo "M3Stage4AutoCheckpointTests"
             ;;
         AgentVMNetSwitch|NetSwitch)
             echo "NetSwitchDissectorAndPCAPTests"
@@ -87,10 +90,12 @@ map_module_to_filters() {
             echo "M3Stage2aChildIdentityTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
+            echo "M3Stage4AutoCheckpointTests"
             ;;
         AgentVMPluginHost|PluginHost)
             echo "PluginSandboxAndIACTests"
             echo "CLIAndMCPDaemonStage4Tests"
+            echo "M3Stage4AutoCheckpointTests"
             ;;
         AgentVMHypervisor|Hypervisor)
             echo "HypervisorCoordinatorTests"
@@ -104,6 +109,7 @@ map_module_to_filters() {
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
+            echo "M3Stage4AutoCheckpointTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -121,6 +127,7 @@ map_module_to_filters() {
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
+            echo "M3Stage4AutoCheckpointTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -145,6 +152,7 @@ map_module_to_filters() {
             echo "M3Stage2bLocksAndBranchBootTests"
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
+            echo "M3Stage4AutoCheckpointTests"
             ;;
         *)
             echo "ERROR: Unknown module '$mod'" >&2

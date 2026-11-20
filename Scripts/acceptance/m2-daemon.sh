@@ -2062,30 +2062,84 @@ PY
     fi
 
     # --------------------------------------------------------------
-    # Row 23: While `t1` is running, `snapshot t1` and `restore <t1 snapshot>`
-    #   Expect: both exit 1 with ERR_VM_LOCKED mentioning M3; t1 root disk inode unchanged; boot_id unchanged.
+    # Row 23 (updated per 01-agentvm.md M3 Item 6, Row 15, Item 9 & Fact 33):
+    #   While `t1` is running:
+    #   1) `snapshot t1` exits 0 via daemon live-disk snapshot; root disk inode and boot_id stay unchanged.
+    #   2) Delete `/root/r23_marker` inside `t1`, then `restore <s1>`: exits 0, stdout prints the auto-saved
+    #      pre-restore snapshot ID (`auto: before restore <s1>`), `t1` is running with guestAgentConnected=true,
+    #      boot_id changed, and `/root/r23_marker` is restored with matching content.
     # --------------------------------------------------------------
     ROW_START_SEC="$(now_sec)"
+    T1_POST_R23_BOOT_ID="$R11_BOOT_ID"
+    r23_vz_before="$T1_VZ_PID"
+    r23_marker="m3-r23-marker-$$-$(now_sec)"
+    run_cli "$TMP_ROOT/r23-mk.out" "$TMP_ROOT/r23-mk.err" --lang en --workspace "$WS" exec t1 -- sh -c "printf '%s' '$r23_marker' > /root/r23_marker && sync"
+    r23_mk_rc=$LAST_RC
+
     r23_ino_before=""
     if [[ -n "$T1_DISK_PATH" && -f "$T1_DISK_PATH" ]]; then
         r23_ino_before="$(stat -f '%i' "$T1_DISK_PATH" 2>/dev/null || true)"
     fi
 
-    run_cli "$TMP_ROOT/r23-snap.out" "$TMP_ROOT/r23-snap.err" --lang en --workspace "$WS" snapshot t1
+    run_cli "$TMP_ROOT/r23-snap.out" "$TMP_ROOT/r23-snap.err" --lang en --workspace "$WS" snapshot t1 m3-r23-s1
     r23_snap_rc=$LAST_RC
+    r23_snap_out="$(cat "$TMP_ROOT/r23-snap.out")"
     r23_snap_err="$(cat "$TMP_ROOT/r23-snap.err")"
+    r23_s1_id="$(printf '%s\n' "$r23_snap_out" | grep -oE 'snap-[0-9a-f]+' | head -n 1 || true)"
 
-    r23_restore_rc=99
-    r23_restore_err=""
-    if [[ -n "$T1_SNAP_ID" ]]; then
-        run_cli "$TMP_ROOT/r23-restore.out" "$TMP_ROOT/r23-restore.err" --lang en --workspace "$WS" restore "$T1_SNAP_ID"
-        r23_restore_rc=$LAST_RC
-        r23_restore_err="$(cat "$TMP_ROOT/r23-restore.err")"
+    r23_ino_after_snap=""
+    if [[ -n "$T1_DISK_PATH" && -f "$T1_DISK_PATH" ]]; then
+        r23_ino_after_snap="$(stat -f '%i' "$T1_DISK_PATH" 2>/dev/null || true)"
     fi
 
-    r23_ino_after=""
-    if [[ -n "$T1_DISK_PATH" && -f "$T1_DISK_PATH" ]]; then
-        r23_ino_after="$(stat -f '%i' "$T1_DISK_PATH" 2>/dev/null || true)"
+    run_cli "$TMP_ROOT/r23-boot-snap.out" "$TMP_ROOT/r23-boot-snap.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r23_boot_snap_rc=$LAST_RC
+    r23_boot_after_snap="$(tr -d '[:space:]' < "$TMP_ROOT/r23-boot-snap.out" 2>/dev/null || true)"
+    r23_vz_after_snap="$(list_extra_vz_pids)"
+
+    run_cli "$TMP_ROOT/r23-rm.out" "$TMP_ROOT/r23-rm.err" --lang en --workspace "$WS" exec t1 -- sh -c 'rm -f /root/r23_marker && test ! -e /root/r23_marker'
+    r23_rm_rc=$LAST_RC
+
+    r23_restore_rc=99
+    r23_restore_out=""
+    r23_restore_err=""
+    r23_auto_snap_id=""
+    if [[ -n "$r23_s1_id" ]]; then
+        run_cli "$TMP_ROOT/r23-restore.out" "$TMP_ROOT/r23-restore.err" --lang en --workspace "$WS" restore "$r23_s1_id"
+        r23_restore_rc=$LAST_RC
+        r23_restore_out="$(cat "$TMP_ROOT/r23-restore.out")"
+        r23_restore_err="$(cat "$TMP_ROOT/r23-restore.err")"
+        r23_auto_snap_id="$(
+            /usr/bin/python3 - "$r23_restore_out" "$r23_s1_id" <<'PY'
+import re, sys
+
+out = sys.argv[1]
+target = sys.argv[2]
+cands = [m for m in re.findall(r"snap-[0-9a-f]+", out) if m != target]
+if not cands:
+    sys.exit(1)
+print(cands[-1])
+PY
+        )" || r23_auto_snap_id=""
+    fi
+
+    r23_snaplist_ok=0
+    if [[ -n "$r23_s1_id" && -n "$r23_auto_snap_id" ]]; then
+        run_cli "$TMP_ROOT/r23-snaps.json" "$TMP_ROOT/r23-snaps.err" --lang en --workspace "$WS" snapshot list --json
+        if [[ $LAST_RC -eq 0 ]]; then
+            /usr/bin/python3 - "$TMP_ROOT/r23-snaps.json" "$r23_s1_id" "$r23_auto_snap_id" <<'PY' && r23_snaplist_ok=1 || r23_snaplist_ok=0
+import json, sys
+
+snaps = json.load(open(sys.argv[1], encoding="utf-8"))
+s1_id, auto_id = sys.argv[2], sys.argv[3]
+s1 = [s for s in snaps if s.get("id") == s1_id]
+auto = [s for s in snaps if s.get("id") == auto_id]
+if len(s1) != 1 or s1[0].get("kind") != "live-disk":
+    sys.exit(1)
+if len(auto) != 1 or auto[0].get("title") != f"auto: before restore {s1_id}":
+    sys.exit(1)
+PY
+        fi
     fi
 
     run_cli "$TMP_ROOT/r23-ps.json" "$TMP_ROOT/r23-ps.err" --lang en --workspace "$WS" ps --json
@@ -2105,28 +2159,57 @@ if tel.get("state") != "running" or tel.get("guestAgentConnected") is not True:
 PY
     fi
 
-    run_cli "$TMP_ROOT/r23-boot.out" "$TMP_ROOT/r23-boot.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
-    r23_boot_rc=$LAST_RC
-    r23_boot_id="$(tr -d '[:space:]' < "$TMP_ROOT/r23-boot.out" 2>/dev/null || true)"
+    run_cli "$TMP_ROOT/r23-boot-after.out" "$TMP_ROOT/r23-boot-after.err" --lang en --workspace "$WS" exec t1 -- cat /proc/sys/kernel/random/boot_id
+    r23_boot_after_rc=$LAST_RC
+    r23_boot_after_restore=""
+    r23_boot_changed_ok=0
+    if [[ $r23_boot_after_rc -eq 0 ]]; then
+        r23_boot_after_restore="$(
+            /usr/bin/python3 - "$TMP_ROOT/r23-boot-after.out" "$R11_BOOT_ID" <<'PY'
+import re, sys
 
-    r23_extra_vz="$(list_extra_vz_pids)"
+new_id = open(sys.argv[1], encoding="utf-8").read().strip()
+old_id = sys.argv[2].strip()
+uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+if not new_id or not old_id or not uuid_re.match(new_id) or new_id == old_id:
+    sys.exit(1)
+print(new_id)
+PY
+        )" && r23_boot_changed_ok=1 || r23_boot_changed_ok=0
+    fi
 
-    if [[ $r23_snap_rc -eq 1 && "$r23_snap_err" == *"ERR_VM_LOCKED"* && "$r23_snap_err" == *"M3"* \
-        && $r23_restore_rc -eq 1 && "$r23_restore_err" == *"ERR_VM_LOCKED"* && "$r23_restore_err" == *"M3"* \
-        && -n "$r23_ino_before" && "$r23_ino_before" == "$r23_ino_after" \
-        && $r23_t1_running -eq 1 && $r23_boot_rc -eq 0 \
-        && -n "$R11_BOOT_ID" && "$r23_boot_id" == "$R11_BOOT_ID" \
-        && -n "$T1_VZ_PID" && "$r23_extra_vz" == "$T1_VZ_PID" ]]; then
-        pass_row 23 "'snapshot t1' and 'restore $T1_SNAP_ID' both exited 1 with ERR_VM_LOCKED mentioning M3; disk inode unchanged ($r23_ino_after); boot_id unchanged ($r23_boot_id)."
+    run_cli "$TMP_ROOT/r23-marker.out" "$TMP_ROOT/r23-marker.err" --lang en --workspace "$WS" exec t1 -- cat /root/r23_marker
+    r23_marker_rc=$LAST_RC
+    r23_marker_after="$(cat "$TMP_ROOT/r23-marker.out" 2>/dev/null || true)"
+
+    r23_extra_vz_after="$(list_extra_vz_pids)"
+    r23_extra_vz_after_count="$(count_lines_nonempty "$r23_extra_vz_after")"
+    if [[ "$r23_extra_vz_after_count" == "1" ]]; then
+        T1_VZ_PID="$r23_extra_vz_after"
+    fi
+    if [[ $r23_boot_changed_ok -eq 1 && -n "$r23_boot_after_restore" ]]; then
+        T1_POST_R23_BOOT_ID="$r23_boot_after_restore"
+    fi
+
+    if [[ $r23_mk_rc -eq 0 && $r23_snap_rc -eq 0 && -n "$r23_s1_id" \
+        && -n "$r23_ino_before" && "$r23_ino_before" == "$r23_ino_after_snap" \
+        && $r23_boot_snap_rc -eq 0 && -n "$R11_BOOT_ID" && "$r23_boot_after_snap" == "$R11_BOOT_ID" \
+        && -n "$r23_vz_before" && "$r23_vz_after_snap" == "$r23_vz_before" \
+        && $r23_rm_rc -eq 0 \
+        && $r23_restore_rc -eq 0 && -n "$r23_auto_snap_id" && $r23_snaplist_ok -eq 1 \
+        && $r23_t1_running -eq 1 && $r23_boot_changed_ok -eq 1 \
+        && $r23_marker_rc -eq 0 && "$r23_marker_after" == "$r23_marker" \
+        && "$r23_extra_vz_after_count" == "1" ]]; then
+        pass_row 23 "live 'snapshot t1' exited 0 ($r23_s1_id, live-disk, boot_id unchanged=$r23_boot_after_snap); live 'restore $r23_s1_id' exited 0 (auto snapshot=$r23_auto_snap_id), t1 running & guestAgentConnected=true, boot_id changed ($r23_boot_after_restore), /root/r23_marker restored."
     else
-        fail_row 23 "snap_rc=$r23_snap_rc, restore_rc=$r23_restore_rc, ino='$r23_ino_before'->'$r23_ino_after', t1_running=$r23_t1_running, boot_rc=$r23_boot_rc, boot_id='$r23_boot_id' (expected '$R11_BOOT_ID'), extra_vz='${r23_extra_vz//$'\n'/,}'"
+        fail_row 23 "mk=$r23_mk_rc, snap=$r23_snap_rc (id='$r23_s1_id', err='$r23_snap_err'), ino='$r23_ino_before'->'$r23_ino_after_snap', boot_snap='$r23_boot_after_snap' (expected '$R11_BOOT_ID'), rm=$r23_rm_rc, restore=$r23_restore_rc (auto='$r23_auto_snap_id', snaplist=$r23_snaplist_ok, err='$r23_restore_err'), running=$r23_t1_running, boot_changed=$r23_boot_changed_ok ('$r23_boot_after_restore'), marker_rc=$r23_marker_rc, vz_count=$r23_extra_vz_after_count"
     fi
 
     # --------------------------------------------------------------
     # Row 24: `pause t1`; `exec t1 -- true`; `resume t1`; `exec t1 -- cat /proc/sys/kernel/random/boot_id`
     #   Expect: `pause` exits 0, `ps --json` is paused, after 15s telemetry is '—';
     #           `exec` while paused exits 125 (ERR_LIFECYCLE_STATE, hints resume);
-    #           `resume` exits 0; boot_id equals Row 11.
+    #           `resume` exits 0; boot_id equals active pre-pause boot_id (post-Row-23 live restore per 01-agentvm.md M3).
     # --------------------------------------------------------------
     ROW_START_SEC="$(now_sec)"
     run_cli "$TMP_ROOT/r24-pause.out" "$TMP_ROOT/r24-pause.err" --lang en --workspace "$WS" pause t1
@@ -2201,10 +2284,10 @@ PY
         && "$r24_exec_paused_err" == *"paused"* \
         && "$r24_exec_paused_err" == *"resume"* \
         && $r24_resume_rc -eq 0 && $r24_boot_rc -eq 0 \
-        && -n "$R11_BOOT_ID" && "$r24_boot_id" == "$R11_BOOT_ID" ]]; then
+        && -n "$T1_POST_R23_BOOT_ID" && "$r24_boot_id" == "$T1_POST_R23_BOOT_ID" ]]; then
         pass_row 24 "'pause t1' exited 0; ps --json=paused & >15s telemetry='—'; 'exec t1 -- true' exited 125 (ERR_LIFECYCLE_STATE + resume hint); 'resume t1' exited 0; boot_id unchanged ($r24_boot_id)."
     else
-        fail_row 24 "pause=$r24_pause_rc, paused_ok=$r24_paused_ok, tel_dash=$r24_tel_dash_ok, exec_paused=$r24_exec_paused_rc, resume=$r24_resume_rc, boot_rc=$r24_boot_rc, boot_id='$r24_boot_id' (expected '$R11_BOOT_ID'), exec_err='$r24_exec_paused_err'"
+        fail_row 24 "pause=$r24_pause_rc, paused_ok=$r24_paused_ok, tel_dash=$r24_tel_dash_ok, exec_paused=$r24_exec_paused_rc, resume=$r24_resume_rc, boot_rc=$r24_boot_rc, boot_id='$r24_boot_id' (expected '$T1_POST_R23_BOOT_ID'), exec_err='$r24_exec_paused_err'"
     fi
 
     # --------------------------------------------------------------

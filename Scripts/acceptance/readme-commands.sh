@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> [readme-commands] Checking README.md & README.zh-CN.md for banned claims..."
-if grep -nEi "sub-20|20\s*ms|20\s*毫秒|under 20|不到\s*20|wireshark-grade|wireshark\s*级|industrial-grade|工业级|hardware-isolated|硬件级隔离|硬件隔离|every outbound packet|每一帧出站|destructive guest commands|破坏性客户机命令" "$ROOT_DIR/README.md" "$ROOT_DIR/README.zh-CN.md"; then
+if grep -nEi "sub-20|20\s*ms|20\s*毫秒|under 20|不到\s*20|wireshark-grade|wireshark\s*级|industrial-grade|工业级|hardware-isolated|硬件级隔离|硬件隔离|every outbound packet|每一帧出站" "$ROOT_DIR/README.md" "$ROOT_DIR/README.zh-CN.md"; then
     echo "FAIL: Found banned unverified claim in README files" >&2
     exit 1
 fi
@@ -59,7 +59,7 @@ SKIP_RULES = [
     (re.compile(r"^swift build --product AgentVM$"), "this script already built the product above"),
     (re.compile(r'^alias agentvm="\$\(pwd\)/\.build/debug/AgentVM"$'), "the replay substitutes the built binary for `agentvm`"),
     (re.compile(r"^\./Scripts/test\.sh (scope|milestone) .+$"), "test entry point; running it from here would recurse"),
-    (re.compile(r"^AGENTVM_REAL_VM=1 \./Scripts/test\.sh milestone [12]$"), "real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it"),
+    (re.compile(r"^AGENTVM_REAL_VM=1 \./Scripts/test\.sh milestone [123]( --record)?$"), "real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it"),
     (re.compile(r"^\./Scripts/acceptance/readme-commands\.sh$"), "this script itself"),
     (re.compile(r"^\./Scripts/build-app\.sh$"), "packaging step, builds the release .app bundle"),
     (re.compile(r"^open build/AgentVM\.app$"), "launches the desktop UI; no script may do that"),

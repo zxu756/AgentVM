@@ -14,7 +14,7 @@ PASS [Row 2/14]: 'agentvm up a' exits non-zero with a fully localized no-bootabl
 PASS [Row 3/14]: 'agentvm doctor' runs a live clonefile(2) probe with zero '< 20ms' claims and zero temp leftovers.
 
 [Row 4/14] Running the full 'swift test' suite and checking repo root and ~/Library/Preferences...
-PASS [Row 4/14]: Test run with 164 tests in 12 suites passed; repo root unchanged, 0 stray SQLite files, 0 new AgentVM preference files in ~/Library/Preferences.
+PASS [Row 4/14]: Test run with 272 tests in 25 suites passed; repo root unchanged, 0 stray SQLite files, 0 new AgentVM preference files in ~/Library/Preferences.
 
 [Row 5/14] Verifying 'agentvm exec a -- uname -a' fails honestly with zero Linux strings (en & zh)...
 PASS [Row 5/14]: 'agentvm exec a -- uname -a' exits non-zero and emits zero Linux kernel strings.
@@ -25,27 +25,33 @@ PASS [Row 6/14]: Explicit '--backend simulation' outputs carry SIMULATED: prefix
 [Row 7/14] Running Scripts/acceptance/readme-commands.sh...
 ==> [readme-commands] Checking README.md & README.zh-CN.md for banned claims...
 PASS: Zero banned claims in README.md and README.zh-CN.md
-PASS: README.md and README.zh-CN.md list the same 25 commands
+PASS: README.md and README.zh-CN.md list the same 34 commands
 ==> [readme-commands] Replaying README.md
 SKIP (this script already built the product above): swift build --product AgentVM
 SKIP (the replay substitutes the built binary for `agentvm`): alias agentvm="$(pwd)/.build/debug/AgentVM"
 SKIP (test entry point; running it from here would recurse): ./Scripts/test.sh scope AgentVMStore AgentVMHypervisor AgentVMCLIAndMCP
 SKIP (this script itself): ./Scripts/acceptance/readme-commands.sh
 SKIP (test entry point; running it from here would recurse): ./Scripts/test.sh milestone 0
+SKIP (real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it): AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 1
+SKIP (real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it): AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 2
+SKIP (real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it): AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 3
 SKIP (packaging step, builds the release .app bundle): ./Scripts/build-app.sh
 SKIP (launches the desktop UI; no script may do that): open build/AgentVM.app
 SKIP (launches the desktop UI; no script may do that): ./build/AgentVM.app/Contents/MacOS/AgentVM --demo
-PASS: README.md: replayed 17 agentvm commands, checked 16 documented outputs, skipped 8 non-replayable lines
+PASS: README.md: replayed 23 agentvm commands, checked 22 documented outputs, skipped 11 non-replayable lines
 ==> [readme-commands] Replaying README.zh-CN.md
 SKIP (this script already built the product above): swift build --product AgentVM
 SKIP (the replay substitutes the built binary for `agentvm`): alias agentvm="$(pwd)/.build/debug/AgentVM"
 SKIP (test entry point; running it from here would recurse): ./Scripts/test.sh scope AgentVMStore AgentVMHypervisor AgentVMCLIAndMCP
 SKIP (this script itself): ./Scripts/acceptance/readme-commands.sh
 SKIP (test entry point; running it from here would recurse): ./Scripts/test.sh milestone 0
+SKIP (real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it): AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 1
+SKIP (real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it): AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 2
+SKIP (real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it): AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 3
 SKIP (packaging step, builds the release .app bundle): ./Scripts/build-app.sh
 SKIP (launches the desktop UI; no script may do that): open build/AgentVM.app
 SKIP (launches the desktop UI; no script may do that): ./build/AgentVM.app/Contents/MacOS/AgentVM --demo
-PASS: README.zh-CN.md: replayed 17 agentvm commands, checked 16 documented outputs, skipped 8 non-replayable lines
+PASS: README.zh-CN.md: replayed 23 agentvm commands, checked 22 documented outputs, skipped 11 non-replayable lines
 ALL README COMMAND CHECKS PASSED.
 PASS [Row 7/14]: readme-commands.sh replayed the commands extracted from README.md and README.zh-CN.md.
 

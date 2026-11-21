@@ -50,7 +50,7 @@ READMES = [("README.md", "en"), ("README.zh-CN.md", "zh")]
 CLI_SUBCOMMANDS = {
     "doctor", "init", "ps", "list", "image", "create", "run", "daemon", "events",
     "up", "boot", "start", "pause", "resume", "halt", "stop",
-    "branch", "fork", "snapshot", "restore", "exec", "pcap", "policy", "plugin", "export-hcl",
+    "branch", "fork", "snapshot", "restore", "exec", "forward", "pcap", "policy", "plugin", "export-hcl",
     "export-html", "help", "version",
 }
 
@@ -59,7 +59,10 @@ SKIP_RULES = [
     (re.compile(r"^swift build --product AgentVM$"), "this script already built the product above"),
     (re.compile(r'^alias agentvm="\$\(pwd\)/\.build/debug/AgentVM"$'), "the replay substitutes the built binary for `agentvm`"),
     (re.compile(r"^\./Scripts/test\.sh (scope|milestone) .+$"), "test entry point; running it from here would recurse"),
-    (re.compile(r"^AGENTVM_REAL_VM=1 \./Scripts/test\.sh milestone [123]( --record)?$"), "real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it"),
+    (re.compile(r"^AGENTVM_REAL_VM=1 \./Scripts/test\.sh milestone [1234]( --record)?$"), "real-VM acceptance entry point; it boots guests and downloads an image, so the README replay never runs it"),
+    (re.compile(r"^AGENTVM_REAL_VM=1 \./Scripts/acceptance/m4-agent\.sh( --record| --mutation [123])?$"), "real-VM M4 acceptance/mutation entry point; boots real guests"),
+    (re.compile(r'^agentvm --workspace \./relay-demo\.agentvm (create t1 --image debian-12-bookworm-arm64 --mount "\$PROJECT_DIR:/workspace"|up t1|halt t1)$'), "real-VM agent-relay example; exercised end-to-end by Scripts/acceptance/m4-agent.sh Row 12 under AGENTVM_REAL_VM=1"),
+    (re.compile(r'^~/\.agents/skills/agent-relay/scripts/relay\.sh verify "\$PROJECT_DIR" "run-tests-in-vm" -- agentvm --workspace \./relay-demo\.agentvm exec t1 -- .+$'), "real-VM agent-relay verify example; exercised end-to-end by Scripts/acceptance/m4-agent.sh Row 12 under AGENTVM_REAL_VM=1"),
     (re.compile(r"^\./Scripts/acceptance/readme-commands\.sh$"), "this script itself"),
     (re.compile(r"^\./Scripts/build-app\.sh$"), "packaging step, builds the release .app bundle"),
     (re.compile(r"^open build/AgentVM\.app$"), "launches the desktop UI; no script may do that"),
@@ -150,15 +153,15 @@ for name, _ in READMES:
     print(f"==> [readme-commands] Replaying {name}")
     for line_no, command, expectations in all_entries[name]:
         where = f"{name}:{line_no}"
-        if not command.startswith("agentvm "):
-            reason = next((why for pattern, why in SKIP_RULES if pattern.match(command)), None)
-            if reason is None:
-                fail(f"{where}: `{command}` is in a README code block but this script neither replays nor explicitly skips it")
+        reason = next((why for pattern, why in SKIP_RULES if pattern.match(command)), None)
+        if reason is not None:
             if expectations:
                 fail(f"{where}: `{command}` is skipped but has an expected-output line")
             print(f"SKIP ({reason}): {command}")
             skipped += 1
             continue
+        if not command.startswith("agentvm "):
+            fail(f"{where}: `{command}` is in a README code block but this script neither replays nor explicitly skips it")
 
         arguments = shlex.split(command)[1:]
         host_arguments = arguments[: arguments.index("--")] if "--" in arguments else arguments

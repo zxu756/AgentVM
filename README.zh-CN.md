@@ -2,11 +2,13 @@
 
 # AgentVM `v1.4.0`
 
-> 在 Mac 上给 coding agent 开真实的 Linux 虚拟机：`agentvm exec` 的输出来自客户机本身；分叉一台带数据的虚拟机用时 **32.49 毫秒**（停机分叉墙钟中位数；最近秩 95 分位 **58.26 毫秒**）、多占 **0 字节**（APFS 克隆私有字节）。
+> 在 Mac 上给 coding agent 开真实的 Linux 虚拟机：`agentvm exec` 与 MCP `agentvm_exec_command` 的输出来自客户机本身，VirtioFS 把宿主机项目目录共享进 `/workspace`，本地 TCP 端口经 `AF_VSOCK` 转发进客户机；分叉一台带数据的虚拟机用时 **32.49 毫秒**（停机分叉墙钟中位数；最近秩 95 分位 **58.26 毫秒**）、多占 **0 字节**（APFS 克隆私有字节）。
 >
-> *实测于 `2026-11-21`，由 `Scripts/acceptance/m3-branch-bench.sh`（结果文件 `reports/m3-branch-bench.json`，可通过 `AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 3 --record` 复现）在 `Mac16,10`（`Apple M4`，10 核，16 GiB 内存）、macOS `27.0.1`（`26A434`）、APFS 卷上测得，宿主机 `uptime` 1m/5m/15m 负载开始为 `1.77 2.24 2.39`、结束为 `1.98 2.53 2.51`；父机为扩容至 `8 GiB` 的 `debian-12-bookworm-arm64` 磁盘，客户机内写入 `1 GiB` 随机数据（`/var/tmp/bench-data.bin`）并 `sync`：16 次停机 `agentvm branch` 进程墙钟中位数为 `32.49 ms`（最小 `26.48 ms`，95 分位 `58.26 ms`；命令行内部从拿锁到写入 SQLite 中位数 `13.52 ms`）；16 次经工作区守护进程执行的运行中 `agentvm branch` 进程墙钟中位数为 `115.31 ms`（最小 `102.90 ms`，95 分位 `164.82 ms`），父机暂停时长（`VM_PAUSED_FOR_SNAPSHOT`）中位数为 `0.603 ms`（95 分位 `0.796 ms`；暂停前客户机 `sync` 中位数 `1.004 ms`）。每次分叉新建的克隆文件（`.raw` / `.nvram`）由独立脚本经 Darwin `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` 读取的不与其他克隆共享的私有字节均为 `0 B`（不含 APFS 文件系统元数据及新生成的 `114688 B` `cidata` ISO 与 `70 B` `.machineid` 文件；16 次停机 / 16 次运行中分叉前后的整卷 `df -k` 可用空间差值为 `7256 KB` / `7936 KB`，宿主机有并发任务时仅作上限参考）。32 台子机依次开机核对客户机身份（与父机共 33 台机器的五项持久身份全部两两不同、并发 IPv4 零冲突）并关机后，子机根盘 APFS 私有字节中位数为 `6131712 B`（`5.85 MiB`，95 分位 `6922240 B` / `6.60 MiB`）。*
+> *分叉基准实测于 `2026-11-21`，由 `Scripts/acceptance/m3-branch-bench.sh`（结果文件 `reports/m3-branch-bench.json`，可通过 `AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 3 --record` 复现）在 `Mac16,10`（`Apple M4`，10 核，16 GiB 内存）、macOS `27.0.1`（`26A434`）、APFS 卷上测得，宿主机 `uptime` 1m/5m/15m 负载开始为 `1.77 2.24 2.39`、结束为 `1.98 2.53 2.51`；父机为扩容至 `8 GiB` 的 `debian-12-bookworm-arm64` 磁盘，客户机内写入 `1 GiB` 随机数据（`/var/tmp/bench-data.bin`）并 `sync`：16 次停机 `agentvm branch` 进程墙钟中位数为 `32.49 ms`（最小 `26.48 ms`，95 分位 `58.26 ms`；命令行内部从拿锁到写入 SQLite 中位数 `13.52 ms`）；16 次经工作区守护进程执行的运行中 `agentvm branch` 进程墙钟中位数为 `115.31 ms`（最小 `102.90 ms`，95 分位 `164.82 ms`），父机暂停时长（`VM_PAUSED_FOR_SNAPSHOT`）中位数为 `0.603 ms`（95 分位 `0.796 ms`；暂停前客户机 `sync` 中位数 `1.004 ms`）。每次分叉新建的克隆文件（`.raw` / `.nvram`）由独立脚本经 Darwin `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` 读取的不与其他克隆共享的私有字节均为 `0 B`（不含 APFS 文件系统元数据及新生成的 `114688 B` `cidata` ISO 与 `70 B` `.machineid` 文件；16 次停机 / 16 次运行中分叉前后的整卷 `df -k` 可用空间差值为 `7256 KB` / `7936 KB`，宿主机有并发任务时仅作上限参考）。32 台子机依次开机核对客户机身份（与父机共 33 台机器的五项持久身份全部两两不同、并发 IPv4 零冲突）并关机后，子机根盘 APFS 私有字节中位数为 `6131712 B`（`5.85 MiB`，95 分位 `6922240 B` / `6.60 MiB`）。*
+>
+> *M4 编码智能体验收实测于 `2026-11-21`，由 `AGENTVM_REAL_VM=1 ./Scripts/acceptance/m4-agent.sh`（详见 `reports/AgentVM-M4.md`；在干净工作树上加 `--record` 可写入 `reports/m4-agent.json` 与 `reports/m4-agent.txt`）在同一台 `Mac16,10`（`Apple M4`，10 核，16 GiB 内存、macOS `27.0.1` `26A434`、APFS）上对真实 `debian-12-bookworm-arm64`（内核 `6.1.0-54-cloud-arm64`，`8 GiB` 磁盘）客户机 `t1` 测得（宿主机 `uptime` 负载开始 `3.65 3.96 4.47`、结束 `4.23 4.01 4.45`，整套耗时 `55.70 s`）：`64 MiB` VirtioFS 顺序写（含 `fsync`）吞吐 `862.7 MiB/s`、客户机顺序读吞吐 `1726.8 MiB/s`，宿主机与客户机双向 SHA-256 完全一致；宿主机本地 TCP 端口转发（`127.0.0.1:<宿主机端口>` -> `vsock` -> 客户机 `:8000`）50 次顺序 HTTP GET 延迟中位数 `1.004 ms`（最小 `0.794 ms`，95 分位 `1.467 ms`），`64 MiB` 下载吞吐 `79.02 MiB/s` 且期间并发执行的 `5/5` 次 `agentvm exec` 全部通过（同日总调度在宿主机较空闲时独立核对录得 50 次短请求延迟中位数 `0.485 ms` / 95 分位 `0.559 ms`、`64 MiB` 下载约 `295 MiB/s`）；MCP `agentvm_fork_cow_branch(bootImmediately: true)` 从分叉到子机 `running` 用时 `4.40 s`、`agentvm_restore_snapshot` 运行中回滚用时 `7.52 s`；客户机 `systemctl reboot` 后 `7.18 s` 自动重连 `vsock` 且 VirtioFS 挂载与原端口转发无需重设即恢复；仓库外真实 Python 标准库项目（`code-review/evals`）在宿主机与客户机各跑 `60/60` 个 `unittest` 测试，退出码与通过数完全一致。*
 
-> **当前状态（M3 — APFS 写时复制分叉、子机独立身份与运行中快照回滚）**：APFS 写时复制（`clonefile(2)`）磁盘分叉（`branch`）、快照捕获（`snapshot`）与回滚（`restore`）现已同时支持已停止和运行中的 `VZVirtualMachine` 真实客户机，配合 SQLite WAL 工作区持久化、纯 Swift NoCloud `cidata` ISO-9660 镜像生成以及 `JavaScriptCore` 策略沙盒在本地运行。以太网/IPv4/DNS/TLS 报文拆解和 `.pcapng` 读写目前只是库层面的能力（`AgentVMNetSwitch`，有单元测试覆盖）；命令行和桌面界面都还没有打开抓包文件的入口。`agentvm image pull debian-12-bookworm-arm64` 会下载固定版本的 Debian 12 arm64 云镜像并校验 SHA-512；`agentvm run <vm> -- <命令>` 用 `VZVirtualMachine` 执行一次性命令并关机；每个工作区一个后台常驻守护进程（`daemon start|status|stop`、`events`）跨独立命令行进程持有运行中的 `VZVirtualMachine`，使 `up`、`exec`（多路并发 `AF_VSOCK` 输出/退出码回传，v2 客户机支持 `SIGINT`/`SIGTERM` 取消；标准输入固定为 `/dev/null`）、`pause`、`resume`、`halt`、`branch`、`snapshot`、`restore` 操作真实客户机，并在 `ps` 中汇报客户机 `/proc` 实时 CPU、内存、运行时长心跳与 APFS 私有字节。启动虚拟机需要带 `com.apple.security.virtualization` 权限的二进制，直接 `swift build` 编出来的没有。MCP 的 `agentvm_capture_snapshot`、`agentvm_fork_cow_branch`、`agentvm_restore_snapshot` 在机器由守护进程持有时会转发给守护进程执行，其余 MCP 生命周期/`exec` 工具与桌面界面在 M4 之前仍拒绝改动守护进程持有的机器；客户机网络走系统 NAT，用户态出站防火墙拦截与实时抓包排在 M5。
+> **当前状态（M4 — 编码智能体 MCP 接入守护进程、VirtioFS 目录共享、本地端口转发与 `agent-relay` 接入）**：`agentvm mcp` 现已通过 Unix 域套接字连接工作区后台守护进程，使 coding agent 可经 stdio JSON-RPC 2.0 对真实 `VZVirtualMachine` 客户机完成建机开机、列表查询、分叉、快照、回滚与命令执行；`create --mount <宿主机目录>:<客户机绝对路径>[:ro]` 通过 VirtioFS 与 NoCloud `cloud-init` 把宿主机目录共享进客户机（`branch --no-mounts` 可不继承父机共享）；`forward <vm> <宿主机端口>:<客户机端口> [--foreground]`、`forward list` 与 `forward stop` 在守护进程内将本地端口经 `AF_VSOCK` 多路复用转发至客户机，支持写半关闭（`SHUT_WR`）传递与客户机重启自动恢复；`agent-relay`（`relay.sh verify`）可直接包住 `agentvm exec` 在真虚拟机内跑项目测试并写入 `.relay/LOG.md` 验收记录。启动虚拟机需要带 `com.apple.security.virtualization` 权限签名的二进制，直接 `swift build` 编出来的没有。桌面界面接入守护进程、虚拟机/快照删除命令（`rm`）以及交互终端 / `exec` 标准输入透传尚未实现；客户机网络走系统 NAT，用户态交换机出站管控与实时抓包排在 M5（默认后端下 `agentvm_query_wiretap` 与 `agentvm_set_firewall_preset` 返回 `isError: true` `[ERR_UNIMPLEMENTED_BEFORE_M5]`）。
 
 [![Version](https://img.shields.io/badge/version-v1.4.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
@@ -14,23 +16,30 @@
 [![Bilingual](https://img.shields.io/badge/界面语言-中文%20%7C%20EN-2A9D6F)](README.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2A9D6F)](LICENSE)
 
-`AgentVM` 是面向 macOS（Apple Silicon）的本地工作区管理器和 APFS 写时复制磁盘与快照血统工具，带命令行、stdio MCP 服务和桌面工作台，基于 Swift 6 编写，桌面端与命令行（`--lang zh` / `--lang en`）均支持 `中文 | EN` 双语切换。常驻真实虚拟机由每个工作区一个后台守护进程持有（`agentvm up` / `exec` / `pause` / `resume` / `halt` / `branch` / `snapshot` / `restore`），一次性执行仍可走 `agentvm run`；工作台里的抓包与防火墙视图在 M5 之前没有真实流量可看。
+`AgentVM` 是面向 macOS（Apple Silicon）的本地工作区管理器和 APFS 写时复制磁盘与快照血统工具，带命令行、stdio MCP 服务和桌面工作台，基于 Swift 6 编写，桌面端与命令行（`--lang zh` / `--lang en`）均支持 `中文 | EN` 双语切换。常驻真实虚拟机由每个工作区一个后台守护进程持有（`agentvm up` / `exec` / `forward` / `pause` / `resume` / `halt` / `branch` / `snapshot` / `restore` 与 `agentvm mcp`），一次性执行仍可走 `agentvm run`；工作台里的抓包与防火墙视图在 M5 之前没有真实流量可看。
 
 默认情况下，启动桌面应用或初始化 `.agentvm` 工作区均显示干净的空状态（0 台虚拟机、0 条数据包、0 条告警），绝不伪造客户机执行结果或遥测数值：
 
-- `create` 会创建一块带 GPT 分区表的空稀疏磁盘与一张 NoCloud `cidata` ISO-9660 配置盘。不带 `--image` 时磁盘内没有客户机操作系统；带 `--image debian-12-bookworm-arm64` 时，根磁盘是缓存镜像的 APFS `clonefile(2)` 克隆（在非 APFS 卷上会回退为完整复制并在标准错误说明）。`ps` 与 `snapshot list` 的空间列通过 `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` 报告不与其他克隆共享的私有字节，不再在关键路径做全盘逐块比对。
-- **`branch` 子机如何更换独立身份**：每次分叉都会为子机单独生成一张 NoCloud `cidata` ISO（`isos/<子机名>-<vmID>-cidata.iso`）：`instance-id` 设为子机自己的 VM ID，`hostname` / `local-hostname` / `fqdn` 按 RFC 1123 规整为子机名，`network-config` 写入 `dhcp-identifier: mac`，`user-data` 保留创建 `/workspace` 的 `bootcmd` 并加入 `cloud-init-per instance avm-machine-id`，在首次开机时重建 `/etc/machine-id`（及 `/var/lib/dbus/machine-id` 软链），SSH 主机密钥由 `cloud-init` 按新实例重新生成，同时分配新的网卡 MAC 与 `VZGenericMachineIdentifier`。子机默认保持 `stopped`（等价于 `--no-boot`）；显式传 `--boot` 时会先做与 `up` 相同的预检（不通过则不建子机），建好后经工作区守护进程启动。若将子机 `restore` 回首次开机之前的初始 `CoW Head` 快照再开机，`cloud-init` 会再次按新实例运行并重新生成一套新的 `machine-id` 与 SSH 主机密钥。
-- **只做磁盘写时复制分叉与快照（为什么不做带内存状态的分叉）**：对运行中的虚拟机执行 `branch` 或 `snapshot` 时，守护进程先经 `AF_VSOCK` 在客户机内执行 `/bin/sync`（30 秒超时），再 `pause` 几毫秒完成根磁盘（及分叉时的 EFI NVRAM）`clonefile(2)`，随即 `resume` 恢复运行，快照类型记为 `live-disk`，并写入带精确暂停毫秒数的 `VM_PAUSED_FOR_SNAPSHOT` 事件。M3 不做带内存状态（`saveMachineStateTo` / `restoreMachineStateFrom`）的分叉：实测 `Virtualization.framework` 恢复内存状态时要求网卡 MAC 与 `VZGenericMachineIdentifier` 必须与保存时完全相同（改动任一项即报 `VZErrorDomain` `invalid argument`），这会使子机沿用父机的 MAC、DHCP IPv4 租约、主机名和 `machine-id`，无法与父机同时运行。
-- **`restore` 自动留存回滚前快照与运行中回滚**：任何 `agentvm restore <快照ID>` 在替换根磁盘前都会先把当前根磁盘克隆为一份标题为 `auto: before restore <快照ID>` 的 `cold-disk` 快照，并在标准输出打印该快照 ID，避免未拍快照的改动静默丢失。对运行中的虚拟机执行 `restore` 时，守护进程按顺序优雅关机（30 秒超时后强制停）→ 留回滚前快照 → 原子替换根盘（不动 `cidata` ISO、MAC 与机器标识）→ 重新开机并等待 `guestd` 连上后返回。
-- **破坏性客户机命令前自动拍检查点**：对运行中的虚拟机执行命中内置守卫规则的破坏性命令（如 `rm -rf`、`apt-get install`、`mkfs`、`dd of=/dev/...`）前，守护进程会自动走运行中快照流程（客户机 `sync` → 短暂 `pause` → `clonefile(2)` → `resume`）拍下一条 `auto-pre-cmd`（`autoPreCommandCheckpoint`）快照。当前尚未提供删除虚拟机或快照的命令（排在 M4），反复分叉或触发检查点会在工作区内累积快照文件（初始私有字节为 `0 B`，随磁盘块写入差异增长）。
-- 对空磁盘执行 `agentvm up <vm>`、`agentvm branch <src> <dst> --boot`，或对空磁盘、未运行的虚拟机执行 `agentvm exec <vm> -- ...`，会以非零退出码返回明确错误，不会静默回退到模拟器或拉起守护进程。对装有系统、已停止的虚拟机执行 `agentvm up` 会开机。对空磁盘执行 `agentvm run` 退出码为 125。
-- 每个工作区至多运行一个后台守护进程（`<工作区>/run/daemon.sock`，由 `up`、`branch --boot` 或 `daemon start` 按需通过双 fork + `setsid` 启动，不注册 `launchd`）。注销 macOS 会话或重启宿主机后**不保证**虚拟机仍在运行；守护进程退出或被强杀后虚拟机会退出，后续读取会把残留的 `running` 对账回 `stopped`（记录 `VM_RUNTIME_LOST`）。
-- 客户机守护脚本（`agentvm-guestd.py` v2）会在新建虚拟机或 `branch` 分叉出的子机首次开机时经 `cloud-init` 写入。M2 之前创建的旧父机本身仍运行旧版 `1.0.0` 脚本（重新 `create --image` 可升级），但从旧父机 `branch` 分叉出的子机首次开机后即会拿到新版 v2 脚本。
-- 主机侧协议与会话模拟仅在显式传入 `--backend simulation` 时启用，或在桌面端显式传入 `--demo` / 点击「载入演示」（带 `[演示数据]` 标记）时载入。模拟运行的每一种输出都带标记：文本逐行加 `SIMULATED:` 前缀，`ps --json` 和 MCP `agentvm_list_fleet` 的记录里有 `"simulated": true`，`export-hcl` 多一行 `# SIMULATED:` 注释，导出的 `.pcapng` 和 HTML 文件内部也写有标记。
-- 模拟器留在工作区里的状态，之后谁来读都带着标记：默认的 `agentvm ps` 显示 `SIMULATED:运行中`，`ps --json` 在 `"state": "running"` 旁边是 `"simulated": true`；默认后端不会把它当真（`up`、`exec`、`pause` 会丢弃模拟状态，然后像对一台从没运行过的虚拟机那样报错）。
-- 未实测或已过期的 CPU 与内存指标（15 秒内无新心跳、已暂停或已停止）统一显示为 `—`。
-- 用 `agentvm up` 或 `agentvm run` 启动的客户机走系统 NAT，M5 之前没有任何出站管控：`agentvm policy strict|airgap` 只是选择并保存一个预设，对真实流量不做任何拦截；选了 `airgap` 时 `agentvm up` 退出码为 1、`agentvm run` 退出码为 125，因为 M5 之前做不到断网启动。用户态交换机在 M5 之前没有通往外网的路径。界面上的抓包与防火墙面板均明确显示「尚未接入真实流量（排在 M5）」。
-- `agentvm doctor` 会如实报告当前可执行文件有没有 `com.apple.security.virtualization` 权限。直接用 `swift build` 编出来的二进制没有这项权限，`doctor` 会明说，不写「通过」。
+- **VirtioFS 目录共享（`create --mount` 与 `branch --no-mounts`）**：`agentvm create <名称> ... --mount <宿主机目录>:<客户机绝对路径>[:ro]` 可重复指定多个共享目录，底层配置 `VZVirtioFileSystemDeviceConfiguration`（`VZSharedDirectory(url:readOnly:)`），并在 `cloud-init` `user-data` 中生成创建挂载点的 `bootcmd` 与 `virtiofs` `mounts:` 条目（`rw,nofail,x-systemd.before=local-fs.target` 或 `ro,nofail,x-systemd.before=local-fs.target`）。`create` 与 `up` 开机前都会显式校验宿主机路径存在且为目录，缺失或非目录时立即以退出码 `1` 返回 `[ERR_SHARED_DIR_INVALID]`，绝不静默跳过。客户机内无论以 `root` 还是普通用户 `agent` 在读写共享目录中新建文件，宿主机侧属主均为当前宿主用户（`stat -f '%u' == id -u`）；只读共享（`:ro`）会拦截写入、删除与 `rw` 重挂载。`branch` 默认继承父机的 `virtioFSMounts` 与 `cloud-init` `mounts:`，传入 `branch <父机> <子机> --no-mounts` 则剥离共享挂载配置。
+- **守护进程托管的本地端口转发（`forward`）**：`agentvm forward <vm> <宿主机端口>:<客户机端口>` 由工作区守护进程在 `127.0.0.1:<宿主机端口>` 监听并持久化到虚拟机配置，经现有 `AF_VSOCK` 多路复用通道（`CHAN_TCP_PORT_FORWARD`）转发至客户机 `127.0.0.1:<guest-port>`（`agentvm-guestd.py` v2）。客户端写半关闭（`shutdown(SHUT_WR)`）会以 `FLAG_FIN` 传递而不会提前截断回包流，慢响应可完整收回；宿主机端口冲突或权限不足立即返回退出码 `1`（`[ERR_PORT_FORWARD_BIND]`，附中英文原因与 `errno`）。转发规则在客户机 `reboot` 后自动恢复、`halt` 后自动释放，可通过 `agentvm forward list [--vm <vm>] [--json]` 查询、`agentvm forward stop <vm> <宿主机端口>` 停止，亦支持 `--foreground`（前台阻塞直至收到 `SIGINT` / `SIGTERM` 时自动解绑并以退出码 `0` 退出）。
+- **接入工作区守护进程的 stdio MCP 服务（`agentvm mcp`）**：保持原有 9 个工具名不变（`agentvm_list_fleet`、`agentvm_create_vm`、`agentvm_fork_cow_branch`、`agentvm_exec_command`、`agentvm_capture_snapshot`、`agentvm_restore_snapshot`、`agentvm_query_wiretap`、`agentvm_set_firewall_preset`、`agentvm_doctor`），所有运行态查询、命令执行与开机均经守护进程 RPC 完成，MCP 进程自身不直接创建 `VZVirtualMachine`：
+  - `agentvm_create_vm` 新增可选参数 `image`（字符串）、`diskSize`（字符串，需配合 `image`）、`mounts`（`[{hostPath, guestPath, readOnly?}]`）与 `bootImmediately`（布尔值，建机后按需拉起/连接工作区守护进程开机）。
+  - `agentvm_fork_cow_branch` 的 `parentVMID` 支持传虚拟机名称或 `vm-...` ID，新增可选 `inheritMounts`（默认 `true`）并在 `bootImmediately: true` 时经工作区守护进程启动子机。
+  - `agentvm_exec_command` 的 `vmID` 支持传名称或 ID，支持可选 `workingDirectory`（默认 `"/"`）、`runAsUser`（默认 `"root"`）、`timeoutSeconds`（默认 `3600`）与 `environment`（字符串字典），经守护进程流式收集输出（客户端侧默认上限 `16 MiB`，超限报 `[ERR_EXEC_OUTPUT_OVERFLOW]`）；客户机命令非零退出时返回 `isError: false` 并带 `exitCode=<N>`，对停机虚拟机调用返回 `isError: true`（`[ERR_LIFECYCLE_STATE]`）。
+  - `agentvm_list_fleet` 优先向守护进程查询实时运行态，守护进程未运行时回退读取经锁对账的 SQLite 记录；`agentvm_capture_snapshot` 与 `agentvm_restore_snapshot` 在机器由守护进程持有时经守护进程执行。
+  - `agentvm_query_wiretap` 与 `agentvm_set_firewall_preset` 在默认硬件后端下统一返回 `isError: true`（`[ERR_UNIMPLEMENTED_BEFORE_M5]`）且不改动工作区策略；仅在显式 `--backend simulation` 下保留带 `SIMULATED:` 前缀的演示输出。
+- **APFS 写时复制磁盘分叉、子机独立身份与运行中快照回滚**：`create` 创建空稀疏 GPT 盘与 NoCloud `cidata` ISO（传 `--image debian-12-bookworm-arm64` 时走 `clonefile(2)`，`ps` 与 `snapshot list` 通过 `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` 统计私有字节）。`branch` 为每台子机生成独立 `cidata` ISO（独立 `instance-id`、RFC 1123 主机名、`dhcp-identifier: mac`、`cloud-init-per instance avm-machine-id`）及新 MAC 与 `VZGenericMachineIdentifier`。运行中 `branch`、`snapshot` 以及命中内置破坏性命令守卫（如 `rm -rf`、`apt-get install`、`mkfs`、`dd of=/dev/...`）前的 `auto-pre-cmd` 自动检查点均经 `AF_VSOCK` 先调客户机 `/bin/sync`，再短暂 `pause` 执行 `clonefile(2)` 后 `resume`（因 `Virtualization.framework` 恢复内存状态不允许更换 MAC 与机器标识，不做内存态分叉）。任何 `restore` 均先留存一份 `auto: before restore <快照ID>` 快照。
+- **显式模拟隔离与诚实遥测**：主机侧模拟仅在显式传入 `--backend simulation` 或桌面端 `--demo`（带 `[演示数据]` 标记）时启用，所有输出均带 `SIMULATED` 标记；未实测或过期的 CPU/内存指标显示为 `—`；`agentvm doctor` 实测 `clonefile(2)` 并如实检查当前可执行文件是否带 `com.apple.security.virtualization` 权限。
+
+---
+
+## 当前边界与后续计划
+
+- **桌面界面尚未接入工作区守护进程**：桌面工作台目前只读磁盘上的工作区数据，不能直接操控守护进程持有的运行中虚拟机；界面上的抓包与防火墙面板也明确显示「尚未接入真实流量（排在 M5）」。
+- **尚未提供 `rm` 删除命令与交互终端**：当前没有虚拟机删除（`rm`）或快照删除（`snapshot rm`）命令，也没有交互式 TTY 终端与 `exec` 标准输入流透传（`exec` 标准输入固定为 `/dev/null`）；反复分叉或触发检查点会在工作区内累积快照文件（初始私有字节为 `0 B`，随写入差异增长），通过 MCP 启动的虚拟机需用命令行 `agentvm halt` 或 `agentvm daemon stop` 关停。
+- **两个 M5 网络工具尚未实现**：默认硬件后端下 MCP 的 `agentvm_query_wiretap` 与 `agentvm_set_firewall_preset` 均返回 `isError: true`（`[ERR_UNIMPLEMENTED_BEFORE_M5]`）。M5 之前真实客户机网络走 macOS 系统 NAT，未接入用户态二层交换机、无域名出站过滤或真实流量 `.pcapng` 抓包（`agentvm policy strict|airgap` 仅保存预设；选了 `airgap` 时 `up` 退出码为 `1`、`run` 退出码为 `125`）。
+- **多台分叉子机共享同一个读写目录会互相改写**：`branch` 默认继承父机的 `--mount` 共享目录；若多台分叉子机同时运行并共享同一个宿主机读写目录，它们会直接读写并互相覆盖同一份宿主机文件。并发跑多分支实验时请加 `branch <父机> <子机> --no-mounts`，或分别为各台虚拟机挂载独立的宿主机临时/克隆目录。
+- **单工作区用户态守护进程边界**：每个工作区的后台守护进程（`<工作区>/run/daemon.sock`）由命令按需经双 fork + `setsid` 启动（不写 `launchd`），注销 macOS 会话或重启宿主机不保留运行中的虚拟机。
 
 ---
 
@@ -42,7 +51,7 @@
 | **M1** | `agentvm image pull debian-12-bookworm-arm64` 与单命令 `agentvm run`：基于 `VZVirtualMachine` 启动真实 Debian 12 Linux 客户机，通过真实 `AF_VSOCK` 回传标准输出/标准错误/退出码 | **已完成** |
 | **M2** | 每个工作区一个后台常驻守护进程，使 `up`、`exec`、`pause`、`resume`、`halt`、`daemon`、`events` 可跨独立命令行进程协同工作，并接入客户机 `/proc` 实时 CPU、内存与运行时长遥测 | **已完成** |
 | **M3** | 停机与运行中 APFS CoW 分叉（`branch` / `branch --boot`）、子机独立 `cidata` 身份重建、运行中 `sync`+`pause` 快照（`snapshot`）、自动留存回滚前快照与运行中回滚（`restore`）、破坏性命令前自动检查点及 APFS 私有字节统计（停机分叉中位数 `32.49 ms`、运行中分叉中位数 `115.31 ms`、新建克隆私有字节 `0 B`） | **已完成** |
-| **M4** | 桌面界面与完整 MCP 生命周期/`exec` 工具接入工作区守护进程、虚拟机与快照删除命令（`rm`）、目录共享、端口转发、`exec` 标准输入透传与交互终端 | 规划中 |
+| **M4** | 给 coding agent 用：`agentvm mcp` 接入工作区守护进程（扩展 `create_vm`、`fork_cow_branch`、`exec_command` 并对两个 M5 工具在默认后端返回 `ERR_UNIMPLEMENTED_BEFORE_M5`）、VirtioFS 目录共享（`create --mount`、`branch --no-mounts`）、守护进程托管本地端口转发（`forward`、`list`、`stop`、`--foreground` 及 `SHUT_WR` 半关闭传递）与 `agent-relay verify` 接入 | **已完成** |
 | **M5** | 真实客户机网卡接入用户态二层交换机、DNS/TLS SNI 出站访问控制与真实流量 `.pcapng` 导出 | 规划中（待 M4 后评估） |
 
 ---
@@ -59,21 +68,25 @@ alias agentvm="$(pwd)/.build/debug/AgentVM"
 agentvm --lang zh --workspace ./demo-check.agentvm doctor
 # -> APFS clonefile(2) : 通过 (实测 clonefile(2) 写时复制克隆成功)
 
-# 2. 初始化空工作区并创建一台空稀疏 GPT 磁盘虚拟机记录
+# 2. 初始化空工作区并创建空稀疏 GPT 磁盘虚拟机记录（含可重复指定的 --mount 共享目录）
 agentvm --lang zh --workspace ./demo-check.agentvm init
 # -> 已初始化空工作区「demo-check」（...）：...
 agentvm --lang zh --workspace ./demo-check.agentvm create sandbox-a
 # -> 已创建虚拟机「sandbox-a」（...），根快照 ...（空稀疏 GPT 磁盘，未安装客户机系统）
+agentvm --lang zh --workspace ./demo-check.agentvm create mount-a --mount .:/workspace --mount .:/mnt/ro:ro
+# -> 已创建虚拟机「mount-a」（...），根快照 ...（空稀疏 GPT 磁盘，未安装客户机系统）
 
-# 3. 查看虚拟机表格或 JSON 输出（未实测的 CPU/内存统一显示为 —；私有字节列显示不与其他克隆共享的字节数）
+# 3. 查看虚拟机表格或 JSON 输出（未实测的 CPU/内存统一显示为 —；JSON 记录 virtioFSMounts）
 agentvm --lang zh --workspace ./demo-check.agentvm ps
 # -> sandbox-a ... 已停止
 agentvm --lang zh --workspace ./demo-check.agentvm ps --json
-# -> "state" : "stopped"
+# -> "guestMountPoint" : "\/workspace"
 
-# 4. 派生 APFS 写时复制磁盘分支、捕获快照、列出快照、查看插件并导出 HCL 清单
+# 4. 派生 APFS 写时复制分支（默认继承挂载，或用 --no-mounts 剥离共享目录）、捕获快照、查看插件并导出 HCL 清单
 agentvm --lang zh --workspace ./demo-check.agentvm branch sandbox-a sandbox-b --no-boot
 # -> 已通过 clonefile(2) 派生 CoW 分支「sandbox-b」（...），耗时 ... ms，父快照 ...
+agentvm --lang zh --workspace ./demo-check.agentvm branch mount-a mount-b --no-mounts
+# -> 已通过 clonefile(2) 派生 CoW 分支「mount-b」（...），耗时 ... ms，父快照 ...
 agentvm --lang zh --workspace ./demo-check.agentvm snapshot sandbox-a before-experiment
 # -> 已为 vm-... 捕获快照 snap-...（「before-experiment」）
 agentvm --lang zh --workspace ./demo-check.agentvm snapshot list
@@ -83,7 +96,13 @@ agentvm --lang zh --workspace ./demo-check.agentvm plugin
 agentvm --lang zh --workspace ./demo-check.agentvm export-hcl
 # -> sandbox_vm "sandbox-a" ... sandbox_vm "sandbox-b"
 
-# 5. 对无操作系统或已停止的磁盘执行 up、branch --boot、exec 诚实报错；halt、daemon status/stop 与 events 无需拉起守护进程即可执行
+# 5. 查看端口转发规则，并验证对无操作系统或已停止虚拟机操作时无需拉起守护进程即可诚实报错
+agentvm --lang zh --workspace ./demo-check.agentvm forward list
+# -> 当前没有活动的端口转发。
+agentvm --lang zh --workspace ./demo-check.agentvm forward list --json
+# -> [
+agentvm --lang zh --workspace ./demo-check.agentvm forward sandbox-a 18080:8000
+# -> 非零退出码：[ERR_LIFECYCLE_STATE] 无法为虚拟机「sandbox-a」（...）设置端口转发：当前状态为「stopped」，需要先启动虚拟机。
 agentvm --lang zh --workspace ./demo-check.agentvm up sandbox-a
 # -> 非零退出码：[ERR_NO_BOOTABLE_SYSTEM] 虚拟机「sandbox-a」磁盘上没有可引导的客户机系统（内核或根文件系统缺失）...
 agentvm --lang zh --workspace ./demo-check.agentvm branch sandbox-a sandbox-c --boot
@@ -114,14 +133,32 @@ agentvm --lang zh --workspace ./demo-check.agentvm --backend simulation halt san
 # -> SIMULATED: 虚拟机「sandbox-a」（...）-> 已停止
 ```
 
-不认识的选项会报错，不会被忽略：`agentvm ps --bogus` 的退出码是 2。使用带虚拟化权限签名的二进制与缓存的 Debian 12 镜像（`agentvm image pull debian-12-bookworm-arm64`）时，可通过 `agentvm create p --image debian-12-bookworm-arm64 --disk-size 8G`、`agentvm up p`、`agentvm branch p c1`、`agentvm branch p c3 --boot`、`agentvm snapshot p s1`、`agentvm restore <快照ID>`、`agentvm exec p -- uname -r`、`agentvm halt p`、`agentvm daemon status`、`agentvm daemon stop` 与 `agentvm events --vm p` 经工作区守护进程管理已停止和运行中的真实客户机（由 `AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 3` 完整验证）。
-
-所有命令同样支持 `--lang en`（或环境变量 `AGENTVM_LANG=en`）输出英文：
+不认识的选项会报错，不会被忽略：`agentvm ps --bogus` 的退出码是 2。所有命令同样支持 `--lang en`（或环境变量 `AGENTVM_LANG=en`）输出英文：
 
 ```bash
 agentvm --lang en --workspace ./demo-check.agentvm doctor
 agentvm --lang en --workspace ./demo-check.agentvm ps
 ```
+
+---
+
+## 接入 `agent-relay` 在真虚拟机内执行验收
+
+使用带虚拟化权限签名的 `agentvm` 二进制与已缓存的 `debian-12-bookworm-arm64` 镜像（`agentvm image pull debian-12-bookworm-arm64`）时，`agent-relay` 的 `relay.sh verify` 子命令可直接包住 `agentvm exec`（以 `argv` 数组直接执行 `--` 后的命令，不调用外部 agent CLI，原样透传客户机退出码，转发 `SIGTERM` 取消信号，并在 `$PROJECT_DIR/.relay/LOG.md` 追加结构化通过/失败记录；由 `Scripts/acceptance/m4-agent.sh` 第 12 行端到端验证）：
+
+```bash
+# 1. 创建将宿主机 $PROJECT_DIR 挂载到 /workspace 的虚拟机并经工作区守护进程启动
+agentvm --workspace ./relay-demo.agentvm create t1 --image debian-12-bookworm-arm64 --mount "$PROJECT_DIR:/workspace"
+agentvm --workspace ./relay-demo.agentvm up t1
+
+# 2. 用 agent-relay 的 verify 子命令在真虚拟机沙箱里跑项目测试并留存 .relay/LOG.md 证据
+~/.agents/skills/agent-relay/scripts/relay.sh verify "$PROJECT_DIR" "run-tests-in-vm" -- agentvm --workspace ./relay-demo.agentvm exec t1 -- python3 -B -m unittest discover -s /workspace -v
+
+# 3. 用完停机
+agentvm --workspace ./relay-demo.agentvm halt t1
+```
+
+若测试命令需要 `cd /workspace && ...` 等 shell 语法，可在 `exec t1` 后写成 `-- /bin/sh -c 'cd /workspace && python3 -B -m unittest discover -v'`。
 
 ---
 
@@ -169,6 +206,13 @@ AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 2
 # 运行 M3 写时复制分叉、子机独立身份、运行中快照/回滚与分叉基准套件（m3-fork.sh、m3-branch-bench.sh 及 M1/M2 回归检查）。
 # 不带 AGENTVM_REAL_VM=1 时，非真机行照常运行，真机行记为“没跑”并以退出码 2 结束；加 --record 可写入 reports/m3-branch-bench.{json,md}。
 AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 3
+
+# 运行 M4 编码智能体验收套件（改动模块范围测试、构建、README 回放与 m4-agent.sh 第 1-14 行）。
+# 不带 AGENTVM_REAL_VM=1 时，非真机第 1-3、14 行运行，真机第 4-13 行记为“没跑”并以退出码 2 结束；在干净工作树上加 --record 可写入 reports/m4-agent.{txt,json}。
+AGENTVM_REAL_VM=1 ./Scripts/test.sh milestone 4
+
+# 在仓库的隔离临时拷贝中运行 M4 源码变异检查（1、2 或 3 -> 第 15-17 行），不污染工作树 Sources/
+AGENTVM_REAL_VM=1 ./Scripts/acceptance/m4-agent.sh --mutation 1
 ```
 
 ---

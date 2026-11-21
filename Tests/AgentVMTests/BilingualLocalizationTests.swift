@@ -191,11 +191,11 @@ struct BilingualLocalizationTests {
             _ = try? await coordinator.haltVM(vm.id)
         }
 
-        // Verify CLI accepts `--lang zh` alongside `version` (`1.4.0`) and `export-html`
+        // Verify CLI accepts `--lang zh` alongside `version` (`1.5.0`) and `export-html`
         let cli = AgentVMCLIRunner()
         let verOut = await cli.execute(arguments: ["--lang", "zh", "--version"], bundleURLOverride: bundleURL)
         #expect(verOut.exitCode == 0)
-        #expect(verOut.stdout.contains("1.4.0"))
+        #expect(verOut.stdout.contains("1.5.0"))
 
         let html = try await HtmlFleetReportExporter().renderStandaloneHTML(coordinator: coordinator)
         #expect(html.contains("data-set-lang=\"zh\""))
@@ -206,7 +206,7 @@ struct BilingualLocalizationTests {
         #expect(html.contains("localStorage"))
         #expect(html.contains("navigator.language"))
         #expect(html.contains("startsWith('zh')"))
-        #expect(html.contains("AgentVM v1.4.0"))
+        #expect(html.contains("AgentVM v1.5.0"))
         // Zero em-dashes in English or Chinese dossier output
         #expect(!html.contains("\u{2014}"))
     }

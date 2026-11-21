@@ -1,6 +1,6 @@
 **[English](README.md)** | **简体中文**
 
-# AgentVM `v1.4.0`
+# AgentVM `v1.5.0`
 
 > 在 Mac 上给 coding agent 开真实的 Linux 虚拟机：`agentvm exec` 与 MCP `agentvm_exec_command` 的输出来自客户机本身，VirtioFS 把宿主机项目目录共享进 `/workspace`，本地 TCP 端口经 `AF_VSOCK` 转发进客户机；分叉一台带数据的虚拟机用时 **32.49 毫秒**（停机分叉墙钟中位数；最近秩 95 分位 **58.26 毫秒**）、多占 **0 字节**（APFS 克隆私有字节）。
 >
@@ -10,7 +10,7 @@
 
 > **当前状态（M4 — 编码智能体 MCP 接入守护进程、VirtioFS 目录共享、本地端口转发与 `agent-relay` 接入）**：`agentvm mcp` 现已通过 Unix 域套接字连接工作区后台守护进程，使 coding agent 可经 stdio JSON-RPC 2.0 对真实 `VZVirtualMachine` 客户机完成建机开机、列表查询、分叉、快照、回滚与命令执行；`create --mount <宿主机目录>:<客户机绝对路径>[:ro]` 通过 VirtioFS 与 NoCloud `cloud-init` 把宿主机目录共享进客户机（`branch --no-mounts` 可不继承父机共享）；`forward <vm> <宿主机端口>:<客户机端口> [--foreground]`、`forward list` 与 `forward stop` 在守护进程内将本地端口经 `AF_VSOCK` 多路复用转发至客户机，支持写半关闭（`SHUT_WR`）传递与客户机重启自动恢复；`agent-relay`（`relay.sh verify`）可直接包住 `agentvm exec` 在真虚拟机内跑项目测试并写入 `.relay/LOG.md` 验收记录。启动虚拟机需要带 `com.apple.security.virtualization` 权限签名的二进制，直接 `swift build` 编出来的没有。桌面界面接入守护进程、虚拟机/快照删除命令（`rm`）以及交互终端 / `exec` 标准输入透传尚未实现；客户机网络走系统 NAT，用户态交换机出站管控与实时抓包排在 M5（默认后端下 `agentvm_query_wiretap` 与 `agentvm_set_firewall_preset` 返回 `isError: true` `[ERR_UNIMPLEMENTED_BEFORE_M5]`）。
 
-[![Version](https://img.shields.io/badge/version-v1.4.0-D97724)](https://github.com/zxu756/AgentVM/releases)
+[![Version](https://img.shields.io/badge/version-v1.5.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
 [![Swift](https://img.shields.io/badge/Swift-6.0%20Strict%20Concurrency-D97724)](https://swift.org)
 [![Bilingual](https://img.shields.io/badge/界面语言-中文%20%7C%20EN-2A9D6F)](README.md)

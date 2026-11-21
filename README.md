@@ -1,6 +1,6 @@
 **English** | **[简体中文](README.zh-CN.md)**
 
-# AgentVM `v1.4.0`
+# AgentVM `v1.5.0`
 
 > Boot real Linux virtual machines for coding agents on a Mac: `agentvm exec` and MCP `agentvm_exec_command` output comes from the guest itself, VirtioFS shares host project directories into `/workspace`, localhost TCP ports forward over `AF_VSOCK`, and forking a data-bearing VM takes **32.49 ms** (median wall-clock; nearest-rank p95 **58.26 ms**) and adds **0 B** of APFS private disk data bytes.
 >
@@ -10,7 +10,7 @@
 
 > **Current Status (M4 — Coding-Agent MCP Daemon Wiring, VirtioFS Directory Sharing, Localhost Port Forwarding & `agent-relay` Integration)**: `agentvm mcp` connects to the per-workspace background daemon over Unix domain sockets so coding agents can create, boot, fork, snapshot, restore, inspect, and execute commands inside real `VZVirtualMachine` guests over stdio JSON-RPC 2.0; `create --mount <host-dir>:<guest-abs-path>[:ro]` shares host directories into guests via VirtioFS and NoCloud `cloud-init` (`branch --no-mounts` opts out of inheriting parent shares); `forward <vm> <host-port>:<guest-port> [--foreground]`, `forward list`, and `forward stop` relay localhost TCP ports over `AF_VSOCK` with write half-close (`SHUT_WR`) propagation and automatic recovery across guest reboots; and `agent-relay` (`relay.sh verify`) wraps `agentvm exec` directly to run project tests in a real VM and log structured evidence to `.relay/LOG.md`. Booting needs a binary carrying `com.apple.security.virtualization`, which a plain `swift build` binary lacks. Desktop UI daemon integration, VM/snapshot `rm`, and interactive TTY / `exec` stdin streaming remain unimplemented; guest networking uses system NAT with no egress enforcement or live packet capture until M5 (`agentvm_query_wiretap` and `agentvm_set_firewall_preset` return `isError: true` `[ERR_UNIMPLEMENTED_BEFORE_M5]` on the default backend).
 
-[![Version](https://img.shields.io/badge/version-v1.4.0-D97724)](https://github.com/zxu756/AgentVM/releases)
+[![Version](https://img.shields.io/badge/version-v1.5.0-D97724)](https://github.com/zxu756/AgentVM/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20(Apple%20Silicon)-141517)](https://github.com/zxu756/AgentVM)
 [![Swift](https://img.shields.io/badge/Swift-6.0%20Strict%20Concurrency-D97724)](https://swift.org)
 [![Bilingual](https://img.shields.io/badge/UI-中文%20%7C%20EN-2A9D6F)](README.zh-CN.md)

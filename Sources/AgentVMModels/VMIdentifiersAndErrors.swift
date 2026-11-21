@@ -69,7 +69,7 @@ public struct SemanticVersion: Codable, Hashable, Sendable, Comparable, CustomSt
         self.prerelease = prerelease
     }
 
-    public static let current = SemanticVersion(major: 1, minor: 4, patch: 0)
+    public static let current = SemanticVersion(major: 1, minor: 5, patch: 0)
 
     public init?(parsing text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)

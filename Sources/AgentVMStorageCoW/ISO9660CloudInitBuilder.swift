@@ -388,11 +388,26 @@ public struct ISO9660CloudInitBuilder: Sendable {
         var lines: [String] = ["#cloud-config"]
         lines.append("hostname: \(Self.yamlScalar(host))")
         lines.append("fqdn: \(Self.yamlScalar("\(host).agentvm.local"))")
-        if !spec.bootCommands.isEmpty {
+        let nonEmptyMounts = spec.mounts.filter { !$0.isEmpty }
+        var mountDirBootCommands: [[String]] = []
+        for entry in nonEmptyMounts where entry.count >= 2 {
+            let guestPath = entry[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !guestPath.isEmpty && guestPath != "/workspace" {
+                let mkdirCmd = ["mkdir", "-p", guestPath]
+                if !mountDirBootCommands.contains(mkdirCmd) {
+                    mountDirBootCommands.append(mkdirCmd)
+                }
+            }
+        }
+
+        if !spec.bootCommands.isEmpty || !nonEmptyMounts.isEmpty {
             lines.append("bootcmd:")
             var effectiveBootCommands: [[String]] = [Self.workspaceInitBootCommand]
+            for mkdirCmd in mountDirBootCommands where !effectiveBootCommands.contains(mkdirCmd) {
+                effectiveBootCommands.append(mkdirCmd)
+            }
             for cmd in spec.bootCommands where !cmd.isEmpty {
-                if cmd == Self.workspaceInitBootCommand {
+                if effectiveBootCommands.contains(cmd) {
                     continue
                 }
                 effectiveBootCommands.append(cmd)
@@ -404,6 +419,14 @@ public struct ISO9660CloudInitBuilder: Sendable {
         }
         lines.append("manage_etc_hosts: true")
         lines.append("timezone: \(Self.yamlScalar(spec.timezone))")
+
+        if !nonEmptyMounts.isEmpty {
+            lines.append("mounts:")
+            for entry in nonEmptyMounts {
+                let renderedFields = entry.map { Self.yamlMountField($0) }.joined(separator: ", ")
+                lines.append("  - [\(renderedFields)]")
+            }
+        }
 
         // Users & SSH keys
         lines.append("users:")
@@ -540,6 +563,13 @@ public struct ISO9660CloudInitBuilder: Sendable {
             return raw
         }
         return yamlSingleQuoted(raw)
+    }
+
+    private static func yamlMountField(_ raw: String) -> String {
+        if raw.isEmpty || raw.allSatisfy({ $0 >= "0" && $0 <= "9" }) {
+            return yamlSingleQuoted(raw)
+        }
+        return yamlScalar(raw)
     }
 
     private static func yamlSingleQuoted(_ raw: String) -> String {

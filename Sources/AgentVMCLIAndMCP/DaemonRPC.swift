@@ -529,17 +529,20 @@ public struct DaemonRPCBranchParams: Codable, Hashable, Sendable {
     public var vm: String
     public var branchName: String
     public var owner: String
+    public var inheritMounts: Bool
     public var lang: AppLanguage
 
     public init(
         vm: String,
         branchName: String,
         owner: String = Self.defaultOwner,
+        inheritMounts: Bool = true,
         lang: AppLanguage = .en
     ) {
         self.vm = vm
         self.branchName = branchName
         self.owner = owner
+        self.inheritMounts = inheritMounts
         self.lang = lang
     }
 
@@ -547,6 +550,7 @@ public struct DaemonRPCBranchParams: Codable, Hashable, Sendable {
         case vm
         case branchName
         case owner
+        case inheritMounts
         case lang
     }
 
@@ -555,6 +559,7 @@ public struct DaemonRPCBranchParams: Codable, Hashable, Sendable {
         self.vm = try container.decode(String.self, forKey: .vm)
         self.branchName = try container.decode(String.self, forKey: .branchName)
         self.owner = try container.decodeIfPresent(String.self, forKey: .owner) ?? Self.defaultOwner
+        self.inheritMounts = try container.decodeIfPresent(Bool.self, forKey: .inheritMounts) ?? true
         self.lang = try container.decodeIfPresent(AppLanguage.self, forKey: .lang) ?? .en
     }
 }

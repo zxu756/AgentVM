@@ -714,7 +714,8 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
             let branchRes = try await coordinator.forkBranchInDaemon(
                 fromVMID: parentID,
                 branchName: params.branchName,
-                agentOwnerTag: params.owner
+                agentOwnerTag: params.owner,
+                inheritMounts: params.inheritMounts
             )
             let resp = DaemonRPCResponse<DaemonRPCBranchResult>.success(
                 id: id,

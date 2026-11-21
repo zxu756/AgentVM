@@ -628,8 +628,13 @@ public struct AgentVMCLIRunner: Sendable {
                 return rawOutcome
             }
 
-            // Preflight `create --image` BEFORE initializing the workspace bundle so a missing/unverified
-            // cached image or a `--disk-size` smaller than the image creates zero directories or files.
+            // Preflight `create --mount` and `create --image` BEFORE initializing the workspace bundle so a missing/non-directory
+            // host share, a missing/unverified cached image, or a `--disk-size` smaller than the image creates zero directories or files.
+            if subcommand == "create", let rawMounts = parsed.multiOptions["--mount"], !rawMounts.isEmpty {
+                if case let .success(mountSpecs) = Self.parseCreateMountArguments(rawMounts, language: language) {
+                    try AgentVMFleetCoordinator.verifySharedHostDirectories(mountSpecs)
+                }
+            }
             if subcommand == "create", let rawImage = parsed.options["--image"] {
                 let trimmedImageID = rawImage.trimmingCharacters(in: .whitespacesAndNewlines)
                 let preflightCatalog = try BaseImageRegistryCatalog(
@@ -875,6 +880,8 @@ public struct AgentVMCLIRunner: Sendable {
                     case let .mcpAndStudioDaemonClientScheduledForM4(operation):
                         hintLine = "提示：请改用命令行 'agentvm \(operation) \(vmName)'；MCP 与界面接入守护进程将在 M4 支持。"
                     }
+                } else if case let .invalidSharedDirectory(path, _, _) = err {
+                    hintLine = "提示：请确认宿主机路径「\(path)」已存在且为目录后再创建或启动虚拟机。"
                 } else {
                     hintLine = "提示：查看审计日志抽屉或运行 'agentvm doctor' 进行环境自检。"
                 }
@@ -1149,6 +1156,14 @@ public struct AgentVMCLIRunner: Sendable {
         let owner = parsed.options["--owner"] ?? "cli-agent"
         let cpus = parsed.options["--cpus"].flatMap(Int.init) ?? 2
         let mem = parsed.options["--memory-mb"].flatMap(UInt64.init) ?? 2048
+        let parsedMounts: [VirtioFSMountSpec]
+        switch Self.parseCreateMountArguments(parsed.multiOptions["--mount"] ?? [], language: language) {
+        case let .success(mounts):
+            parsedMounts = mounts
+        case let .failure(usageErr):
+            throw AgentVMError.cliUsageError(detail: usageErr.message)
+        }
+        try AgentVMFleetCoordinator.verifySharedHostDirectories(parsedMounts)
 
         if let rawImage = parsed.options["--image"] {
             let imageID = rawImage.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1159,7 +1174,8 @@ public struct AgentVMCLIRunner: Sendable {
                 requestedDiskBytes: requestedDiskBytes,
                 agentOwnerTag: owner,
                 vcpus: cpus,
-                memoryMB: mem
+                memoryMB: mem,
+                sharedDirectories: parsedMounts
             )
             if summary.diskCloneStrategy == .fullCopyFallback {
                 progressStderrCollector.emit(
@@ -1188,7 +1204,8 @@ public struct AgentVMCLIRunner: Sendable {
             name: name,
             agentOwnerTag: owner,
             vcpus: cpus,
-            memoryMB: mem
+            memoryMB: mem,
+            sharedDirectories: parsedMounts
         )
         if summary.diskCloneStrategy == .fullCopyFallback {
             progressStderrCollector.emit(
@@ -1327,8 +1344,8 @@ public struct AgentVMCLIRunner: Sendable {
         guard positional.count >= 2 else {
             throw AgentVMError.cliUsageError(
                 detail: isZh
-                    ? "用法：agentvm branch <源虚拟机> <新分支名> [--boot|--no-boot] [--owner <智能体>]"
-                    : "Usage: agentvm branch <source-vm> <new-branch-name> [--boot|--no-boot] [--owner <agent>]"
+                    ? "用法：agentvm branch <源虚拟机> <新分支名> [--boot|--no-boot] [--no-mounts] [--owner <智能体>]"
+                    : "Usage: agentvm branch <source-vm> <new-branch-name> [--boot|--no-boot] [--no-mounts] [--owner <agent>]"
             )
         }
         if parsed.flags.contains("--boot") && parsed.flags.contains("--no-boot") {
@@ -1341,6 +1358,7 @@ public struct AgentVMCLIRunner: Sendable {
         let parentID = try await resolveVMID(positional[0], coordinator: coordinator)
         let branchName = positional[1]
         let owner = parsed.options["--owner"] ?? "branch-worker"
+        let inheritMounts = !parsed.flags.contains("--no-mounts")
         // Decided Item 4 (A57): never follow parent state; without `--boot`, child always stays stopped.
         let shouldBoot = parsed.flags.contains("--boot")
 
@@ -1354,7 +1372,8 @@ public struct AgentVMCLIRunner: Sendable {
             _ = try await coordinator.preflightPersistentBoot(
                 parentID,
                 checkProcessEntitlement: checkProcessEntitlement,
-                hasEntitlementOverride: entProvider
+                hasEntitlementOverride: entProvider,
+                verifySharedDirectories: inheritMounts
             )
         }
 
@@ -1369,6 +1388,7 @@ public struct AgentVMCLIRunner: Sendable {
                 vm: parentID.rawValue,
                 branchName: branchName,
                 owner: owner,
+                inheritMounts: inheritMounts,
                 lang: language
             )
             let rpcOutcome = try DaemonClient.performUnaryCall(
@@ -1384,7 +1404,8 @@ public struct AgentVMCLIRunner: Sendable {
                     fromVMID: parentID,
                     branchName: branchName,
                     agentOwnerTag: owner,
-                    bootImmediately: false
+                    bootImmediately: false,
+                    inheritMounts: inheritMounts
                 )
             }
         } else {
@@ -1392,7 +1413,8 @@ public struct AgentVMCLIRunner: Sendable {
                 fromVMID: parentID,
                 branchName: branchName,
                 agentOwnerTag: owner,
-                bootImmediately: false
+                bootImmediately: false,
+                inheritMounts: inheritMounts
             )
         }
         if fork.diskCloneStrategy == .fullCopyFallback {
@@ -2244,7 +2266,140 @@ public struct AgentVMCLIRunner: Sendable {
                 }
             }
         }
+        if let rawMounts = parsed.multiOptions["--mount"], !rawMounts.isEmpty {
+            if case let .failure(mountErr) = parseCreateMountArguments(rawMounts, language: language) {
+                return mountErr.message
+            }
+        }
         return nil
+    }
+
+    /// Parses `--mount <host-dir>:<guest-path>[:ro]` specifications, canonicalizing `hostDirectoryPath`
+    /// to a standardized absolute path, rejecting malformed specs / relative guest paths / unknown suffixes /
+    /// duplicate guest mount points with `SubcommandUsageError`, and assigning unique `1...36` byte `mountTag`s.
+    public static func parseCreateMountArguments(
+        _ rawSpecs: [String],
+        language: AppLanguage
+    ) -> Result<[VirtioFSMountSpec], SubcommandUsageError> {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+
+        var results: [VirtioFSMountSpec] = []
+        var seenGuestPaths = Set<String>()
+        var seenTags = Set<String>()
+
+        for raw in rawSpecs {
+            let parts = raw.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 2 else {
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数「\(raw)」（缺少冒号，期望格式：<宿主机目录>:<客户机绝对路径>[:ro]）。\(helpHintZh)"
+                    : "Invalid '--mount' value '\(raw)' (missing ':', expected '<host-dir>:<guest-abs-path>[:ro]'). \(helpHintEn)"))
+            }
+            if parts.count > 3 {
+                let extra = parts.dropFirst(2).joined(separator: ":")
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数「\(raw)」（未知挂载后缀「:\(extra)」，仅支持可选的 :ro）。\(helpHintZh)"
+                    : "Invalid '--mount' value '\(raw)' (unknown mount suffix ':\(extra)'; only optional ':ro' is supported). \(helpHintEn)"))
+            }
+            let rawHost = parts[0]
+            let rawGuest = parts[1]
+            if rawHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数「\(raw)」（宿主机目录路径不能为空）。\(helpHintZh)"
+                    : "Invalid '--mount' value '\(raw)' (host directory path must not be empty). \(helpHintEn)"))
+            }
+            if rawGuest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数「\(raw)」（客户机挂载路径不能为空）。\(helpHintZh)"
+                    : "Invalid '--mount' value '\(raw)' (guest mount path must not be empty). \(helpHintEn)"))
+            }
+            let readOnly: Bool
+            if parts.count == 3 {
+                let suffix = parts[2]
+                guard suffix == "ro" else {
+                    return .failure(SubcommandUsageError(message: isZh
+                        ? "无效的「--mount」参数「\(raw)」（未知挂载后缀「:\(suffix)」，仅支持可选的 :ro）。\(helpHintZh)"
+                        : "Invalid '--mount' value '\(raw)' (unknown mount suffix ':\(suffix)'; only optional ':ro' is supported). \(helpHintEn)"))
+                }
+                readOnly = true
+            } else {
+                readOnly = false
+            }
+
+            guard rawGuest.hasPrefix("/") else {
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数「\(raw)」（客户机路径「\(rawGuest)」必须是绝对路径，以 '/' 开头）。\(helpHintZh)"
+                    : "Invalid '--mount' value '\(raw)' (guest path '\(rawGuest)' must be an absolute path starting with '/'). \(helpHintEn)"))
+            }
+            guard let normalizedGuest = normalizeGuestMountPoint(rawGuest) else {
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数「\(raw)」（客户机路径「\(rawGuest)」不能为根目录 '/'，且不能包含 '..' 或空白控制字符）。\(helpHintZh)"
+                    : "Invalid '--mount' value '\(raw)' (guest path '\(rawGuest)' must not be '/', contain '..', or contain whitespace/control characters). \(helpHintEn)"))
+            }
+            guard seenGuestPaths.insert(normalizedGuest).inserted else {
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数：客户机挂载路径「\(normalizedGuest)」重复指定。\(helpHintZh)"
+                    : "Invalid '--mount' arguments: duplicate guest mount path '\(normalizedGuest)'. \(helpHintEn)"))
+            }
+
+            let canonicalHost = canonicalizeHostDirectoryPath(rawHost)
+            let tag = VirtioFSMountSpec.makeUniqueMountTag(
+                forGuestMountPoint: normalizedGuest,
+                existingTags: seenTags
+            )
+            seenTags.insert(tag)
+
+            results.append(VirtioFSMountSpec(
+                mountTag: tag,
+                hostDirectoryPath: canonicalHost,
+                guestMountPoint: normalizedGuest,
+                readOnly: readOnly
+            ))
+        }
+        return .success(results)
+    }
+
+    /// Resolves `~`, relative paths (against current working directory), `.`, `..`, duplicate `/`, and trailing `/`
+    /// into a clean absolute POSIX path without rewriting `/private/var` <-> `/var` behind the caller's back.
+    private static func canonicalizeHostDirectoryPath(_ rawHost: String) -> String {
+        let expanded = (rawHost as NSString).expandingTildeInPath
+        let absRaw: String
+        if expanded.hasPrefix("/") {
+            absRaw = expanded
+        } else {
+            absRaw = FileManager.default.currentDirectoryPath + "/" + expanded
+        }
+        var stack: [String] = []
+        for seg in absRaw.split(separator: "/", omittingEmptySubsequences: true) {
+            if seg == "." {
+                continue
+            } else if seg == ".." {
+                if !stack.isEmpty {
+                    stack.removeLast()
+                }
+            } else {
+                stack.append(String(seg))
+            }
+        }
+        return "/" + stack.joined(separator: "/")
+    }
+
+    private static func normalizeGuestMountPoint(_ raw: String) -> String? {
+        guard raw.hasPrefix("/") else { return nil }
+        for scalar in raw.unicodeScalars {
+            if scalar.value <= 0x20 || scalar.value == 0x7F {
+                return nil
+            }
+        }
+        let rawSegments = raw.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard !rawSegments.isEmpty else { return nil }
+        for seg in rawSegments {
+            if seg == "." || seg == ".." {
+                return nil
+            }
+        }
+        return "/" + rawSegments.joined(separator: "/")
     }
 
     /// Parses `<N>G` / `<N>GiB` / `<N>GB` (`N * 1024^3`) or `<N>M` / `<N>MiB` / `<N>MB` (`N * 1024^2`) for `N >= 1`.
@@ -2811,6 +2966,7 @@ public struct AgentVMCLIRunner: Sendable {
     struct SubcommandGrammar: Sendable {
         var flags: Set<String> = []
         var valueOptions: Set<String> = []
+        var multiValueOptions: Set<String> = []
         /// `nil` means the subcommand parses its own tail (`exec` hands everything after the VM to the guest).
         var maxPositionals: Int? = 0
         var allowedFirstPositional: Set<String>? = nil
@@ -2820,6 +2976,7 @@ public struct AgentVMCLIRunner: Sendable {
         var positionals: [String] = []
         var flags: Set<String> = []
         var options: [String: String] = [:]
+        var multiOptions: [String: [String]] = [:]
     }
 
     public struct SubcommandUsageError: Error, Sendable {
@@ -2832,7 +2989,11 @@ public struct AgentVMCLIRunner: Sendable {
 
     static let subcommandGrammars: [String: SubcommandGrammar] = {
         let lifecycle = SubcommandGrammar(maxPositionals: 1)
-        let branch = SubcommandGrammar(flags: ["--no-boot", "--boot"], valueOptions: ["--owner"], maxPositionals: 2)
+        let branch = SubcommandGrammar(
+            flags: ["--no-boot", "--boot", "--no-mounts"],
+            valueOptions: ["--owner"],
+            maxPositionals: 2
+        )
         let list = SubcommandGrammar(flags: ["--json"])
         return [
             "doctor": SubcommandGrammar(),
@@ -2856,6 +3017,7 @@ public struct AgentVMCLIRunner: Sendable {
             ),
             "create": SubcommandGrammar(
                 valueOptions: ["--owner", "--cpus", "--memory-mb", "--image", "--disk-size"],
+                multiValueOptions: ["--mount"],
                 maxPositionals: 1
             ),
             "up": lifecycle, "boot": lifecycle, "start": lifecycle,
@@ -2899,6 +3061,20 @@ public struct AgentVMCLIRunner: Sendable {
                 if let eq = token.firstIndex(of: "="), token.hasPrefix("--") {
                     name = String(token[..<eq])
                     inlineValue = String(token[token.index(after: eq)...])
+                }
+                if grammar.multiValueOptions.contains(name) {
+                    if let inlineValue {
+                        parsed.multiOptions[name, default: []].append(inlineValue)
+                        idx += 1
+                    } else if idx + 1 < arguments.count {
+                        parsed.multiOptions[name, default: []].append(arguments[idx + 1])
+                        idx += 2
+                    } else {
+                        return .failure(SubcommandUsageError(message: isZh
+                            ? "选项「\(name)」需要一个值。\(helpHintZh)"
+                            : "Option '\(name)' requires a value. \(helpHintEn)"))
+                    }
+                    continue
                 }
                 if grammar.valueOptions.contains(name) {
                     if let inlineValue {
@@ -3081,10 +3257,11 @@ public struct AgentVMCLIRunner: Sendable {
               image list [--json]             列出基础镜像目录条目、支持状态与共享缓存状态（默认 ~/Library/Caches/AgentVM/images）
               image pull <id>                 通过 HTTPS（支持断点续传）下载基础镜像至共享缓存并校验大小与 SHA-512
               image verify <id>               在本地重新计算缓存镜像的 SHA-512 与大小并核对固定目录记录（不联网）
-              create <名称> [--image <id>] [--disk-size <N>G] [--cpus N] [--memory-mb MB]
-                                              从已校验缓存镜像克隆创建虚拟机（不传 --image 则创建空稀疏 GPT 磁盘）
+              create <名称> [--image <id>] [--disk-size <N>G] [--cpus N] [--memory-mb MB] [--mount <宿主机目录>:<客户机路径>[:ro]]...
+                                              从已校验缓存镜像克隆创建虚拟机（不传 --image 则创建空稀疏 GPT 磁盘）；--mount 可重复指定 VirtioFS 共享目录
               up | pause | resume | halt <vm> 控制虚拟机生命周期（无客户机系统且未传 --backend simulation 时返回错误）
-              branch <源虚拟机> <新分支名>    基于 APFS clonefile(2) 派生写时复制磁盘与快照分支
+              branch <源虚拟机> <新分支名> [--boot|--no-boot] [--no-mounts] [--owner <智能体>]
+                                              基于 APFS clonefile(2) 派生写时复制磁盘与快照分支（默认继承父机 --mount 共享目录；注意：多台分叉子机共享同一个读写目录会互相改写宿主机文件，需隔离时请加 --no-mounts）
               snapshot [list [--json] | <vm> <标题>]
                                               列出（含分配字节与不与其他克隆共享的私有字节）或捕获 CoW 磁盘快照检查点
               restore <快照ID>                将虚拟机磁盘回滚至指定快照节点
@@ -3131,10 +3308,11 @@ public struct AgentVMCLIRunner: Sendable {
           image list [--json]             List curated base images, support status, and shared cache status (AGENTVM_IMAGE_CACHE)
           image pull <id>                 Download base image over HTTPS (resumable Range) and verify size & SHA-512
           image verify <id>               Recompute cached image SHA-512 & size against pinned catalog entry (offline)
-          create <name> [--image <id>] [--disk-size <N>G] [--cpus N] [--memory-mb MB]
-                                          Provision a VM cloned from a verified cached image (or an empty GPT disk without --image)
+          create <name> [--image <id>] [--disk-size <N>G] [--cpus N] [--memory-mb MB] [--mount <host-dir>:<guest-path>[:ro]]...
+                                          Provision a VM cloned from a verified cached image (or an empty GPT disk without --image); repeat --mount for VirtioFS shares
           up | pause | resume | halt <vm> Control VM lifecycle (fails honestly if disk has no bootable guest OS)
-          branch <src-vm> <branch-name>   Fork an APFS clonefile(2) Copy-on-Write disk & snapshot branch
+          branch <src-vm> <branch-name> [--boot|--no-boot] [--no-mounts] [--owner <agent>]
+                                          Fork an APFS clonefile(2) Copy-on-Write disk & snapshot branch (inherits parent --mount shares by default; warning: multiple forked branches sharing the same read-write directory will overwrite each other's host files; pass --no-mounts to omit mounts)
           snapshot [list [--json] | <vm> <title>]
                                           List (with allocated & APFS private bytes not shared with other clones) or capture CoW disk snapshot checkpoints
           restore <snapshot-id>           Roll back VM disk & topology to a snapshot node

@@ -313,6 +313,11 @@ public enum RestoreFailureOutcomeState: Codable, Hashable, Sendable {
     case stoppedAfterDiskRestored(preRestoreSnapshotID: SnapshotID)
 }
 
+public enum SharedDirectoryErrorReason: String, Codable, Hashable, Sendable {
+    case doesNotExist
+    case notADirectory
+}
+
 public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case virtualizationUnsupported(reason: String)
     case virtualizationEntitlementMissing
@@ -370,6 +375,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case cliUsageError(detail: String)
     case ipcDaemonUnavailable(socketPath: String, detail: String)
     case resourceQuotaExceeded(resource: String, requested: String, limit: String)
+    case invalidSharedDirectory(path: String, guestMountPoint: String?, reason: SharedDirectoryErrorReason)
 
     public var errorCode: String {
         switch self {
@@ -423,6 +429,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .cliUsageError: return "ERR_CLI_USAGE"
         case .ipcDaemonUnavailable: return "ERR_DAEMON_IPC"
         case .resourceQuotaExceeded: return "ERR_QUOTA_EXCEEDED"
+        case .invalidSharedDirectory: return "ERR_SHARED_DIR_INVALID"
         }
     }
 
@@ -680,6 +687,19 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return isZh
                 ? "超出集群配额（\(resource)）：请求 \(requested)，上限 \(limit)。"
                 : "Fleet quota exceeded for \(resource): requested \(requested), limit \(limit)."
+        case let .invalidSharedDirectory(path, guestMountPoint, reason):
+            let guestSuffixZh = guestMountPoint.map { "（对应客户机挂载点「\($0)」）" } ?? ""
+            let guestSuffixEn = guestMountPoint.map { " (for guest mount point '\($0)')" } ?? ""
+            switch reason {
+            case .doesNotExist:
+                return isZh
+                    ? "VirtioFS 宿主机共享目录不存在：「\(path)」\(guestSuffixZh)。"
+                    : "VirtioFS host shared directory does not exist: '\(path)'\(guestSuffixEn)."
+            case .notADirectory:
+                return isZh
+                    ? "VirtioFS 宿主机共享路径不是目录：「\(path)」\(guestSuffixZh)。"
+                    : "VirtioFS host shared path is not a directory: '\(path)'\(guestSuffixEn)."
+            }
         }
     }
 
@@ -737,6 +757,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             }
         case .execOutputBufferOverflow:
             return "Drain stdout/stderr from 'agentvm exec' continuously or redirect large outputs to a file inside the guest."
+        case let .invalidSharedDirectory(path, _, _):
+            return "Ensure '\(path)' exists on the host as a directory before creating or booting the VM."
         default:
             return "Inspect the Audit Journal drawer or run 'agentvm doctor' for detailed diagnostics."
         }

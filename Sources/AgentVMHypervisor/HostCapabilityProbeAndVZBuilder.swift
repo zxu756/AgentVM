@@ -301,13 +301,26 @@ public struct VZConfigurationTranslator: Sendable {
         var fsDevices: [VZDirectorySharingDeviceConfiguration] = []
         for mount in spec.virtioFSMounts {
             let dirURL = URL(fileURLWithPath: mount.hostDirectoryPath)
-            if FileManager.default.fileExists(atPath: dirURL.path) {
-                let sharedDir = VZSharedDirectory(url: dirURL, readOnly: mount.readOnly)
-                let singleShare = VZSingleDirectoryShare(directory: sharedDir)
-                let dev = VZVirtioFileSystemDeviceConfiguration(tag: mount.mountTag)
-                dev.share = singleShare
-                fsDevices.append(dev)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: dirURL.path, isDirectory: &isDir) else {
+                throw AgentVMError.invalidSharedDirectory(
+                    path: mount.hostDirectoryPath,
+                    guestMountPoint: mount.guestMountPoint,
+                    reason: .doesNotExist
+                )
             }
+            guard isDir.boolValue else {
+                throw AgentVMError.invalidSharedDirectory(
+                    path: mount.hostDirectoryPath,
+                    guestMountPoint: mount.guestMountPoint,
+                    reason: .notADirectory
+                )
+            }
+            let sharedDir = VZSharedDirectory(url: dirURL, readOnly: mount.readOnly)
+            let singleShare = VZSingleDirectoryShare(directory: sharedDir)
+            let dev = VZVirtioFileSystemDeviceConfiguration(tag: mount.mountTag)
+            dev.share = singleShare
+            fsDevices.append(dev)
             #if arch(arm64)
             if mount.enableRosettaLinuxBinFmt && VZLinuxRosettaDirectoryShare.availability == .installed {
                 if let rosettaShare = try? VZLinuxRosettaDirectoryShare() {

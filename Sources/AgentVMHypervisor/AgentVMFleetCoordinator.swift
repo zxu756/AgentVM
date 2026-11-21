@@ -982,13 +982,38 @@ public actor AgentVMFleetCoordinator {
     /// 1. Discards any state left by `--backend simulation` (`loadVMForOperation`).
     /// 2. Verifies a bootable guest OS/kernel exists on disk (`verifyBootableGuestSystem`).
     /// 3. Verifies host Virtualization.framework support and current executable's `com.apple.security.virtualization` entitlement.
+    public nonisolated static func verifySharedHostDirectories(_ mounts: [VirtioFSMountSpec]) throws {
+        for mount in mounts {
+            let dirURL = URL(fileURLWithPath: mount.hostDirectoryPath)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: dirURL.path, isDirectory: &isDir) else {
+                throw AgentVMError.invalidSharedDirectory(
+                    path: mount.hostDirectoryPath,
+                    guestMountPoint: mount.guestMountPoint,
+                    reason: .doesNotExist
+                )
+            }
+            guard isDir.boolValue else {
+                throw AgentVMError.invalidSharedDirectory(
+                    path: mount.hostDirectoryPath,
+                    guestMountPoint: mount.guestMountPoint,
+                    reason: .notADirectory
+                )
+            }
+        }
+    }
+
     public func preflightPersistentBoot(
         _ vmID: VMID,
         checkProcessEntitlement: Bool = true,
-        hasEntitlementOverride: (@Sendable () -> Bool)? = nil
+        hasEntitlementOverride: (@Sendable () -> Bool)? = nil,
+        verifySharedDirectories: Bool = true
     ) async throws -> VMInstanceRecord {
         let record = try await loadVMForOperation(vmID)
         try verifyBootableGuestSystem(for: record.spec)
+        if verifySharedDirectories {
+            try Self.verifySharedHostDirectories(record.spec.virtioFSMounts)
+        }
         if checkProcessEntitlement {
             guard VZVirtualMachine.isSupported else {
                 throw AgentVMError.virtualizationUnsupported(
@@ -1268,6 +1293,9 @@ public actor AgentVMFleetCoordinator {
             injectGuestVsockAgent: true
         )
         rawCloudInit.hostname = CloudInitSpec.sanitizeHostname(rawCloudInit.hostname)
+        if rawCloudInit.mounts.isEmpty && !sharedDirectories.isEmpty {
+            rawCloudInit.mounts = CloudInitSpec.virtioFSMountEntries(from: sharedDirectories)
+        }
         let enrichedCloudInit = rawCloudInit.injectGuestVsockAgent
             ? guestBootstrap.applying(to: rawCloudInit, includePythonAptPackage: false)
             : rawCloudInit
@@ -1414,6 +1442,7 @@ public actor AgentVMFleetCoordinator {
         cloudInitOverride: CloudInitSpec? = nil
     ) async throws -> FleetCreationSummary {
         try await rejectDuplicateVMName(name)
+        try Self.verifySharedHostDirectories(sharedDirectories)
 
         // 1. Strict offline cache & index stat verification (never downloads, never touches network)
         let cachedImageURL = try await imageCatalog.verifiedCachedImageURL(forID: imageID)
@@ -1474,6 +1503,9 @@ public actor AgentVMFleetCoordinator {
             injectGuestVsockAgent: true
         )
         rawCloudInit.hostname = CloudInitSpec.sanitizeHostname(rawCloudInit.hostname)
+        if rawCloudInit.mounts.isEmpty && !sharedDirectories.isEmpty {
+            rawCloudInit.mounts = CloudInitSpec.virtioFSMountEntries(from: sharedDirectories)
+        }
         let enrichedCloudInit = rawCloudInit.injectGuestVsockAgent
             ? guestBootstrap.applying(to: rawCloudInit, includePythonAptPackage: false)
             : rawCloudInit
@@ -1696,6 +1728,7 @@ public actor AgentVMFleetCoordinator {
         )
         let record = try await loadVMForOperation(vmID)
         try verifyBootableGuestSystem(for: record.spec)
+        try Self.verifySharedHostDirectories(record.spec.virtioFSMounts)
         throw AgentVMError.persistentBootRequiresDaemon(vmName: record.spec.name)
     }
 
@@ -1752,6 +1785,7 @@ public actor AgentVMFleetCoordinator {
 
         if !isSimulationBackend {
             try verifyBootableGuestSystem(for: record.spec)
+            try Self.verifySharedHostDirectories(record.spec.virtioFSMounts)
         }
 
         let manifest = try await store.loadManifest()
@@ -3096,7 +3130,8 @@ public actor AgentVMFleetCoordinator {
         fromVMID parentVMID: VMID,
         branchName: String,
         agentOwnerTag: String,
-        bootImmediately: Bool = false
+        bootImmediately: Bool = false,
+        inheritMounts: Bool = true
     ) async throws -> CoWBranchForkResult {
         guard let existingParent = try await store.fetchVM(parentVMID) else {
             throw AgentVMError.vmNotFound(parentVMID)
@@ -3187,11 +3222,15 @@ public actor AgentVMFleetCoordinator {
         }
         // Reassign port forwards to avoid host port collision
         childSpec.portForwards = []
+        if !inheritMounts {
+            childSpec.virtioFSMounts = []
+        }
         if childSpec.serialAndDisplay.serialLogPath != nil {
             childSpec.serialAndDisplay.serialLogPath = consoleLogURL(forVMName: branchName).path
         }
         let (childCloudInit, childISOURL) = try synthesizeChildCloudInitAndISO(
             parentSpec: parentRecord.spec,
+            childVirtioFSMounts: childSpec.virtioFSMounts,
             childID: childID,
             childBranchName: branchName,
             childSlug: slug,
@@ -3306,6 +3345,7 @@ public actor AgentVMFleetCoordinator {
 
     private func synthesizeChildCloudInitAndISO(
         parentSpec: VMSpec,
+        childVirtioFSMounts: [VirtioFSMountSpec],
         childID: VMID,
         childBranchName: String,
         childSlug: String,
@@ -3322,6 +3362,7 @@ public actor AgentVMFleetCoordinator {
         )
         childCI.instanceID = childID.rawValue
         childCI.hostname = childHostname
+        childCI.mounts = CloudInitSpec.virtioFSMountEntries(from: childVirtioFSMounts)
 
         if parentSpec.networkInterfaces.first?.mode == .systemNAT {
             childCI.staticIPv4CIDR = nil
@@ -3337,8 +3378,9 @@ public actor AgentVMFleetCoordinator {
 
         let workspaceBoot = ISO9660CloudInitBuilder.workspaceInitBootCommand
         let machineIDBoot = ISO9660CloudInitBuilder.machineIDResetBootCommand
+        let parentMountMkdirCmds = Set(parentSpec.virtioFSMounts.map { ["mkdir", "-p", $0.guestMountPoint] })
         var customBootCommands = childCI.bootCommands.filter {
-            $0 != workspaceBoot && $0 != machineIDBoot
+            $0 != workspaceBoot && $0 != machineIDBoot && !parentMountMkdirCmds.contains($0)
         }
         customBootCommands.insert(workspaceBoot, at: 0)
         customBootCommands.append(machineIDBoot)
@@ -3580,13 +3622,15 @@ public actor AgentVMFleetCoordinator {
     public func forkBranchInDaemon(
         fromVMID parentVMID: VMID,
         branchName: String,
-        agentOwnerTag: String
+        agentOwnerTag: String,
+        inheritMounts: Bool = true
     ) async throws -> LiveDaemonBranchResult {
         try await enqueueVMLifecycleOperation(for: parentVMID) {
             try await self.forkBranchInDaemonUnlocked(
                 fromVMID: parentVMID,
                 branchName: branchName,
-                agentOwnerTag: agentOwnerTag
+                agentOwnerTag: agentOwnerTag,
+                inheritMounts: inheritMounts
             )
         }
     }
@@ -3594,7 +3638,8 @@ public actor AgentVMFleetCoordinator {
     private func forkBranchInDaemonUnlocked(
         fromVMID parentVMID: VMID,
         branchName: String,
-        agentOwnerTag: String
+        agentOwnerTag: String,
+        inheritMounts: Bool
     ) async throws -> LiveDaemonBranchResult {
         let startNs = DispatchTime.now().uptimeNanoseconds
         guard let parentRecord = try await store.fetchVM(parentVMID) else {
@@ -3605,7 +3650,8 @@ public actor AgentVMFleetCoordinator {
                 fromVMID: parentVMID,
                 branchName: branchName,
                 agentOwnerTag: agentOwnerTag,
-                bootImmediately: false
+                bootImmediately: false,
+                inheritMounts: inheritMounts
             )
             return LiveDaemonBranchResult(fork: coldFork, pauseDurationMilliseconds: 0)
         }
@@ -3736,11 +3782,15 @@ public actor AgentVMFleetCoordinator {
                 childSpec.networkInterfaces[0].macAddress = childMAC
             }
             childSpec.portForwards = []
+            if !inheritMounts {
+                childSpec.virtioFSMounts = []
+            }
             if childSpec.serialAndDisplay.serialLogPath != nil {
                 childSpec.serialAndDisplay.serialLogPath = consoleLogURL(forVMName: branchName).path
             }
             let (childCloudInit, childISOURL) = try synthesizeChildCloudInitAndISO(
                 parentSpec: parentRecord.spec,
+                childVirtioFSMounts: childSpec.virtioFSMounts,
                 childID: childID,
                 childBranchName: branchName,
                 childSlug: slug,

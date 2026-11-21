@@ -165,6 +165,74 @@ public struct VirtioFSMountSpec: Codable, Hashable, Sendable, Identifiable {
         self.readOnly = readOnly
         self.enableRosettaLinuxBinFmt = enableRosettaLinuxBinFmt
     }
+
+    /// Generates a deterministic, ASCII-safe VirtioFS `mountTag` within `1...36` UTF-8 bytes
+    /// that does not collide with `existingTags`.
+    public static func makeUniqueMountTag(
+        forGuestMountPoint guestMountPoint: String,
+        existingTags: Set<String>
+    ) -> String {
+        let stripped = guestMountPoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var asciiBytes: [UInt8] = []
+        var lastWasHyphen = false
+        for scalar in stripped.unicodeScalars {
+            let v = scalar.value
+            let isLower = (v >= 0x61 && v <= 0x7A)
+            let isUpper = (v >= 0x41 && v <= 0x5A)
+            let isDigit = (v >= 0x30 && v <= 0x39)
+            let isAllowedPunct = (v == 0x2D || v == 0x5F || v == 0x2E)
+            if isLower || isDigit || isAllowedPunct {
+                if v == 0x2D {
+                    if !asciiBytes.isEmpty && !lastWasHyphen {
+                        asciiBytes.append(0x2D)
+                        lastWasHyphen = true
+                    }
+                } else {
+                    asciiBytes.append(UInt8(v))
+                    lastWasHyphen = false
+                }
+            } else if isUpper {
+                asciiBytes.append(UInt8(v + 32))
+                lastWasHyphen = false
+            } else {
+                if !asciiBytes.isEmpty && !lastWasHyphen {
+                    asciiBytes.append(0x2D)
+                    lastWasHyphen = true
+                }
+            }
+        }
+        while asciiBytes.last == 0x2D || asciiBytes.last == 0x2E {
+            asciiBytes.removeLast()
+        }
+        while asciiBytes.first == 0x2D || asciiBytes.first == 0x2E {
+            asciiBytes.removeFirst()
+        }
+        let rawBase = asciiBytes.isEmpty ? "mount" : String(decoding: asciiBytes, as: UTF8.self)
+        var base = String(rawBase.prefix(28))
+        while base.hasSuffix("-") || base.hasSuffix(".") {
+            base.removeLast()
+        }
+        if base.isEmpty {
+            base = "mount"
+        }
+        if !existingTags.contains(base) && (1...36).contains(base.utf8.count) {
+            return base
+        }
+        var counter = 2
+        while true {
+            let suffix = "-\(counter)"
+            let maxPrefix = max(1, 36 - suffix.utf8.count)
+            var prefix = String(base.prefix(maxPrefix))
+            while (prefix.hasSuffix("-") || prefix.hasSuffix(".")) && prefix.count > 1 {
+                prefix.removeLast()
+            }
+            let candidate = prefix + suffix
+            if !existingTags.contains(candidate) && (1...36).contains(candidate.utf8.count) {
+                return candidate
+            }
+            counter += 1
+        }
+    }
 }
 
 public enum NetworkAttachmentMode: String, Codable, Hashable, Sendable, CaseIterable {
@@ -283,6 +351,9 @@ public struct CloudInitWriteFile: Codable, Hashable, Sendable, Identifiable {
 }
 
 public struct CloudInitSpec: Codable, Hashable, Sendable {
+    public static let virtioFSMountReadWriteOptions = "rw,nofail,x-systemd.before=local-fs.target"
+    public static let virtioFSMountReadOnlyOptions = "ro,nofail,x-systemd.before=local-fs.target"
+
     public var instanceID: String
     public var hostname: String
     public var defaultUser: String
@@ -290,6 +361,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
     public var sshAuthorizedKeys: [String]
     public var aptPackages: [String]
     public var bootCommands: [[String]]
+    public var mounts: [[String]]
     public var writeFiles: [CloudInitWriteFile]
     public var runCommands: [String]
     public var staticIPv4CIDR: String?
@@ -306,6 +378,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         sshAuthorizedKeys: [String] = [],
         aptPackages: [String] = [],
         bootCommands: [[String]] = [],
+        mounts: [[String]] = [],
         writeFiles: [CloudInitWriteFile] = [],
         runCommands: [String] = [],
         staticIPv4CIDR: String? = nil,
@@ -321,6 +394,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         self.sshAuthorizedKeys = sshAuthorizedKeys
         self.aptPackages = aptPackages
         self.bootCommands = bootCommands
+        self.mounts = mounts
         self.writeFiles = writeFiles
         self.runCommands = runCommands
         self.staticIPv4CIDR = staticIPv4CIDR
@@ -328,6 +402,20 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         self.nameservers = nameservers
         self.injectGuestVsockAgent = injectGuestVsockAgent
         self.timezone = timezone
+    }
+
+    public static func virtioFSMountEntries(from mounts: [VirtioFSMountSpec]) -> [[String]] {
+        mounts.map { mount in
+            let options = mount.readOnly ? Self.virtioFSMountReadOnlyOptions : Self.virtioFSMountReadWriteOptions
+            return [
+                mount.mountTag,
+                mount.guestMountPoint,
+                "virtiofs",
+                options,
+                "0",
+                "0"
+            ]
+        }
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -338,6 +426,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         case sshAuthorizedKeys
         case aptPackages
         case bootCommands
+        case mounts
         case writeFiles
         case runCommands
         case staticIPv4CIDR
@@ -356,6 +445,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         self.sshAuthorizedKeys = try container.decodeIfPresent([String].self, forKey: .sshAuthorizedKeys) ?? []
         self.aptPackages = try container.decodeIfPresent([String].self, forKey: .aptPackages) ?? []
         self.bootCommands = try container.decodeIfPresent([[String]].self, forKey: .bootCommands) ?? []
+        self.mounts = try container.decodeIfPresent([[String]].self, forKey: .mounts) ?? []
         self.writeFiles = try container.decodeIfPresent([CloudInitWriteFile].self, forKey: .writeFiles) ?? []
         self.runCommands = try container.decodeIfPresent([String].self, forKey: .runCommands) ?? []
         self.staticIPv4CIDR = try container.decodeIfPresent(String.self, forKey: .staticIPv4CIDR)
@@ -374,6 +464,7 @@ public struct CloudInitSpec: Codable, Hashable, Sendable {
         try container.encode(sshAuthorizedKeys, forKey: .sshAuthorizedKeys)
         try container.encode(aptPackages, forKey: .aptPackages)
         try container.encode(bootCommands, forKey: .bootCommands)
+        try container.encode(mounts, forKey: .mounts)
         try container.encode(writeFiles, forKey: .writeFiles)
         try container.encode(runCommands, forKey: .runCommands)
         try container.encodeIfPresent(staticIPv4CIDR, forKey: .staticIPv4CIDR)

@@ -55,6 +55,7 @@ map_module_to_filters() {
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
             echo "M3Stage4AutoCheckpointTests"
+            echo "M4Stage1VirtioFSMountTests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
@@ -77,6 +78,7 @@ map_module_to_filters() {
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
             echo "M3Stage4AutoCheckpointTests"
+            echo "M4Stage1VirtioFSMountTests"
             ;;
         AgentVMNetSwitch|NetSwitch)
             echo "NetSwitchDissectorAndPCAPTests"
@@ -110,6 +112,7 @@ map_module_to_filters() {
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
             echo "M3Stage4AutoCheckpointTests"
+            echo "M4Stage1VirtioFSMountTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -128,6 +131,7 @@ map_module_to_filters() {
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
             echo "M3Stage4AutoCheckpointTests"
+            echo "M4Stage1VirtioFSMountTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -153,6 +157,7 @@ map_module_to_filters() {
             echo "M3Stage3aDaemonLiveForkSnapshotTests"
             echo "M3Stage3bRestoreTests"
             echo "M3Stage4AutoCheckpointTests"
+            echo "M4Stage1VirtioFSMountTests"
             ;;
         *)
             echo "ERROR: Unknown module '$mod'" >&2

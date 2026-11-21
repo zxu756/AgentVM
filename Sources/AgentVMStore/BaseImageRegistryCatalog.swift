@@ -147,6 +147,18 @@ public struct ImageCacheEvictionPlan: Codable, Hashable, Sendable {
 
 // MARK: - Curated Apple Silicon & Rosetta Base Image Registry Actor
 
+public enum ImageCacheSyncTarget: String, Sendable, Equatable {
+    case partFile
+    case cachedFile
+    case cacheDirectory
+}
+
+public typealias ImageFileSyncHandler = @Sendable (
+    _ fd: Int32,
+    _ path: String,
+    _ target: ImageCacheSyncTarget
+) -> Int32
+
 public actor BaseImageRegistryCatalog {
     private struct PersistedCacheManifest: Codable, Sendable {
         var formatVersion: Int = 2
@@ -167,10 +179,41 @@ public actor BaseImageRegistryCatalog {
 
     private let projectStore: AgentVMProjectStore?
     private let urlSessionConfiguration: URLSessionConfiguration?
+    private let fileSyncHandler: ImageFileSyncHandler
     private var entriesByID: [String: BaseImageCatalogEntry]
     private var cacheMetadataByID: [String: CachedImageIndexRecord]
     private let jsonEncoder: JSONEncoder
     private let jsonDecoder: JSONDecoder
+
+    public nonisolated static func defaultSynchronizeDescriptor(
+        fd: Int32,
+        path: String,
+        target: ImageCacheSyncTarget
+    ) -> Int32 {
+        while true {
+            if Darwin.fcntl(fd, F_FULLFSYNC) == 0 {
+                return 0
+            }
+            let code = Darwin.errno
+            if code == EINTR {
+                continue
+            }
+            if code == ENOTSUP || code == EINVAL {
+                break
+            }
+            return code != 0 ? code : EIO
+        }
+        while true {
+            if Darwin.fsync(fd) == 0 {
+                return 0
+            }
+            let code = Darwin.errno
+            if code == EINTR {
+                continue
+            }
+            return code != 0 ? code : EIO
+        }
+    }
 
     public static func defaultCacheDirectoryURL(
         environment: [String: String] = ProcessInfo.processInfo.environment
@@ -209,11 +252,13 @@ public actor BaseImageRegistryCatalog {
         curatedEntries: [BaseImageCatalogEntry]? = nil,
         urlSessionConfiguration: URLSessionConfiguration? = nil,
         projectStore: AgentVMProjectStore? = nil,
-        createIfMissing: Bool = false
+        createIfMissing: Bool = false,
+        fileSyncHandler: ImageFileSyncHandler? = nil
     ) throws {
         let standardized = cacheDirectoryURL.standardizedFileURL
         self.cacheDirectoryURL = standardized
         self.urlSessionConfiguration = urlSessionConfiguration
+        self.fileSyncHandler = fileSyncHandler ?? Self.defaultSynchronizeDescriptor
         self.projectStore = projectStore
 
         let encoder = JSONEncoder()
@@ -525,8 +570,25 @@ public actor BaseImageRegistryCatalog {
                     )
                 }
             }
+            try Self.synchronizeFile(
+                at: targetURL,
+                target: .cachedFile,
+                detail: "Failed syncing copied offline image in cache directory.",
+                using: fileSyncHandler
+            )
+            try Self.synchronizeDirectory(
+                at: cacheDirectoryURL,
+                detail: "Failed syncing cache directory after copying offline image.",
+                using: fileSyncHandler
+            )
             finalImageURL = targetURL
         } else {
+            try Self.synchronizeFile(
+                at: standardizedSource,
+                target: .cachedFile,
+                detail: "Failed syncing registered offline image.",
+                using: fileSyncHandler
+            )
             finalImageURL = standardizedSource
         }
 
@@ -615,6 +677,17 @@ public actor BaseImageRegistryCatalog {
             }
             try fm.copyItem(at: sourceURL, to: targetURL)
         }
+        try Self.synchronizeFile(
+            at: targetURL,
+            target: .cachedFile,
+            detail: "Failed syncing staged curated image in cache directory.",
+            using: fileSyncHandler
+        )
+        try Self.synchronizeDirectory(
+            at: cacheDirectoryURL,
+            detail: "Failed syncing cache directory after staging curated image.",
+            using: fileSyncHandler
+        )
 
         let logicalBytes = Self.queryLogicalFileSize(at: targetURL)
         let physBytes = Self.queryPhysicalFileSize(at: targetURL)
@@ -740,6 +813,17 @@ public actor BaseImageRegistryCatalog {
                         )
                     }
                 }
+                try Self.synchronizeFile(
+                    at: finalURL,
+                    target: .cachedFile,
+                    detail: "Failed syncing verified cached image file.",
+                    using: fileSyncHandler
+                )
+                try Self.synchronizeDirectory(
+                    at: cacheDirectoryURL,
+                    detail: "Failed syncing cache directory for verified cached image.",
+                    using: fileSyncHandler
+                )
                 guard let refreshedStat = Self.posixFileStat(at: finalURL.path) else {
                     throw AgentVMError.diskImageOperationFailed(
                         path: finalURL.path,
@@ -836,6 +920,12 @@ public actor BaseImageRegistryCatalog {
             } else if existingBytes == expectedSize {
                 if let partDigest = try? BinaryChecksums.sha512HexFile(at: partURL),
                    partDigest.lowercased() == expectedSHA.lowercased() {
+                    try Self.synchronizeFile(
+                        at: partURL,
+                        target: .partFile,
+                        detail: "Failed syncing pre-existing complete partial image file before finalization.",
+                        using: fileSyncHandler
+                    )
                     return try await finalizeVerifiedPartFile(
                         curated: curated,
                         partURL: partURL,
@@ -871,6 +961,7 @@ public actor BaseImageRegistryCatalog {
             resumeOffset: resumeOffset,
             expectedTotalBytes: expectedSize,
             configurationOverride: urlSessionConfiguration,
+            fileSyncHandler: fileSyncHandler,
             progress: progress
         )
 
@@ -965,6 +1056,11 @@ public actor BaseImageRegistryCatalog {
                 detail: "Atomic rename from '\(partURL.lastPathComponent)' to '\(finalURL.lastPathComponent)' failed."
             )
         }
+        try Self.synchronizeDirectory(
+            at: cacheDirectoryURL,
+            detail: "Failed syncing base image cache directory after atomic rename.",
+            using: fileSyncHandler
+        )
 
         guard let finalStat = Self.posixFileStat(at: finalURL.path) else {
             throw AgentVMError.diskImageOperationFailed(
@@ -1448,6 +1544,75 @@ public actor BaseImageRegistryCatalog {
         return config
     }
 
+    private nonisolated static func synchronizeFile(
+        at fileURL: URL,
+        target: ImageCacheSyncTarget,
+        detail: String,
+        using syncHandler: ImageFileSyncHandler
+    ) throws {
+        let standardizedPath = fileURL.standardizedFileURL.path
+        let fd = Darwin.open(standardizedPath, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
+            let code = Darwin.errno
+            throw AgentVMError.diskImageOperationFailed(
+                path: standardizedPath,
+                errnoCode: code != 0 ? code : EIO,
+                detail: "Unable to open '\(fileURL.lastPathComponent)' for durability sync."
+            )
+        }
+        let syncErrno = syncHandler(fd, standardizedPath, target)
+        let closeRC = Darwin.close(fd)
+        let closeCode = closeRC != 0 ? (Darwin.errno != 0 ? Darwin.errno : EIO) : 0
+        if syncErrno != 0 {
+            throw AgentVMError.diskImageOperationFailed(
+                path: standardizedPath,
+                errnoCode: syncErrno,
+                detail: detail
+            )
+        }
+        if closeCode != 0 {
+            throw AgentVMError.diskImageOperationFailed(
+                path: standardizedPath,
+                errnoCode: closeCode,
+                detail: "Failed closing descriptor after durability sync on '\(fileURL.lastPathComponent)'."
+            )
+        }
+    }
+
+    private nonisolated static func synchronizeDirectory(
+        at directoryURL: URL,
+        detail: String,
+        using syncHandler: ImageFileSyncHandler
+    ) throws {
+        let standardizedPath = directoryURL.standardizedFileURL.path
+        let dirFD = Darwin.open(standardizedPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard dirFD >= 0 else {
+            let code = Darwin.errno
+            throw AgentVMError.diskImageOperationFailed(
+                path: standardizedPath,
+                errnoCode: code != 0 ? code : EIO,
+                detail: "Unable to open cache directory '\(directoryURL.lastPathComponent)' for durability sync."
+            )
+        }
+        let syncErrno = syncHandler(dirFD, standardizedPath, .cacheDirectory)
+        let closeRC = Darwin.close(dirFD)
+        let closeCode = closeRC != 0 ? (Darwin.errno != 0 ? Darwin.errno : EIO) : 0
+        if syncErrno != 0 {
+            throw AgentVMError.diskImageOperationFailed(
+                path: standardizedPath,
+                errnoCode: syncErrno,
+                detail: detail
+            )
+        }
+        if closeCode != 0 {
+            throw AgentVMError.diskImageOperationFailed(
+                path: standardizedPath,
+                errnoCode: closeCode,
+                detail: "Failed closing cache directory descriptor after durability sync."
+            )
+        }
+    }
+
     private nonisolated static func performStreamingHTTPSDownload(
         imageID: String,
         remoteURL: URL,
@@ -1455,6 +1620,7 @@ public actor BaseImageRegistryCatalog {
         resumeOffset: UInt64,
         expectedTotalBytes: UInt64,
         configurationOverride: URLSessionConfiguration?,
+        fileSyncHandler: @escaping ImageFileSyncHandler,
         progress: (@Sendable (BaseImagePullProgress) -> Void)?
     ) async throws -> StreamingDownloadSummary {
         let sessionConfig = configurationOverride ?? makeDefaultDownloadSessionConfiguration()
@@ -1474,6 +1640,7 @@ public actor BaseImageRegistryCatalog {
             partURL: partURL,
             initialResumeOffset: resumeOffset,
             expectedTotalBytes: expectedTotalBytes,
+            fileSyncHandler: fileSyncHandler,
             progressHandler: progress
         )
         let session = URLSession(
@@ -1521,18 +1688,103 @@ public actor BaseImageRegistryCatalog {
     }
 }
 
-// MARK: - Streaming URLSession Delegate (HTTPS Redirect Gate + Range 206 / 200 File Writer)
+// MARK: - Dense Offset-Based .part Writer (POSIX write + Offset-Based HTTP 206 Resume)
+
+private struct OffsetPartFileWriter {
+    let fd: Int32
+    private(set) var logicalOffset: UInt64
+    private var fdOffset: UInt64
+
+    init(fd: Int32, startOffset: UInt64) {
+        self.fd = fd
+        self.logicalOffset = startOffset
+        self.fdOffset = startOffset
+    }
+
+    private mutating func seekDescriptorIfNeeded(to targetOffset: UInt64) -> Int32 {
+        guard fdOffset != targetOffset else { return 0 }
+        guard targetOffset <= UInt64(Int64.max) else { return EOVERFLOW }
+        let res = Darwin.lseek(fd, off_t(targetOffset), SEEK_SET)
+        if res < 0 || UInt64(res) != targetOffset {
+            let code = Darwin.errno
+            return code != 0 ? code : EIO
+        }
+        fdOffset = targetOffset
+        return 0
+    }
+
+    private static let maxSingleWriteBytes = 16 * 1024 * 1024
+
+    private mutating func writeRawBytes(_ base: UnsafeRawPointer, count: Int) -> Int32 {
+        guard count > 0 else { return 0 }
+        let seekErr = seekDescriptorIfNeeded(to: logicalOffset)
+        if seekErr != 0 { return seekErr }
+        var remaining = count
+        var localOff = 0
+        while remaining > 0 {
+            // Darwin write(2) returns EINVAL if nbyte > INT32_MAX; cap each syscall to 16 MiB.
+            let step = min(remaining, Self.maxSingleWriteBytes)
+            let written = Darwin.write(fd, base.advanced(by: localOff), step)
+            if written > 0 {
+                localOff += written
+                remaining -= written
+                logicalOffset &+= UInt64(written)
+                fdOffset &+= UInt64(written)
+            } else if written < 0 && Darwin.errno == EINTR {
+                continue
+            } else {
+                let code = Darwin.errno
+                return code != 0 ? code : EIO
+            }
+        }
+        return 0
+    }
+
+    mutating func append(_ data: Data) -> Int32 {
+        for region in data.regions where !region.isEmpty {
+            let err = region.withUnsafeBytes { rawBuf -> Int32 in
+                guard let base = rawBuf.baseAddress, rawBuf.count > 0 else { return 0 }
+                return writeRawBytes(base, count: rawBuf.count)
+            }
+            if err != 0 { return err }
+        }
+        return 0
+    }
+
+    mutating func finalizeLength() -> Int32 {
+        guard logicalOffset <= UInt64(Int64.max) else { return EOVERFLOW }
+        var st = Darwin.stat()
+        if Darwin.fstat(fd, &st) == 0, st.st_size == off_t(logicalOffset) {
+            return 0
+        }
+        while true {
+            if Darwin.ftruncate(fd, off_t(logicalOffset)) == 0 {
+                break
+            }
+            let code = Darwin.errno
+            if code == EINTR {
+                continue
+            }
+            return code != 0 ? code : EIO
+        }
+        return 0
+    }
+}
+
+// MARK: - Streaming URLSession Delegate (HTTPS Redirect Gate + Range 206 / 200 Dense Offset File Writer)
 
 private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let imageID: String
     private let partURL: URL
     private let initialResumeOffset: UInt64
     private let expectedTotalBytes: UInt64
+    private let fileSyncHandler: ImageFileSyncHandler
     private let progressHandler: (@Sendable (BaseImagePullProgress) -> Void)?
 
     private let lock = NSLock()
     private var continuation: CheckedContinuation<BaseImageRegistryCatalog.StreamingDownloadSummary, Error>?
     private var fileDescriptor: Int32 = -1
+    private var partWriter: OffsetPartFileWriter?
     private var activeStartOffset: UInt64 = 0
     private var bytesWrittenThisAttempt: UInt64 = 0
     private var lastReportedBytes: UInt64 = 0
@@ -1545,13 +1797,15 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
         partURL: URL,
         initialResumeOffset: UInt64,
         expectedTotalBytes: UInt64,
+        fileSyncHandler: @escaping ImageFileSyncHandler,
         progressHandler: (@Sendable (BaseImagePullProgress) -> Void)?
     ) {
         self.imageID = imageID
-        self.partURL = partURL
+        self.partURL = partURL.standardizedFileURL
         self.initialResumeOffset = initialResumeOffset
         self.expectedTotalBytes = expectedTotalBytes
         self.resolvedTotalBytes = expectedTotalBytes
+        self.fileSyncHandler = fileSyncHandler
         self.progressHandler = progressHandler
         super.init()
     }
@@ -1656,14 +1910,74 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
                 return
             }
 
-            let fd = Darwin.open(partURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+            // Open without O_APPEND so explicit byte offsets work across HTTP 206 resume.
+            let fd = Darwin.open(partURL.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
             guard fd >= 0 else {
-                let code = errno
+                let code = Darwin.errno
                 recordFailure(
                     AgentVMError.diskImageOperationFailed(
                         path: partURL.path,
-                        errnoCode: code,
-                        detail: "Unable to open partial download file for appending."
+                        errnoCode: code != 0 ? code : EIO,
+                        detail: "Unable to open partial download file for offset-based resume."
+                    )
+                )
+                completionHandler(.cancel)
+                return
+            }
+
+            var st = Darwin.stat()
+            guard Darwin.fstat(fd, &st) == 0 else {
+                let code = Darwin.errno
+                _ = Darwin.close(fd)
+                recordFailure(
+                    AgentVMError.diskImageOperationFailed(
+                        path: partURL.path,
+                        errnoCode: code != 0 ? code : EIO,
+                        detail: "Unable to fstat partial download file during HTTP 206 resume."
+                    )
+                )
+                completionHandler(.cancel)
+                return
+            }
+
+            let currentSize = UInt64(max(0, st.st_size))
+            if currentSize < initialResumeOffset {
+                _ = Darwin.close(fd)
+                recordFailure(
+                    AgentVMError.diskImageOperationFailed(
+                        path: partURL.path,
+                        errnoCode: EINVAL,
+                        detail: "Partial download file size (\(currentSize)) is smaller than resume offset (\(initialResumeOffset))."
+                    )
+                )
+                completionHandler(.cancel)
+                return
+            }
+            if currentSize > initialResumeOffset {
+                if Darwin.ftruncate(fd, off_t(initialResumeOffset)) != 0 {
+                    let code = Darwin.errno
+                    _ = Darwin.close(fd)
+                    recordFailure(
+                        AgentVMError.diskImageOperationFailed(
+                            path: partURL.path,
+                            errnoCode: code != 0 ? code : EIO,
+                            detail: "Failed truncating partial file to resume offset \(initialResumeOffset)."
+                        )
+                    )
+                    completionHandler(.cancel)
+                    return
+                }
+            }
+
+            let seekRes = Darwin.lseek(fd, off_t(initialResumeOffset), SEEK_SET)
+            guard seekRes >= 0, UInt64(seekRes) == initialResumeOffset else {
+                let code = Darwin.errno
+                _ = Darwin.close(fd)
+                recordFailure(
+                    AgentVMError.diskImageOperationFailed(
+                        path: partURL.path,
+                        errnoCode: code != 0 ? code : EIO,
+                        detail: "Failed seeking partial download file to resume offset \(initialResumeOffset)."
                     )
                 )
                 completionHandler(.cancel)
@@ -1672,6 +1986,7 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
 
             lock.lock()
             fileDescriptor = fd
+            partWriter = OffsetPartFileWriter(fd: fd, startOffset: initialResumeOffset)
             activeStartOffset = initialResumeOffset
             bytesWrittenThisAttempt = 0
             lastReportedBytes = initialResumeOffset
@@ -1691,13 +2006,13 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
             if FileManager.default.fileExists(atPath: partURL.path) {
                 _ = Darwin.chmod(partURL.path, 0o644)
             }
-            let fd = Darwin.open(partURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            let fd = Darwin.open(partURL.path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
             guard fd >= 0 else {
-                let code = errno
+                let code = Darwin.errno
                 recordFailure(
                     AgentVMError.diskImageOperationFailed(
                         path: partURL.path,
-                        errnoCode: code,
+                        errnoCode: code != 0 ? code : EIO,
                         detail: "Unable to create/truncate temporary download file."
                     )
                 )
@@ -1708,6 +2023,7 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
             let wasRangeIgnored = (initialResumeOffset > 0)
             lock.lock()
             fileDescriptor = fd
+            partWriter = OffsetPartFileWriter(fd: fd, startOffset: 0)
             activeStartOffset = 0
             bytesWrittenThisAttempt = 0
             lastReportedBytes = 0
@@ -1746,27 +2062,18 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
         lock.lock()
         let fd = fileDescriptor
         let failed = (terminalError != nil)
+        var writer = partWriter
         lock.unlock()
 
-        guard !failed, fd >= 0 else { return }
+        guard !failed, fd >= 0, writer != nil else { return }
 
-        let writeErrno: Int32 = data.withUnsafeBytes { rawBuf in
-            guard let base = rawBuf.baseAddress else { return 0 }
-            var remaining = rawBuf.count
-            var offset = 0
-            while remaining > 0 {
-                let written = Darwin.write(fd, base.advanced(by: offset), remaining)
-                if written > 0 {
-                    offset += written
-                    remaining -= written
-                } else if written < 0 && errno == EINTR {
-                    continue
-                } else {
-                    return errno != 0 ? errno : EIO
-                }
-            }
-            return 0
+        let writeErrno = writer!.append(data)
+
+        lock.lock()
+        if fileDescriptor == fd {
+            partWriter = writer
         }
+        lock.unlock()
 
         if writeErrno != 0 {
             recordFailure(
@@ -1810,7 +2117,14 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        let closeResult = closeFileDescriptorAndCaptureError()
+        lock.lock()
+        let hadTerminalFailure = (terminalError != nil)
+        lock.unlock()
+
+        let finalizeAndCloseError = finalizeSyncAndCloseDescriptor(
+            isCleanStreamCompletion: !hadTerminalFailure && (error == nil),
+            flushPartialOnInterruption: !hadTerminalFailure && (error != nil)
+        )
 
         lock.lock()
         let cont = continuation
@@ -1827,8 +2141,8 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
 
         if let recordedErr {
             cont.resume(throwing: recordedErr)
-        } else if let closeResult {
-            cont.resume(throwing: closeResult)
+        } else if let finalizeAndCloseError {
+            cont.resume(throwing: finalizeAndCloseError)
         } else if let error {
             if let avmErr = error as? AgentVMError {
                 cont.resume(throwing: avmErr)
@@ -1854,25 +2168,62 @@ private final class StreamingImageDownloadDelegate: NSObject, URLSessionDataDele
     }
 
     private func closeFileDescriptorIfOpen() {
-        _ = closeFileDescriptorAndCaptureError()
+        _ = finalizeSyncAndCloseDescriptor(
+            isCleanStreamCompletion: false,
+            flushPartialOnInterruption: false
+        )
     }
 
-    private func closeFileDescriptorAndCaptureError() -> Error? {
+    private func finalizeSyncAndCloseDescriptor(
+        isCleanStreamCompletion: Bool,
+        flushPartialOnInterruption: Bool
+    ) -> Error? {
         lock.lock()
         let fd = fileDescriptor
         fileDescriptor = -1
+        var writer = partWriter
+        partWriter = nil
+        let wroteBytes = bytesWrittenThisAttempt
         lock.unlock()
 
         guard fd >= 0 else { return nil }
-        if Darwin.close(fd) != 0 {
-            let code = errno
-            return AgentVMError.diskImageOperationFailed(
-                path: partURL.path,
-                errnoCode: code,
-                detail: "Failed closing downloaded partial image file."
-            )
+
+        var primaryError: Error?
+        if (isCleanStreamCompletion || (flushPartialOnInterruption && wroteBytes > 0)),
+           writer != nil {
+            let finErrno = writer!.finalizeLength()
+            if finErrno != 0 {
+                primaryError = AgentVMError.diskImageOperationFailed(
+                    path: partURL.path,
+                    errnoCode: finErrno,
+                    detail: "Failed finalizing file length (\(writer!.logicalOffset) bytes) on downloaded image."
+                )
+            }
         }
-        return nil
+
+        if primaryError == nil && isCleanStreamCompletion {
+            let syncErrno = fileSyncHandler(fd, partURL.path, .partFile)
+            if syncErrno != 0 {
+                primaryError = AgentVMError.diskImageOperationFailed(
+                    path: partURL.path,
+                    errnoCode: syncErrno,
+                    detail: "Failed syncing downloaded partial image file to stable storage."
+                )
+            }
+        }
+
+        if Darwin.close(fd) != 0 {
+            let code = Darwin.errno
+            if primaryError == nil {
+                primaryError = AgentVMError.diskImageOperationFailed(
+                    path: partURL.path,
+                    errnoCode: code != 0 ? code : EIO,
+                    detail: "Failed closing downloaded partial image file."
+                )
+            }
+        }
+
+        return primaryError
     }
 
     private static func parseContentRangeStartOffset(_ header: String) -> UInt64? {

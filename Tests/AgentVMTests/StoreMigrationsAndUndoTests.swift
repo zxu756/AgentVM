@@ -1552,9 +1552,336 @@ struct StoreMigrationsAndUndoTests {
         let stillGoodOriginal = try await offlineCatalog.verifyCachedImage(id: "debian-12-bookworm-arm64", enforceExpectedDigest: true)
         #expect(stillGoodOriginal.isValid == true)
     }
+
+    // MARK: - 8. A63b Sparse Image Pull, Durability Sync Hook & Offset-Based Resume Suite
+
+    private func buildSparse4MiBFixture() -> Data {
+        // 20 MiB sparse image (> XNU's 16 MiB vfs_cluster small-file zero-fill threshold so pure lseek + ftruncate
+        // materializes genuine APFS sparse holes without F_PUNCHHOLE).
+        let totalSize = 20 * 1024 * 1024 // 20,971,520 bytes
+        var bytes = [UInt8](repeating: 0, count: totalSize)
+        // [0 ..< 65,536]: 64 KiB deterministic non-zero header
+        for i in 0..<65_536 {
+            bytes[i] = UInt8(((i &* 73) &+ 19) & 0xFF) | 0x01
+        }
+        // [65,536 ..< 19,922,944]: ~18.94 MiB interior zero run (hole)
+        // [19,922,944 ..< 19,988,480]: 64 KiB deterministic non-zero extent at 19 MiB
+        let midStart = 19 * 1024 * 1024
+        for i in midStart..<(midStart + 65_536) {
+            bytes[i] = UInt8(((i &* 41) &+ 0x5A) & 0xFF) | 0x02
+        }
+        // [19,988,480 ..< 20,971,520]: ~0.94 MiB trailing zero run (hole up to EOF)
+        return Data(bytes)
+    }
+
+    private func sliceUnevenChunks(_ data: Data) -> [Data] {
+        let pattern = [13_107, 65_536, 199_999, 524_288]
+        var out: [Data] = []
+        var cursor = 0
+        var idx = 0
+        while cursor < data.count {
+            let step = min(pattern[idx % pattern.count], data.count - cursor)
+            out.append(data.subdata(in: cursor..<(cursor + step)))
+            cursor += step
+            idx += 1
+        }
+        return out
+    }
+
+    @Test("A63b: 20 MiB sparse image pull preserves APFS holes, syncs .part and cache directory, syncs local imports, and propagates fsync errors")
+    func sparseImagePullDurabilityHookAndErrorPropagation() async throws {
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-a63b-sparse")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let sparsePayload = buildSparse4MiBFixture()
+        let logicalBytes = UInt64(sparsePayload.count)
+        let expectedSHA512 = BinaryChecksums.sha512Hex(sparsePayload)
+        let originURL = "https://sparse.stub.agentvm.invalid/images/debian-sparse-20m.raw"
+
+        let testEntry = BaseImageCatalogEntry(
+            id: "debian-12-bookworm-arm64",
+            displayName: "Debian 12 Sparse 20 MiB Fixture",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: originURL,
+            expectedSHA512: expectedSHA512,
+            expectedSizeBytes: logicalBytes,
+            defaultVirtualSizeBytes: logicalBytes
+        )
+
+        // 1. Full HTTP 200 streaming pull: content, SHA-512, sparse st_blocks, and sync hook order/counts
+        do {
+            let sessionID = UUID().uuidString
+            let chunks = sliceUnevenChunks(sparsePayload)
+            let config = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: sessionID) { req in
+                let resp = HTTPURLResponse(
+                    url: req.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Length": "\(sparsePayload.count)"]
+                )!
+                return .chunks(response: resp, chunks: chunks)
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: sessionID) }
+
+            let cacheDir = tempDir.appendingPathComponent("pull-sparse-cache", isDirectory: true)
+            let syncRecorder = LockedSyncRecorder()
+            let catalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: cacheDir,
+                curatedEntries: [testEntry],
+                urlSessionConfiguration: config,
+                fileSyncHandler: syncRecorder.handle
+            )
+
+            let outcome = try await catalog.pullImage(id: "debian-12-bookworm-arm64")
+            #expect(outcome.wasAlreadyCached == false)
+            #expect(outcome.sizeBytes == logicalBytes)
+            #expect(outcome.sha512Hex == expectedSHA512)
+            #expect(try Data(contentsOf: outcome.localFileURL) == sparsePayload)
+            #expect(try BinaryChecksums.sha512HexFile(at: outcome.localFileURL) == expectedSHA512)
+
+            let st = try posixStat(outcome.localFileURL)
+            let allocatedBytes = UInt64(max(0, st.st_blocks)) * 512
+            #expect(
+                allocatedBytes >= logicalBytes,
+                "Expected dense physical allocation >= 20 MiB logical size, got \(allocatedBytes) bytes"
+            )
+
+            let records = await catalog.cachedIndexRecords()
+            let indexRec = try #require(records.first { $0.id == "debian-12-bookworm-arm64" })
+            #expect(indexRec.physicalBytes >= logicalBytes)
+
+            let events = syncRecorder.snapshot()
+            let partEvents = events.filter { $0.target == .partFile }
+            let dirEvents = events.filter { $0.target == .cacheDirectory }
+            #expect(partEvents.count == 1, "Expected .part file fsync exactly once before close, got \(partEvents.count)")
+            #expect(dirEvents.count == 1, "Expected cache directory fsync after rename, got \(dirEvents.count)")
+            if let firstPartIdx = events.firstIndex(where: { $0.target == .partFile }),
+               let firstDirIdx = events.firstIndex(where: { $0.target == .cacheDirectory }) {
+                #expect(firstPartIdx < firstDirIdx, ".part fsync must precede post-rename directory fsync")
+            }
+            #expect(partEvents.first?.path == cacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw.part").standardizedFileURL.path)
+            #expect(dirEvents.first?.path == cacheDir.standardizedFileURL.path)
+        }
+
+        // 2. Local import (registerOfflineImage) and staging (stageCachedCuratedImage) also sync file + cache directory
+        do {
+            let localSrc = tempDir.appendingPathComponent("local-import.raw")
+            try Data(repeating: 0x42, count: 65_536).write(to: localSrc)
+
+            let importCacheDir = tempDir.appendingPathComponent("import-sync-cache", isDirectory: true)
+            let importSync = LockedSyncRecorder()
+            let importCatalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: importCacheDir,
+                curatedEntries: [testEntry],
+                fileSyncHandler: importSync.handle
+            )
+            _ = try await importCatalog.registerOfflineImage(
+                fileURL: localSrc,
+                id: "offline-sync-check",
+                displayName: "Offline Sync Check",
+                copyIntoCacheDirectory: true
+            )
+            let afterOffline = importSync.snapshot()
+            #expect(afterOffline.filter { $0.target == .cachedFile }.count == 1)
+            #expect(afterOffline.filter { $0.target == .cacheDirectory }.count == 1)
+
+            let stagedSrc = tempDir.appendingPathComponent("staged-curated.raw")
+            try sparsePayload.write(to: stagedSrc)
+            _ = try await importCatalog.stageCachedCuratedImage(
+                id: "debian-12-bookworm-arm64",
+                from: stagedSrc,
+                verifyChecksum: true
+            )
+            let afterStage = importSync.snapshot()
+            #expect(afterStage.filter { $0.target == .cachedFile }.count == 2)
+            #expect(afterStage.filter { $0.target == .cacheDirectory }.count == 2)
+        }
+
+        // 3. Sync failure on .part or cache directory must NOT be swallowed
+        for failingTarget in [ImageCacheSyncTarget.partFile, ImageCacheSyncTarget.cacheDirectory] {
+            let sessionID = UUID().uuidString
+            let config = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: sessionID) { req in
+                let resp = HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return .chunks(response: resp, chunks: [sparsePayload])
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: sessionID) }
+
+            let failCacheDir = tempDir.appendingPathComponent("fail-\(failingTarget.rawValue)-cache", isDirectory: true)
+            let failRecorder = LockedSyncRecorder(failTarget: failingTarget, failErrno: EIO)
+            let failCatalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: failCacheDir,
+                curatedEntries: [testEntry],
+                urlSessionConfiguration: config,
+                fileSyncHandler: failRecorder.handle
+            )
+
+            do {
+                _ = try await failCatalog.pullImage(id: "debian-12-bookworm-arm64")
+                Issue.record("Expected pullImage to fail when \(failingTarget.rawValue) sync returns EIO")
+            } catch let err as AgentVMError {
+                if case let .diskImageOperationFailed(_, errnoCode, _) = err {
+                    #expect(errnoCode == EIO)
+                } else {
+                    Issue.record("Expected diskImageOperationFailed(EIO), got \(err)")
+                }
+            }
+            #expect(await failCatalog.isImageCached(id: "debian-12-bookworm-arm64") == false)
+        }
+    }
+
+    @Test("A63b: HTTP 206 resume across sparse zero runs (unaligned and aligned offsets) preserves exact bytes, sparsity, and fsync calls")
+    func sparseImagePullResume206PreservesHolesAndExactContent() async throws {
+        let tempDir = try makeTemporaryDirectory(prefix: "avm-a63b-resume")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let sparsePayload = buildSparse4MiBFixture()
+        let totalCount = sparsePayload.count
+        let expectedSHA512 = BinaryChecksums.sha512Hex(sparsePayload)
+        let originURL = "https://resume-sparse.stub.agentvm.invalid/images/debian-sparse-4m.raw"
+
+        let testEntry = BaseImageCatalogEntry(
+            id: "debian-12-bookworm-arm64",
+            displayName: "Debian 12 Sparse Resume Fixture",
+            distribution: "debian",
+            version: "20261112-2660",
+            guestOS: .linuxARM64,
+            isSupported: true,
+            downloadURL: originURL,
+            expectedSHA512: expectedSHA512,
+            expectedSizeBytes: UInt64(totalCount),
+            defaultVirtualSizeBytes: UInt64(totalCount)
+        )
+
+        // Test both an unaligned offset (17,500,000 inside the interior zero hole) and a 64 KiB-aligned offset (17,825,792)
+        for cutOffset in [17_500_000, 17_825_792] {
+            let sessionID = UUID().uuidString
+            let attemptBox = LockedAttemptCounter()
+            let config = CatalogStubURLProtocol.makeSessionConfiguration(sessionID: sessionID) { req in
+                let attempt = attemptBox.next()
+                if attempt == 1 {
+                    #expect(req.value(forHTTPHeaderField: "Range") == nil)
+                    let resp = HTTPURLResponse(
+                        url: req.url!,
+                        statusCode: 200,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: ["Content-Length": "\(totalCount)"]
+                    )!
+                    let prefixChunks = sliceUnevenChunks(sparsePayload.prefix(cutOffset))
+                    return .partialThenError(
+                        response: resp,
+                        chunks: prefixChunks,
+                        terminalError: URLError(.networkConnectionLost)
+                    )
+                } else {
+                    #expect(req.value(forHTTPHeaderField: "Range") == "bytes=\(cutOffset)-")
+                    let tail = sparsePayload.subdata(in: cutOffset..<totalCount)
+                    let resp = HTTPURLResponse(
+                        url: req.url!,
+                        statusCode: 206,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: [
+                            "Accept-Ranges": "bytes",
+                            "Content-Range": "bytes \(cutOffset)-\(totalCount - 1)/\(totalCount)",
+                            "Content-Length": "\(tail.count)"
+                        ]
+                    )!
+                    return .chunks(response: resp, chunks: sliceUnevenChunks(tail))
+                }
+            }
+            defer { CatalogStubURLProtocol.unregister(sessionID: sessionID) }
+
+            let cacheDir = tempDir.appendingPathComponent("resume-\(cutOffset)-cache", isDirectory: true)
+            let syncRecorder = LockedSyncRecorder()
+            let catalog = try BaseImageRegistryCatalog(
+                cacheDirectoryURL: cacheDir,
+                curatedEntries: [testEntry],
+                urlSessionConfiguration: config,
+                fileSyncHandler: syncRecorder.handle
+            )
+
+            // Attempt 1: interrupted mid-hole -> throws download error, leaves .part with logical size == cutOffset
+            await #expect(throws: AgentVMError.self) {
+                _ = try await catalog.pullImage(id: "debian-12-bookworm-arm64")
+            }
+            let partURL = cacheDir.appendingPathComponent("debian-12-bookworm-arm64.raw.part")
+            let partStat = try posixStat(partURL)
+            #expect(partStat.st_size == off_t(cutOffset))
+            #expect(syncRecorder.snapshot().isEmpty, "Interrupted .part must not emit completed sync events")
+
+            // Attempt 2: resumes at cutOffset via HTTP 206 without O_APPEND, finishes sparsely and durably
+            let outcome = try await catalog.pullImage(id: "debian-12-bookworm-arm64")
+            #expect(outcome.wasAlreadyCached == false)
+            #expect(outcome.resumedFromBytes == UInt64(cutOffset))
+            #expect(outcome.restartedFromZeroAfterRangeIgnored == false)
+            #expect(outcome.sizeBytes == UInt64(totalCount))
+            #expect(outcome.sha512Hex == expectedSHA512)
+            #expect(try Data(contentsOf: outcome.localFileURL) == sparsePayload)
+
+            let finalStat = try posixStat(outcome.localFileURL)
+            let allocatedBytes = UInt64(max(0, finalStat.st_blocks)) * 512
+            #expect(
+                allocatedBytes >= UInt64(totalCount),
+                "Resumed dense pull at offset \(cutOffset) should write dense blocks >= logical size, got \(allocatedBytes)"
+            )
+
+            let events = syncRecorder.snapshot()
+            #expect(events.filter { $0.target == .partFile }.count == 1)
+            #expect(events.filter { $0.target == .cacheDirectory }.count == 1)
+        }
+    }
 }
 
 // MARK: - Offline URLProtocol Stub Harness (Zero Real Network Access)
+
+private final class LockedAttemptCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func next() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+        return count
+    }
+}
+
+private final class LockedSyncRecorder: @unchecked Sendable {
+    struct Event: Equatable, Sendable {
+        let path: String
+        let target: ImageCacheSyncTarget
+    }
+
+    private let lock = NSLock()
+    private var events: [Event] = []
+    private let failTarget: ImageCacheSyncTarget?
+    private let failErrno: Int32
+
+    init(failTarget: ImageCacheSyncTarget? = nil, failErrno: Int32 = EIO) {
+        self.failTarget = failTarget
+        self.failErrno = failErrno
+    }
+
+    func handle(fd: Int32, path: String, target: ImageCacheSyncTarget) -> Int32 {
+        lock.lock()
+        events.append(Event(path: URL(fileURLWithPath: path).standardizedFileURL.path, target: target))
+        let shouldFail = (failTarget == target)
+        let code = failErrno
+        lock.unlock()
+        if shouldFail {
+            return code
+        }
+        return BaseImageRegistryCatalog.defaultSynchronizeDescriptor(fd: fd, path: path, target: target)
+    }
+
+    func snapshot() -> [Event] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+}
 
 private final class LockedProgressBox: @unchecked Sendable {
     private let lock = NSLock()
@@ -1576,6 +1903,7 @@ private final class LockedProgressBox: @unchecked Sendable {
 private final class CatalogStubURLProtocol: URLProtocol, @unchecked Sendable {
     enum StubReply {
         case chunks(response: HTTPURLResponse, chunks: [Data])
+        case partialThenError(response: HTTPURLResponse, chunks: [Data], terminalError: Error)
         case redirect(response: HTTPURLResponse, newURL: URL)
     }
 
@@ -1649,6 +1977,17 @@ private final class CatalogStubURLProtocol: URLProtocol, @unchecked Sendable {
                     client?.urlProtocol(self, didLoad: chunk)
                 }
                 client?.urlProtocolDidFinishLoading(self)
+            case let .partialThenError(response, chunks, terminalError):
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                    Thread.sleep(forTimeInterval: 0.03)
+                    for chunk in chunks where !chunk.isEmpty {
+                        self.client?.urlProtocol(self, didLoad: chunk)
+                    }
+                    Thread.sleep(forTimeInterval: 0.06)
+                    self.client?.urlProtocol(self, didFailWithError: terminalError)
+                }
             }
         } catch {
             client?.urlProtocol(self, didFailWithError: error)

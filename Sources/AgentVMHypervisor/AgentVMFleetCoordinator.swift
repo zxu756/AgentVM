@@ -271,6 +271,46 @@ public struct LiveDaemonRestoreResult: Codable, Hashable, Sendable {
     }
 }
 
+public struct ManagedPortForwardEntry: Codable, Hashable, Sendable, Identifiable {
+    public var id: PortForwardID
+    public var vmID: VMID
+    public var vmName: String
+    public var hostBindAddress: String
+    public var hostPort: UInt16
+    public var guestPort: UInt16
+    public var protocolType: PortForwardProtocol
+    public var activeConnections: Int
+    public var bytesHostToGuest: UInt64
+    public var bytesGuestToHost: UInt64
+    public var startedAt: Date
+
+    public init(
+        id: PortForwardID,
+        vmID: VMID,
+        vmName: String,
+        hostBindAddress: String = "127.0.0.1",
+        hostPort: UInt16,
+        guestPort: UInt16,
+        protocolType: PortForwardProtocol = .vsockStream,
+        activeConnections: Int = 0,
+        bytesHostToGuest: UInt64 = 0,
+        bytesGuestToHost: UInt64 = 0,
+        startedAt: Date = Date()
+    ) {
+        self.id = id
+        self.vmID = vmID
+        self.vmName = vmName
+        self.hostBindAddress = hostBindAddress
+        self.hostPort = hostPort
+        self.guestPort = guestPort
+        self.protocolType = protocolType
+        self.activeConnections = activeConnections
+        self.bytesHostToGuest = bytesHostToGuest
+        self.bytesGuestToHost = bytesGuestToHost
+        self.startedAt = startedAt
+    }
+}
+
 public struct HardwareVsockFDDescriptor: Sendable {
     public var fileDescriptor: Int32
     public var closeWhenSessionEnds: Bool
@@ -1821,8 +1861,15 @@ public actor AgentVMFleetCoordinator {
             await session.attachTerminalScreenBuffer(tty)
             vsockSessions[vmID] = session
 
-            for rule in record.spec.portForwards where rule.enabled {
-                _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
+            do {
+                for rule in record.spec.portForwards where rule.enabled {
+                    _ = try await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
+                }
+            } catch {
+                await portForwardManager.stopAllRules(for: vmID)
+                vsockSessions.removeValue(forKey: vmID)
+                await session.shutdown()
+                throw error
             }
 
             bootTimestamps[vmID] = Date()
@@ -2678,7 +2725,8 @@ public actor AgentVMFleetCoordinator {
         boxToken: UUID,
         descriptor: HardwareVsockFDDescriptor,
         persistState: Bool,
-        vmSpec: VMSpec
+        vmSpec: VMSpec,
+        isReconnect: Bool = false
     ) async throws -> (session: VsockMultiplexSession, sessionToken: UUID) {
         let sessionToken = UUID()
         let session = VsockMultiplexSession(vmID: vmID)
@@ -2753,8 +2801,37 @@ public actor AgentVMFleetCoordinator {
             )
         }
 
-        for rule in vmSpec.portForwards where rule.enabled {
-            _ = try? await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
+        if isReconnect {
+            for rule in vmSpec.portForwards where rule.enabled {
+                do {
+                    _ = try await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
+                } catch {
+                    let detail = (error as? AgentVMError)?.localizedMessage(in: .en) ?? error.localizedDescription
+                    try? await store.appendDiagnostic(DiagnosticEvent(
+                        severity: .warning,
+                        subsystem: "VsockRPC",
+                        vmID: vmID,
+                        code: "PORT_FORWARD_REBIND_FAILED",
+                        message: "Failed re-binding host port \(rule.hostPort)->\(rule.guestPort) for VM '\(vmSpec.name)' on vsock reconnect: \(detail)"
+                    ))
+                }
+            }
+        } else {
+            do {
+                for rule in vmSpec.portForwards where rule.enabled {
+                    _ = try await portForwardManager.startForwardRule(rule, vmID: vmID, vsockSession: session)
+                }
+            } catch {
+                if inFlightVsockAttachTokens[vmID] == sessionToken {
+                    inFlightVsockAttachTokens.removeValue(forKey: vmID)
+                    heartbeatExpiryTasks.removeValue(forKey: vmID)?.cancel()
+                    negotiatedGuestAgentVersions.removeValue(forKey: vmID)
+                    latestGuestHeartbeats.removeValue(forKey: vmID)
+                }
+                await portForwardManager.stopAllRules(for: vmID)
+                await session.shutdown()
+                throw error
+            }
         }
 
         if disconnectedInFlightVsockTokens.contains(sessionToken)
@@ -2888,7 +2965,8 @@ public actor AgentVMFleetCoordinator {
                     boxToken: boxToken,
                     descriptor: desc,
                     persistState: true,
-                    vmSpec: currentRecord.spec
+                    vmSpec: currentRecord.spec,
+                    isReconnect: true
                 )
                 let openStreams = await newSession.openStreamCount()
                 guard !Task.isCancelled,
@@ -4624,6 +4702,152 @@ public actor AgentVMFleetCoordinator {
     ) async {
         guard let session = vsockSessions[vmID] else { return }
         await session.cancelExecStream(streamID: streamID, reason: reason)
+    }
+
+    // MARK: - Daemon-Managed Localhost TCP Port Forwarding (`agentvm forward`)
+
+    /// Binds `127.0.0.1:<hostPort>` -> `127.0.0.1:<guestPort>` over the running VM's multiplexed vsock session
+    /// and persists the rule in `record.spec.portForwards` so in-place guest reboots automatically rebind it.
+    public func addPortForwardInDaemon(
+        vmID: VMID,
+        hostPort: UInt16,
+        guestPort: UInt16
+    ) async throws -> ManagedPortForwardEntry {
+        try await enqueueVMLifecycleOperation(for: vmID) {
+            try await self.addPortForwardInDaemonUnlocked(
+                vmID: vmID,
+                hostPort: hostPort,
+                guestPort: guestPort
+            )
+        }
+    }
+
+    private func addPortForwardInDaemonUnlocked(
+        vmID: VMID,
+        hostPort: UInt16,
+        guestPort: UInt16
+    ) async throws -> ManagedPortForwardEntry {
+        guard hostPort > 0, guestPort > 0 else {
+            throw AgentVMError.cliUsageError(detail: "Port numbers must be in 1...65535.")
+        }
+        var record = try await loadVMForOperation(vmID)
+        if !isSimulationBackend && hardwareBoxes[vmID] == nil {
+            let effectiveState: VMLifecycleState = (record.telemetry.state == .running) ? .stopped : record.telemetry.state
+            throw AgentVMError.portForwardRequiresRunningVM(
+                vmName: record.spec.name,
+                vmID: vmID,
+                currentState: effectiveState
+            )
+        }
+        guard record.telemetry.state == .running else {
+            throw AgentVMError.portForwardRequiresRunningVM(
+                vmName: record.spec.name,
+                vmID: vmID,
+                currentState: record.telemetry.state
+            )
+        }
+        guard let session = vsockSessions[vmID] else {
+            throw AgentVMError.guestAgentNotConnected(
+                vmName: record.spec.name,
+                state: record.telemetry.state.rawValue
+            )
+        }
+
+        let rule = PortForwardRuleSpec(
+            label: "forward-\(hostPort)-\(guestPort)",
+            protocolType: .vsockStream,
+            hostBindAddress: "127.0.0.1",
+            hostPort: hostPort,
+            guestPort: guestPort,
+            enabled: true
+        )
+        let binding = try await portForwardManager.startForwardRule(
+            rule,
+            vmID: vmID,
+            vsockSession: session
+        )
+
+        record.spec.portForwards.removeAll(where: { $0.hostPort == binding.actualBoundPort })
+        var storedRule = rule
+        storedRule.hostPort = binding.actualBoundPort
+        record.spec.portForwards.append(storedRule)
+        stampRuntimeOrigin(&record)
+        try await store.upsertVM(record)
+
+        return ManagedPortForwardEntry(
+            id: binding.id,
+            vmID: vmID,
+            vmName: record.spec.name,
+            hostBindAddress: "127.0.0.1",
+            hostPort: binding.actualBoundPort,
+            guestPort: storedRule.guestPort,
+            protocolType: storedRule.protocolType,
+            activeConnections: binding.activeConnections,
+            bytesHostToGuest: binding.bytesHostToGuest,
+            bytesGuestToHost: binding.bytesGuestToHost,
+            startedAt: binding.startedAt
+        )
+    }
+
+    /// Lists currently active localhost port-forward bindings (optionally scoped to `vmID`).
+    public func listPortForwardsInDaemon(vmID: VMID? = nil) async throws -> [ManagedPortForwardEntry] {
+        if let vmID {
+            _ = try await loadVMForOperation(vmID)
+        }
+        let bindings = await portForwardManager.listActiveBindings(for: vmID)
+        guard !bindings.isEmpty else { return [] }
+        let allVMs = try await store.listVMs()
+        let namesByID = Dictionary(uniqueKeysWithValues: allVMs.map { ($0.id, $0.spec.name) })
+        return bindings.map { b in
+            ManagedPortForwardEntry(
+                id: b.id,
+                vmID: b.vmID,
+                vmName: namesByID[b.vmID] ?? b.vmID.rawValue,
+                hostBindAddress: b.rule.hostBindAddress.isEmpty ? "127.0.0.1" : b.rule.hostBindAddress,
+                hostPort: b.actualBoundPort,
+                guestPort: b.rule.guestPort,
+                protocolType: b.rule.protocolType,
+                activeConnections: b.activeConnections,
+                bytesHostToGuest: b.bytesHostToGuest,
+                bytesGuestToHost: b.bytesGuestToHost,
+                startedAt: b.startedAt
+            )
+        }
+    }
+
+    /// Unbinds an active or persisted localhost port-forward rule on `hostPort` for `vmID` and removes it from `spec.portForwards`.
+    public func removePortForwardInDaemon(
+        vmID: VMID,
+        hostPort: UInt16
+    ) async throws -> (vmName: String, removedRule: PortForwardRuleSpec) {
+        try await enqueueVMLifecycleOperation(for: vmID) {
+            try await self.removePortForwardInDaemonUnlocked(vmID: vmID, hostPort: hostPort)
+        }
+    }
+
+    private func removePortForwardInDaemonUnlocked(
+        vmID: VMID,
+        hostPort: UInt16
+    ) async throws -> (vmName: String, removedRule: PortForwardRuleSpec) {
+        var record = try await loadVMForOperation(vmID)
+        let activeMatches = await portForwardManager.listActiveBindings(for: vmID).filter {
+            $0.actualBoundPort == hostPort || $0.rule.hostPort == hostPort
+        }
+        for match in activeMatches {
+            await portForwardManager.stopForwardRule(match.id)
+        }
+
+        let specMatches = record.spec.portForwards.filter { $0.hostPort == hostPort }
+        if !specMatches.isEmpty {
+            record.spec.portForwards.removeAll(where: { $0.hostPort == hostPort })
+            stampRuntimeOrigin(&record)
+            try await store.upsertVM(record)
+        }
+
+        guard let removed = activeMatches.first?.rule ?? specMatches.first else {
+            throw AgentVMError.portForwardRuleNotFound(vmName: record.spec.name, hostPort: hostPort)
+        }
+        return (record.spec.name, removed)
     }
 
     /// Executes a single guest command in a complete in-process boot -> vsock connect -> exec -> halt lifecycle (`agentvm run`).

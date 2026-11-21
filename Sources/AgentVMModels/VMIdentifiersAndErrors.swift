@@ -363,6 +363,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case vsockProtocolViolation(detail: String)
     case vsockCRCMismatch(expected: UInt32, actual: UInt32)
     case portForwardBindFailed(port: UInt16, errnoCode: Int32)
+    case portForwardRequiresRunningVM(vmName: String, vmID: VMID, currentState: VMLifecycleState)
+    case portForwardRuleNotFound(vmName: String, hostPort: UInt16)
     case snapshotCycleDetected(SnapshotID)
     case storageDatabaseError(code: Int32, sql: String, detail: String)
     case storageMigrationFailed(fromVersion: Int, toVersion: Int, detail: String)
@@ -405,7 +407,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .invalidConfiguration: return "ERR_INVALID_CONFIG"
         case .vmNotFound: return "ERR_VM_NOT_FOUND"
         case .snapshotNotFound: return "ERR_SNAPSHOT_NOT_FOUND"
-        case .invalidLifecycleTransition, .execRequiresRunningVM: return "ERR_LIFECYCLE_STATE"
+        case .invalidLifecycleTransition, .execRequiresRunningVM, .portForwardRequiresRunningVM: return "ERR_LIFECYCLE_STATE"
         case .execOutputBufferOverflow: return "ERR_EXEC_OUTPUT_OVERFLOW"
         case .diskImageOperationFailed: return "ERR_DISK_IO"
         case .cowCloneFailed: return "ERR_APFS_COW_CLONE"
@@ -417,6 +419,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .vsockProtocolViolation: return "ERR_VSOCK_PROTOCOL"
         case .vsockCRCMismatch: return "ERR_VSOCK_CRC"
         case .portForwardBindFailed: return "ERR_PORT_FORWARD_BIND"
+        case .portForwardRuleNotFound: return "ERR_PORT_FORWARD_NOT_FOUND"
         case .snapshotCycleDetected: return "ERR_SNAPSHOT_CYCLE"
         case .storageDatabaseError: return "ERR_SQLITE_EXEC"
         case .storageMigrationFailed: return "ERR_SQLITE_MIGRATION"
@@ -640,9 +643,30 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
                 ? String(format: "Vsock 帧 CRC32 校验不匹配（期望 0x%08X，实际 0x%08X）。", expected, actual)
                 : String(format: "Vsock frame CRC32 mismatch (expected 0x%08X, got 0x%08X).", expected, actual)
         case let .portForwardBindFailed(port, errnoCode):
+            let reasonZh: String
+            let reasonEn: String
+            if errnoCode == EADDRINUSE {
+                reasonZh = "端口已被占用"
+                reasonEn = "address already in use"
+            } else if errnoCode == EACCES || errnoCode == EPERM {
+                reasonZh = "权限不足"
+                reasonEn = "permission denied"
+            } else {
+                let sysMsg = String(cString: Darwin.strerror(errnoCode))
+                reasonZh = sysMsg
+                reasonEn = sysMsg
+            }
             return isZh
-                ? "绑定本地 TCP 端口 \(port) 失败（errno=\(errnoCode)）。"
-                : "Failed to bind localhost TCP port \(port) (errno=\(errnoCode))."
+                ? "绑定本地 TCP 端口 \(port) 失败：\(reasonZh)（errno=\(errnoCode)）。"
+                : "Failed to bind localhost TCP port \(port): \(reasonEn) (errno=\(errnoCode))."
+        case let .portForwardRequiresRunningVM(vmName, vmID, currentState):
+            return isZh
+                ? "无法为虚拟机「\(vmName)」（\(vmID.rawValue)）设置端口转发：当前状态为「\(currentState.rawValue)」，需要先启动虚拟机。"
+                : "Cannot forward ports for VM '\(vmName)' (\(vmID.rawValue)): current state is '\(currentState.rawValue)' (VM must be running)."
+        case let .portForwardRuleNotFound(vmName, hostPort):
+            return isZh
+                ? "虚拟机「\(vmName)」上不存在宿主机端口 \(hostPort) 的转发规则。"
+                : "No port-forward rule on host port \(hostPort) found for VM '\(vmName)'."
         case let .snapshotCycleDetected(id):
             return isZh
                 ? "在节点「\(id.rawValue)」处检测到快照血缘环路。"
@@ -741,6 +765,13 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return "Grant the capability in plugin manifest.json and approve it in Plugin Studio."
         case .portForwardBindFailed:
             return "Choose an unprivileged free TCP port >= 1024."
+        case let .portForwardRequiresRunningVM(vmName, _, currentState):
+            if currentState == .paused {
+                return "Resume the VM first with 'agentvm resume \(vmName)'."
+            }
+            return "Start the VM first with 'agentvm up \(vmName)'."
+        case .portForwardRuleNotFound:
+            return "Run 'agentvm forward list' to inspect active port forwards."
         case let .execRequiresRunningVM(vmName, _, currentState):
             if currentState == .paused {
                 return "Resume the VM first with 'agentvm resume \(vmName)'."

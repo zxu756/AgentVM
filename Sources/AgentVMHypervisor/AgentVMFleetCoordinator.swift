@@ -382,6 +382,7 @@ public actor AgentVMFleetCoordinator {
     public static let defaultHeartbeatStaleTimeoutNanoseconds: UInt64 = 15_000_000_000
 
     public nonisolated let isWorkspaceDaemon: Bool
+    public nonisolated let hasHardwareBackendOverride: Bool
     private let hardwareBackend: any HardwareVMLowLevelBackend
     private let vsockConnectTimeoutNanoseconds: UInt64
     private let vsockRetryIntervalNanoseconds: UInt64
@@ -804,6 +805,7 @@ public actor AgentVMFleetCoordinator {
         )
         self.diskEngine = diskEngine
         self.executionBackend = executionBackend
+        self.hasHardwareBackendOverride = (hardwareBackendOverride != nil)
         self.hardwareBackend = hardwareBackendOverride ?? DefaultVZHardwareBackend()
         self.vsockConnectTimeoutNanoseconds = vsockConnectTimeoutNanoseconds
         self.vsockRetryIntervalNanoseconds = vsockRetryIntervalNanoseconds
@@ -1043,6 +1045,23 @@ public actor AgentVMFleetCoordinator {
         }
     }
 
+    public nonisolated func verifyHostCanStartHardwareVM(
+        checkProcessEntitlement: Bool = true,
+        hasEntitlementOverride: (@Sendable () -> Bool)? = nil
+    ) throws {
+        guard checkProcessEntitlement else { return }
+        guard VZVirtualMachine.isSupported else {
+            throw AgentVMError.virtualizationUnsupported(
+                reason: "VZVirtualMachine.isSupported returned false (this host cannot run Virtualization.framework guests)."
+            )
+        }
+        let entitled = hasEntitlementOverride?()
+            ?? HostHypervisorProbe.currentProcessHasBooleanEntitlement(HostHypervisorProbe.virtualizationEntitlementKey)
+        guard entitled else {
+            throw AgentVMError.virtualizationEntitlementMissing
+        }
+    }
+
     public func preflightPersistentBoot(
         _ vmID: VMID,
         checkProcessEntitlement: Bool = true,
@@ -1054,18 +1073,10 @@ public actor AgentVMFleetCoordinator {
         if verifySharedDirectories {
             try Self.verifySharedHostDirectories(record.spec.virtioFSMounts)
         }
-        if checkProcessEntitlement {
-            guard VZVirtualMachine.isSupported else {
-                throw AgentVMError.virtualizationUnsupported(
-                    reason: "VZVirtualMachine.isSupported returned false (this host cannot run Virtualization.framework guests)."
-                )
-            }
-            let entitled = hasEntitlementOverride?()
-                ?? HostHypervisorProbe.currentProcessHasBooleanEntitlement(HostHypervisorProbe.virtualizationEntitlementKey)
-            guard entitled else {
-                throw AgentVMError.virtualizationEntitlementMissing
-            }
-        }
+        try verifyHostCanStartHardwareVM(
+            checkProcessEntitlement: checkProcessEntitlement,
+            hasEntitlementOverride: hasEntitlementOverride
+        )
         return record
     }
 

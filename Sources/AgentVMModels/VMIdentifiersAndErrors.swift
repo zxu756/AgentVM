@@ -378,6 +378,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
     case ipcDaemonUnavailable(socketPath: String, detail: String)
     case resourceQuotaExceeded(resource: String, requested: String, limit: String)
     case invalidSharedDirectory(path: String, guestMountPoint: String?, reason: SharedDirectoryErrorReason)
+    case unimplementedBeforeM5(feature: String)
 
     public var errorCode: String {
         switch self {
@@ -433,6 +434,7 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
         case .ipcDaemonUnavailable: return "ERR_DAEMON_IPC"
         case .resourceQuotaExceeded: return "ERR_QUOTA_EXCEEDED"
         case .invalidSharedDirectory: return "ERR_SHARED_DIR_INVALID"
+        case .unimplementedBeforeM5: return "ERR_UNIMPLEMENTED_BEFORE_M5"
         }
     }
 
@@ -724,6 +726,10 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
                     ? "VirtioFS 宿主机共享路径不是目录：「\(path)」\(guestSuffixZh)。"
                     : "VirtioFS host shared path is not a directory: '\(path)'\(guestSuffixEn)."
             }
+        case let .unimplementedBeforeM5(feature):
+            return isZh
+                ? "MCP 工具「\(feature)」在 M5 之前未实现（真实客户机网络流量在 M5 之前不经过用户态交换机或出口防火墙）。"
+                : "MCP tool '\(feature)' is not implemented before M5 (real guest network traffic does not pass through the user-space switch or egress firewall before M5)."
         }
     }
 
@@ -790,6 +796,8 @@ public enum AgentVMError: Error, LocalizedError, Sendable, Equatable {
             return "Drain stdout/stderr from 'agentvm exec' continuously or redirect large outputs to a file inside the guest."
         case let .invalidSharedDirectory(path, _, _):
             return "Ensure '\(path)' exists on the host as a directory before creating or booting the VM."
+        case .unimplementedBeforeM5:
+            return "This capability is not implemented before M5."
         default:
             return "Inspect the Audit Journal drawer or run 'agentvm doctor' for detailed diagnostics."
         }

@@ -258,7 +258,7 @@ public struct VZConfigurationTranslator: Sendable {
             }
             let caching: VZDiskImageCachingMode
             switch blk.cachingMode {
-            case .automatic: caching = .automatic
+            case .automatic: caching = blk.readOnly ? .automatic : .cached
             case .cached: caching = .cached
             case .uncached: caching = .uncached
             }

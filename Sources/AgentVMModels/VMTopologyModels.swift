@@ -125,7 +125,7 @@ public struct BlockDeviceSpec: Codable, Hashable, Sendable, Identifiable {
         format: DiskImageFormat = .rawSparse,
         readOnly: Bool = false,
         isBootVolume: Bool = false,
-        cachingMode: BlockDiskCachingMode = .automatic,
+        cachingMode: BlockDiskCachingMode? = nil,
         syncMode: BlockDiskSyncMode = .fsyncOnly,
         parentCoWImagePath: String? = nil
     ) {
@@ -136,7 +136,7 @@ public struct BlockDeviceSpec: Codable, Hashable, Sendable, Identifiable {
         self.format = format
         self.readOnly = readOnly
         self.isBootVolume = isBootVolume
-        self.cachingMode = cachingMode
+        self.cachingMode = cachingMode ?? (readOnly ? .automatic : .cached)
         self.syncMode = syncMode
         self.parentCoWImagePath = parentCoWImagePath
     }

@@ -1550,4 +1550,110 @@ struct HypervisorCoordinatorTests {
         let persisted = try #require(try await coordinator.store.fetchVM(created.vmRecord.id))
         #expect(persisted.telemetry.state == .stopped)
     }
+
+    @Test("A63d: VZConfigurationTranslator sets cachingMode=.cached and synchronizationMode=.fsync on all writable block devices while keeping read-only devices unchanged")
+    func vzConfigurationUsesCachedFsyncForWritableDisksAndPreservesReadOnlyDevices() async throws {
+        let tempDir = try makeTempDirectory(prefix: "avm-a63d-vz-caching")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let fix = try await makeFakeCuratedImageFixture(in: tempDir)
+        defer { _ = Darwin.chmod(fix.cachedFileURL.path, 0o644) }
+
+        let bundleURL = tempDir.appendingPathComponent("Fleet.agentvm", isDirectory: true)
+        let coordinator = try AgentVMFleetCoordinator(
+            bundleURL: bundleURL,
+            executionBackend: .strictHardwareVZ,
+            imageCacheDirectoryURL: fix.cacheDir,
+            curatedImageEntries: [fix.entry]
+        )
+
+        let created = try await coordinator.createVMFromImage(name: "t1", imageID: fix.entry.id)
+        #expect(created.vmRecord.spec.blockDevices.first?.cachingMode == .cached)
+        #expect(created.vmRecord.spec.blockDevices.first?.syncMode == .fsyncOnly)
+
+        let diskEngine = APFSCoWDiskEngine()
+        let extraRWURL = tempDir.appendingPathComponent("extra-data-rw.raw")
+        let extraROURL = tempDir.appendingPathComponent("extra-seed-ro.raw")
+        _ = try diskEngine.createSparseRawDisk(at: extraRWURL, virtualSizeBytes: 16 * 1024 * 1024, overwrite: true)
+        _ = try diskEngine.createSparseRawDisk(at: extraROURL, virtualSizeBytes: 16 * 1024 * 1024, overwrite: true)
+
+        var spec = created.vmRecord.spec
+        spec.blockDevices.append(
+            BlockDeviceSpec(
+                label: "data-rw",
+                imagePath: extraRWURL.path,
+                virtualSizeBytes: 16 * 1024 * 1024,
+                format: .rawSparse,
+                readOnly: false,
+                isBootVolume: false
+            )
+        )
+        spec.blockDevices.append(
+            BlockDeviceSpec(
+                label: "seed-ro",
+                imagePath: extraROURL.path,
+                virtualSizeBytes: 16 * 1024 * 1024,
+                format: .rawSparse,
+                readOnly: true,
+                isBootVolume: false
+            )
+        )
+        #expect(spec.blockDevices[1].cachingMode == .cached)
+        #expect(spec.blockDevices[2].cachingMode == .automatic)
+
+        let translator = VZConfigurationTranslator()
+        let vzConfig = try translator.buildVZConfiguration(from: spec, validateConfiguration: false)
+        #expect(vzConfig.storageDevices.count == 4) // root-rw + data-rw + seed-ro + cidata ISO
+
+        let rootBlk = try #require(vzConfig.storageDevices[0] as? VZVirtioBlockDeviceConfiguration)
+        let rootAtt = try #require(rootBlk.attachment as? VZDiskImageStorageDeviceAttachment)
+        #expect(rootAtt.isReadOnly == false)
+        #expect(rootAtt.cachingMode == VZDiskImageCachingMode.cached)
+        #expect(rootAtt.synchronizationMode == VZDiskImageSynchronizationMode.fsync)
+
+        let extraRWBlk = try #require(vzConfig.storageDevices[1] as? VZVirtioBlockDeviceConfiguration)
+        let extraRWAtt = try #require(extraRWBlk.attachment as? VZDiskImageStorageDeviceAttachment)
+        #expect(extraRWAtt.isReadOnly == false)
+        #expect(extraRWAtt.cachingMode == VZDiskImageCachingMode.cached)
+        #expect(extraRWAtt.synchronizationMode == VZDiskImageSynchronizationMode.fsync)
+
+        let extraROBlk = try #require(vzConfig.storageDevices[2] as? VZVirtioBlockDeviceConfiguration)
+        let extraROAtt = try #require(extraROBlk.attachment as? VZDiskImageStorageDeviceAttachment)
+        #expect(extraROAtt.isReadOnly == true)
+        #expect(extraROAtt.cachingMode == VZDiskImageCachingMode.automatic)
+        #expect(extraROAtt.synchronizationMode == VZDiskImageSynchronizationMode.fsync)
+
+        let isoPath = try #require(spec.cloudInitISOPath)
+        let baselineISOAtt = try VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath: isoPath), readOnly: true)
+        let cidataBlk = try #require(vzConfig.storageDevices[3] as? VZVirtioBlockDeviceConfiguration)
+        let cidataAtt = try #require(cidataBlk.attachment as? VZDiskImageStorageDeviceAttachment)
+        #expect(cidataAtt.isReadOnly == true)
+        #expect(cidataAtt.cachingMode == VZDiskImageCachingMode.automatic)
+        #expect(cidataAtt.cachingMode == baselineISOAtt.cachingMode)
+        #expect(cidataAtt.synchronizationMode == baselineISOAtt.synchronizationMode)
+
+        // Pre-existing VM persisted before A63d with cachingMode == .automatic on writable root disk must also upgrade to .cached on next `up`
+        var legacyPersistedSpec = created.vmRecord.spec
+        legacyPersistedSpec.blockDevices[0].cachingMode = .automatic
+        let legacyVZConfig = try translator.buildVZConfiguration(from: legacyPersistedSpec, validateConfiguration: false)
+        let legacyRootBlk = try #require(legacyVZConfig.storageDevices.first as? VZVirtioBlockDeviceConfiguration)
+        let legacyRootAtt = try #require(legacyRootBlk.attachment as? VZDiskImageStorageDeviceAttachment)
+        #expect(legacyRootAtt.isReadOnly == false)
+        #expect(legacyRootAtt.cachingMode == VZDiskImageCachingMode.cached)
+        #expect(legacyRootAtt.synchronizationMode == VZDiskImageSynchronizationMode.fsync)
+
+        // Forked child VM writable CoW root disk also uses .cached + .fsync
+        let forked = try await coordinator.forkCoWBranch(
+            fromVMID: created.vmRecord.id,
+            branchName: "t1-child",
+            agentOwnerTag: "a63d-test"
+        )
+        #expect(forked.childVM.spec.blockDevices.first?.cachingMode == BlockDiskCachingMode.cached)
+        let forkVZConfig = try translator.buildVZConfiguration(from: forked.childVM.spec, validateConfiguration: false)
+        let forkRootBlk = try #require(forkVZConfig.storageDevices.first as? VZVirtioBlockDeviceConfiguration)
+        let forkRootAtt = try #require(forkRootBlk.attachment as? VZDiskImageStorageDeviceAttachment)
+        #expect(forkRootAtt.isReadOnly == false)
+        #expect(forkRootAtt.cachingMode == VZDiskImageCachingMode.cached)
+        #expect(forkRootAtt.synchronizationMode == VZDiskImageSynchronizationMode.fsync)
+    }
 }

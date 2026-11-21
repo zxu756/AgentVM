@@ -134,7 +134,7 @@ if en_commands != zh_commands:
 print(f"PASS: README.md and README.zh-CN.md list the same {len(en_commands)} commands")
 
 home = os.path.join(tmp_root, "home")
-os.makedirs(home, exist_ok=True)
+os.makedirs(os.path.join(home, "Library", "Preferences"), exist_ok=True)
 environment = dict(os.environ)
 environment["HOME"] = home
 environment["CFFIXED_USER_HOME"] = home

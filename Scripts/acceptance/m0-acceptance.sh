@@ -33,7 +33,7 @@ AGENTVM_BIN="$ROOT_DIR/.build/debug/AgentVM"
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentvm-m0-accept.XXXXXX")"
 ISOLATED_HOME="$TMP_ROOT/home"
-mkdir -p "$ISOLATED_HOME"
+mkdir -p "$ISOLATED_HOME/Library/Preferences"
 cleanup() {
     rm -rf "$TMP_ROOT"
 }

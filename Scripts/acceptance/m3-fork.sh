@@ -231,7 +231,10 @@ def has_virtualization_entitlement(bin_path: str) -> bool:
 
 
 def list_vz_vm_pids() -> set[int]:
-    proc = subprocess.run(["ps", "-axww", "-o", "pid=,comm="], capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["ps", "-axww", "-o", "pid=,comm="], capture_output=True, text=True)
+    except OSError:
+        return set()
     if proc.returncode != 0:
         return set()
     pids: set[int] = set()
@@ -245,7 +248,10 @@ def list_vz_vm_pids() -> set[int]:
 
 def list_host_agentvm_daemons(expected_bin: str = "") -> list[tuple[int, str, str]]:
     exp_real = os.path.realpath(expected_bin) if expected_bin else ""
-    proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
+    except OSError:
+        return []
     if proc.returncode != 0:
         return []
     found = []
@@ -378,6 +384,17 @@ baseline_daemons = list_host_agentvm_daemons(resolved_bin)
 baseline_home = snapshot_home_hygiene()
 cache_before = snapshot_cache_dir(source_cache_dir)
 
+def prepare_isolated_home(home_dir: str) -> None:
+    os.makedirs(os.path.join(home_dir, "Library", "Preferences"), exist_ok=True)
+
+
+def format_tail_lines(output: str, max_lines: int = 40) -> str:
+    lines = [ln.rstrip() for ln in (output or "").splitlines()]
+    if not lines:
+        return "    (no output)"
+    return "\n".join(f"    {ln}" for ln in lines[-max_lines:])
+
+
 raw_tmp_root = tempfile.mkdtemp(prefix="agentvm-m3-fork.")
 tmp_root = os.path.realpath(raw_tmp_root)
 isolated_home = os.path.join(tmp_root, "home")
@@ -387,7 +404,8 @@ bin_dir = os.path.join(tmp_root, "bin")
 ws_empty = os.path.join(tmp_root, "ws-empty.agentvm")
 ws_real = os.path.join(tmp_root, "ws-real.agentvm")
 tracked_workspaces = [ws_empty, ws_real]
-for d in (isolated_home, isolated_tmp, local_cache_dir, bin_dir):
+prepare_isolated_home(isolated_home)
+for d in (isolated_tmp, local_cache_dir, bin_dir):
     os.makedirs(d, exist_ok=True)
 
 
@@ -669,8 +687,11 @@ COORDINATOR_REL = os.path.join("Sources", "AgentVMHypervisor", "AgentVMFleetCoor
 COORDINATOR_PATH = os.path.join(root_dir, COORDINATOR_REL)
 
 
-def git_porcelain() -> str:
-    p = subprocess.run(["git", "status", "--porcelain"], cwd=root_dir, capture_output=True, text=True, check=True)
+def git_porcelain(*paths: str) -> str:
+    cmd = ["git", "--no-optional-locks", "status", "--porcelain"]
+    if paths:
+        cmd += ["--", *paths]
+    p = subprocess.run(cmd, cwd=root_dir, capture_output=True, text=True, check=True)
     return p.stdout.strip()
 
 
@@ -681,9 +702,10 @@ def run_mutation_mode(mid: str) -> int:
     emit(f" AgentVM Milestone M3 Mutation Check --mutation {mid} (Row {row_num})")
     emit("==================================================================")
 
-    pre_git = git_porcelain()
-    if pre_git:
-        emit_err(f"REFUSED [Row {row_num}]: git working tree is not clean before --mutation {mid}:\n{pre_git}")
+    pre_git_all = git_porcelain()
+    pre_git_sources = git_porcelain("Sources")
+    if pre_git_sources:
+        emit_err(f"REFUSED [Row {row_num}]: Sources/ is not clean before --mutation {mid}:\n{pre_git_sources}")
         return 1
 
     orig_bytes = open(COORDINATOR_PATH, "rb").read()
@@ -859,23 +881,35 @@ def run_mutation_mode(mid: str) -> int:
                 [os.path.join(root_dir, "Scripts", "acceptance", "m3-branch-bench.sh"), "--out-dir", mut3_out],
                 cwd=root_dir,
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
             )
             jpath = os.path.join(mut3_out, "m3-branch-bench.json")
             med_ms = None
+            bench_failures = None
             if os.path.isfile(jpath):
-                med_ms = json.load(open(jpath, encoding="utf-8"))["stoppedFork"]["wallClockMs"]["median"]
+                bdoc = json.load(open(jpath, encoding="utf-8"))
+                med_ms = ((bdoc.get("stoppedFork") or {}).get("wallClockMs") or {}).get("median")
+                bench_failures = bdoc.get("failures")
             caught = (bproc.returncode != 0) and (med_ms is not None and med_ms > 500.0)
-            summary_detail = f"bench_exit={bproc.returncode}, stopped_median_ms={med_ms}"
+            summary_detail = (
+                f"bench_exit={bproc.returncode}, stopped_median_ms={med_ms}, failures={bench_failures}"
+            )
+            if not caught:
+                summary_detail += "\nbench last 40 lines:\n" + format_tail_lines(bproc.stdout, 40)
 
     finally:
         restore_source_and_rebuild()
         cleanup_temp_tree()
 
-    post_git = git_porcelain()
-    if post_git:
-        emit_err(f"FAIL [Row {row_num}]: git status not clean after restoring mutation:\n{post_git}")
+    post_git_sources = git_porcelain("Sources")
+    post_git_all = git_porcelain()
+    if post_git_sources or post_git_all != pre_git_all:
+        emit_err(
+            f"FAIL [Row {row_num}]: git status changed or Sources/ not clean after restoring mutation:\n"
+            f"sources={post_git_sources!r}\npost={post_git_all!r}\npre={pre_git_all!r}"
+        )
         return 1
     if not caught:
         emit_err(f"FAIL [Row {row_num}]: mutation {mid} was NOT caught ({summary_detail})")
@@ -1478,20 +1512,27 @@ try:
                 ],
                 cwd=root_dir,
                 env=u_env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 timeout=600,
             )
-            if rem.returncode == 0 and len(extra_vz_pids()) == 0:
+            vz_during_rem = sorted(extra_vz_pids())
+            if rem.returncode == 0 and not vz_during_rem:
                 pass_row(23, "remaining unit suites (NetSwitch, WorkbenchShell, StudioViews) passed alongside milestone 3 scopes + M0 checks (0 VMs)")
             else:
-                fail_row(23, f"remaining unit suites exited {rem.returncode}")
+                fail_row(
+                    23,
+                    f"remaining unit suites exited {rem.returncode} (extra_vz={vz_during_rem}); last 40 lines:\n"
+                    + format_tail_lines(rem.stdout, 40),
+                )
         else:
             ut = subprocess.run(
                 ["swift", "test", *swift_jobs_args(), "--no-parallel"],
                 cwd=root_dir,
                 env=u_env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 timeout=1800,
             )
@@ -1499,19 +1540,28 @@ try:
                 [os.path.join(root_dir, "Scripts", "test.sh"), "milestone", "0"],
                 cwd=root_dir,
                 env=u_env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 timeout=1800,
             )
             # Clean up milestone 0's temp log directory inside isolated_tmp
-            for m_log in re.findall(r"Acceptance logs:\s*(\S+)", m0.stdout):
+            for m_log in re.findall(r"Acceptance logs:\s*(\S+)", m0.stdout or ""):
                 if os.path.isdir(m_log):
                     shutil.rmtree(m_log, ignore_errors=True)
-            if ut.returncode == 0 and m0.returncode == 0 and len(extra_vz_pids()) == 0:
+            vz_during_r23 = sorted(extra_vz_pids())
+            if ut.returncode == 0 and m0.returncode == 0 and not vz_during_r23:
                 summary_ut = next((ln.strip() for ln in reversed(ut.stdout.splitlines()) if "Test run with" in ln), "passed")
                 pass_row(23, f"swift test --no-parallel ({summary_ut}) and Scripts/test.sh milestone 0 passed (0 VMs)")
             else:
-                fail_row(23, f"swift_test_rc={ut.returncode}, milestone0_rc={m0.returncode}")
+                fail_parts = [
+                    f"swift_test_rc={ut.returncode}, milestone0_rc={m0.returncode}, extra_vz_pids={vz_during_r23}"
+                ]
+                if ut.returncode != 0:
+                    fail_parts.append("swift test last 40 lines:\n" + format_tail_lines(ut.stdout, 40))
+                if m0.returncode != 0:
+                    fail_parts.append("milestone 0 last 40 lines:\n" + format_tail_lines(m0.stdout, 40))
+                fail_row(23, "\n".join(fail_parts))
     except Exception as exc:
         fail_row(23, str(exc))
 

@@ -413,7 +413,7 @@ trap on_sigterm TERM
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agentvm-m1-real-boot.XXXXXX")"
 ISOLATED_HOME="$TMP_ROOT/home"
 WS="$TMP_ROOT/ws.agentvm"
-mkdir -p "$ISOLATED_HOME"
+mkdir -p "$ISOLATED_HOME/Library/Preferences"
 
 emit_out "=================================================================="
 emit_out " AgentVM Milestone M1 Real-Boot Acceptance Suite (Rows 1-25, 27)"

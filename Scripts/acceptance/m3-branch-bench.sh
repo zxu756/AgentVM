@@ -71,6 +71,7 @@ cd "$ROOT_DIR"
 
 exec /usr/bin/python3 - "$CALLER_PWD" "$ROOT_DIR" "$RECORD_REPORTS" "$OUT_DIR" <<'PY'
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 import ctypes
 import ctypes.util
 import datetime
@@ -275,6 +276,153 @@ def summarize_int_samples(values: list[int]) -> dict:
     }
 
 
+def summarize_samples_safe(values: list[float], ndigits: int = 2):
+    return summarize_samples(values, ndigits=ndigits) if values else None
+
+
+def summarize_int_samples_safe(values: list[int]):
+    return summarize_int_samples(values) if values else None
+
+
+def read_host_loadavg() -> dict:
+    try:
+        sysctl_p = subprocess.run(["/usr/sbin/sysctl", "-n", "vm.loadavg"], capture_output=True, text=True)
+        raw_vm = sysctl_p.stdout.strip() if sysctl_p.returncode == 0 else ""
+    except OSError:
+        raw_vm = ""
+    nums = [float(tok) for tok in re.findall(r"[0-9]+(?:\.[0-9]+)?", raw_vm)]
+    try:
+        up_p = subprocess.run(["/usr/bin/uptime"], capture_output=True, text=True)
+        raw_uptime = up_p.stdout.strip() if up_p.returncode == 0 else ""
+    except OSError:
+        raw_uptime = ""
+    return {
+        "load1m": nums[0] if len(nums) >= 1 else None,
+        "load5m": nums[1] if len(nums) >= 2 else None,
+        "load15m": nums[2] if len(nums) >= 3 else None,
+        "sysctlVmLoadavg": raw_vm,
+        "uptime": raw_uptime,
+    }
+
+
+def format_load_triplet(ld) -> str:
+    if not ld or ld.get("load1m") is None:
+        return "unknown"
+    return f"{ld['load1m']:.2f} {ld['load5m']:.2f} {ld['load15m']:.2f}"
+
+
+def prepare_isolated_home(home_dir: str) -> None:
+    os.makedirs(os.path.join(home_dir, "Library", "Preferences"), exist_ok=True)
+
+
+def record_failure(failures: list[dict], check: str, reason: str) -> None:
+    clean_reason = scrub(reason)
+    failures.append({"check": check, "reason": clean_reason})
+    emit_err(f"CHECK FAILED [{check}]: {clean_reason}")
+
+
+IPV4_UNIQUENESS_RULE = (
+    "hostname, /etc/machine-id, instance-id, NIC MAC, and SSH ED25519 host key fingerprint must be "
+    "pairwise distinct across all 33 VMs (parent p + 32 children); DHCP IPv4 is required to be distinct "
+    "only among simultaneously running VMs (e.g., parent p and a concurrently booted child; also enforced "
+    "by m3-fork.sh Rows 9, 13, and 19), while sequentially booted VMs after earlier VMs halt may legitimately "
+    "reuse released DHCP leases and are recorded in sequentialIPv4LeaseReuses."
+)
+
+
+def verify_identities_across_fleet(
+    p_ident,
+    verified_children: list[dict],
+    concurrent_ipv4_collisions: list[dict],
+    max_concurrent_seen: int,
+    post_boot_priv_stats,
+    failures: list[dict],
+) -> dict:
+    all_identities = []
+    if p_ident is not None:
+        p_ipv4_bare = p_ident["ipv4"].split("/")[0] if p_ident.get("ipv4") else ""
+        all_identities.append({
+            "name": "p",
+            "hostname": p_ident["hostname"],
+            "machineID": p_ident["machine_id"],
+            "instanceID": p_ident["instance_id"],
+            "mac": p_ident["mac"],
+            "ipv4Address": p_ipv4_bare,
+            "sshEd25519Fingerprint": p_ident["ssh_ed25519"],
+        })
+    for c in verified_children:
+        all_identities.append({
+            "name": c["name"],
+            "hostname": c["hostname"],
+            "machineID": c["machineID"],
+            "instanceID": c["instanceID"],
+            "mac": c["mac"],
+            "ipv4Address": c["ipv4Address"],
+            "sshEd25519Fingerprint": c["sshEd25519Fingerprint"],
+        })
+
+    expected_children = STOPPED_FORK_COUNT + LIVE_FORK_COUNT
+    if p_ident is None or len(verified_children) != expected_children:
+        record_failure(
+            failures,
+            "childIdentity.bootCoverage",
+            f"Expected parent 'p' + {expected_children} booted children, got parent={p_ident is not None}, children={len(verified_children)}",
+        )
+
+    distinct_flags = {}
+    for field in ("hostname", "machineID", "instanceID", "mac", "sshEd25519Fingerprint"):
+        seen = {}
+        dups = []
+        for it in all_identities:
+            v = it[field]
+            if v in seen:
+                dups.append({"firstVM": seen[v], "secondVM": it["name"], "value": v})
+            else:
+                seen[v] = it["name"]
+        distinct_flags[field] = (len(dups) == 0 and len(all_identities) == expected_children + 1)
+        if dups:
+            record_failure(
+                failures,
+                f"childIdentity.pairwiseUnique.{field}",
+                f"Identity collision across {len(all_identities)} VMs on {field}: {dups}",
+            )
+
+    seen_ip = {}
+    sequential_ipv4_reuses = []
+    for it in all_identities:
+        ip_val = it["ipv4Address"]
+        if not ip_val:
+            continue
+        if ip_val in seen_ip:
+            sequential_ipv4_reuses.append({
+                "earlierVM": seen_ip[ip_val],
+                "laterVM": it["name"],
+                "ipv4Address": ip_val,
+            })
+        else:
+            seen_ip[ip_val] = it["name"]
+
+    unique_ipv4_count = len(seen_ip)
+
+    return {
+        "totalChildrenBooted": len(verified_children),
+        "totalVMsComparedIncludingParent": len(all_identities),
+        "maxConcurrentVMsObserved": max_concurrent_seen,
+        "ipv4UniquenessRule": IPV4_UNIQUENESS_RULE,
+        "allHostnamesPairwiseDistinct": distinct_flags["hostname"],
+        "allMachineIDsPairwiseDistinct": distinct_flags["machineID"],
+        "allInstanceIDsPairwiseDistinct": distinct_flags["instanceID"],
+        "allMACsPairwiseDistinct": distinct_flags["mac"],
+        "allSSHEd25519FingerprintsPairwiseDistinct": distinct_flags["sshEd25519Fingerprint"],
+        "allConcurrentIPv4sPairwiseDistinct": len(concurrent_ipv4_collisions) == 0,
+        "concurrentIPv4Collisions": concurrent_ipv4_collisions,
+        "uniqueIPv4CountAcrossAllBootedVMs": unique_ipv4_count,
+        "sequentialIPv4LeaseReuses": sequential_ipv4_reuses,
+        "postFirstBootAndHaltRootDiskPrivateBytes": post_boot_priv_stats,
+        "children": verified_children,
+    }
+
+
 def df_available_kb(path: str) -> int:
     proc = subprocess.run(["/bin/df", "-k", path], capture_output=True, text=True, check=True)
     lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
@@ -297,7 +445,10 @@ def has_virtualization_entitlement(bin_path: str) -> bool:
 
 
 def list_vz_vm_pids() -> set[int]:
-    proc = subprocess.run(["ps", "-axww", "-o", "pid=,comm="], capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["ps", "-axww", "-o", "pid=,comm="], capture_output=True, text=True)
+    except OSError:
+        return set()
     if proc.returncode != 0:
         return set()
     pids: set[int] = set()
@@ -311,7 +462,10 @@ def list_vz_vm_pids() -> set[int]:
 
 def list_host_agentvm_daemons(expected_bin: str = "") -> list[tuple[int, str, str]]:
     exp_real = os.path.realpath(expected_bin) if expected_bin else ""
-    proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="], capture_output=True, text=True)
+    except OSError:
+        return []
     if proc.returncode != 0:
         return []
     found: list[tuple[int, str, str]] = []
@@ -400,22 +554,9 @@ else:
 
 user_bin_env = os.environ.get("AGENTVM_BIN", "").strip()
 resolved_bin = ""
-if user_bin_env:
-    if os.path.isabs(user_bin_env):
-        cand = user_bin_env
-    else:
-        from_caller = os.path.join(caller_pwd, user_bin_env)
-        cand = from_caller if os.path.exists(from_caller) else os.path.join(root_dir, user_bin_env)
-    resolved_bin = os.path.realpath(cand)
-    if not (os.path.isfile(resolved_bin) and os.access(resolved_bin, os.X_OK)):
-        emit_err("ERROR: AGENTVM_BIN does not exist or is not executable.")
-        sys.exit(1)
-    if not has_virtualization_entitlement(resolved_bin):
-        emit_err("REFUSED: AGENTVM_BIN lacks com.apple.security.virtualization entitlement.")
-        sys.exit(1)
 
 baseline_vz_pids = list_vz_vm_pids()
-baseline_daemons = list_host_agentvm_daemons(resolved_bin)
+baseline_daemons = list_host_agentvm_daemons("")
 cache_before = snapshot_cache_dir(source_cache_dir)
 
 raw_tmp_root = tempfile.mkdtemp(prefix="agentvm-m3-bench.")
@@ -425,7 +566,8 @@ isolated_tmp = os.path.join(tmp_root, "tmp")
 local_cache_dir = os.path.join(tmp_root, "image-cache")
 bin_dir = os.path.join(tmp_root, "bin")
 ws_path = os.path.join(tmp_root, "ws.agentvm")
-for d in (isolated_home, isolated_tmp, local_cache_dir, bin_dir):
+prepare_isolated_home(isolated_home)
+for d in (isolated_tmp, local_cache_dir, bin_dir):
     os.makedirs(d, exist_ok=True)
 
 
@@ -443,6 +585,7 @@ def wait_for_extra_vz_count(expected: int, timeout_sec: float = 30.0) -> bool:
 
 
 max_concurrent_vms_seen = 0
+failures: list[dict] = []
 
 
 def check_vm_cap(limit: int = 2) -> int:
@@ -451,7 +594,11 @@ def check_vm_cap(limit: int = 2) -> int:
     if cnt > max_concurrent_vms_seen:
         max_concurrent_vms_seen = cnt
     if cnt > limit:
-        raise RuntimeError(f"Concurrent VM limit ({limit}) exceeded: {cnt} extra VirtualMachine PIDs active")
+        record_failure(
+            failures,
+            "concurrentVMCap",
+            f"Concurrent VM limit ({limit}) exceeded: {cnt} extra VirtualMachine PIDs active",
+        )
     return cnt
 
 
@@ -534,7 +681,24 @@ signal.signal(signal.SIGINT, handle_sig)
 signal.signal(signal.SIGTERM, handle_sig)
 
 bench_start = time.perf_counter()
-exit_code = 0
+load_at_start = read_host_loadavg()
+current_stage = "startup"
+
+payload_sha256 = ""
+p_disk_space_before = None
+p_ident = None
+p_boot_id_before = ""
+p_boot_id_after = ""
+stopped_df_before_kb = None
+stopped_df_after_kb = None
+stopped_records: list[dict] = []
+live_df_before_kb = None
+live_df_after_kb = None
+live_records: list[dict] = []
+verified_children: list[dict] = []
+post_boot_priv_samples: list[int] = []
+active_running_ipv4: dict[str, str] = {}
+concurrent_ipv4_collisions: list[dict] = []
 
 try:
     emit("==================================================================")
@@ -542,10 +706,26 @@ try:
     emit("==================================================================")
     emit(f"Baseline VirtualMachine PIDs (untouched): {sorted(baseline_vz_pids)}")
     emit(f"Baseline host AgentVM daemons (untouched): {len(baseline_daemons)}")
+    emit(f"Host load average at start (1m/5m/15m): {format_load_triplet(load_at_start)}")
 
+    if user_bin_env:
+        if os.path.isabs(user_bin_env):
+            cand = user_bin_env
+        else:
+            from_caller = os.path.join(caller_pwd, user_bin_env)
+            cand = from_caller if os.path.exists(from_caller) else os.path.join(root_dir, user_bin_env)
+        resolved_bin = os.path.realpath(cand)
+        if not (os.path.isfile(resolved_bin) and os.access(resolved_bin, os.X_OK)):
+            raise RuntimeError("AGENTVM_BIN does not exist or is not executable.")
+        if not has_virtualization_entitlement(resolved_bin):
+            raise RuntimeError("REFUSED: AGENTVM_BIN lacks com.apple.security.virtualization entitlement.")
+        baseline_daemons = list_host_agentvm_daemons(resolved_bin)
+
+    current_stage = "apfsProbe"
     verify_apfs_privsize_probe(tmp_root)
 
     # 1. Build & ad-hoc sign binary copy in $TMP_ROOT/bin if AGENTVM_BIN was not supplied
+    current_stage = "buildAndSignBinary"
     if not resolved_bin:
         emit("Building debug AgentVM binary...")
         jobs_env = os.environ.get("AGENTVM_BUILD_JOBS", "").strip()
@@ -555,8 +735,7 @@ try:
         build_cmd += ["--product", "AgentVM"]
         bproc = subprocess.run(build_cmd, cwd=root_dir, capture_output=True, text=True)
         if bproc.returncode != 0:
-            emit_err("ERROR: swift build --product AgentVM failed:\n" + bproc.stderr[-2000:])
-            sys.exit(1)
+            raise RuntimeError("swift build --product AgentVM failed:\n" + bproc.stderr[-2000:])
         built_debug = os.path.realpath(os.path.join(root_dir, ".build", "debug", "AgentVM"))
         signed_copy = os.path.join(bin_dir, "AgentVM")
         shutil.copy2(built_debug, signed_copy)
@@ -568,11 +747,12 @@ try:
             text=True,
         )
         if cs.returncode != 0 or not has_virtualization_entitlement(signed_copy):
-            emit_err(f"ERROR: codesign failed on temporary binary copy: {cs.stderr}")
-            sys.exit(1)
+            raise RuntimeError(f"codesign failed on temporary binary copy: {cs.stderr}")
         resolved_bin = os.path.realpath(signed_copy)
+        baseline_daemons = list_host_agentvm_daemons(resolved_bin)
 
     # 2. Clone Debian 12 image cache into $TMP_ROOT/image-cache via APFS clonefile (`cp -c`)
+    current_stage = "stageImageCache"
     src_raw = os.path.join(source_cache_dir, "debian-12-bookworm-arm64.raw")
     src_idx = os.path.join(source_cache_dir, "catalog-index.json")
     if not (os.path.isfile(src_raw) and os.path.isfile(src_idx)):
@@ -588,6 +768,7 @@ try:
         os.chmod(dst_raw, 0o444)
 
     # 3. Prepare parent VM `p` (8 GiB disk, 2 vCPU, 2048 MiB RAM; write 1 GiB random data + marker, sync, halt)
+    current_stage = "prepareParentVM"
     emit("\n[1/5] Preparing parent VM 'p' (8 GiB disk, 1 GiB random data + marker, sync, halt)...")
     run_avm(["--lang", "en", "--workspace", ws_path, "init"])
     run_avm([
@@ -615,13 +796,17 @@ try:
     payload_size = int(prep_lines[0])
     payload_sha256 = prep_lines[1].split()[0]
     if payload_size != EXPECTED_PAYLOAD_BYTES:
-        raise RuntimeError(f"Expected 1 GiB payload ({EXPECTED_PAYLOAD_BYTES} B), got {payload_size}")
+        record_failure(
+            failures,
+            "parentVM.payloadBytes",
+            f"Expected 1 GiB payload ({EXPECTED_PAYLOAD_BYTES} B), got {payload_size}",
+        )
     emit(f"  wrote 1 GiB payload ({payload_size} B, sha256={payload_sha256[:16]}...) in {prep_exec['wallMs']:.1f} ms")
 
     # Also read parent `p` identity while booted (or during live fork step); halt `p` first for stopped forks
     halt_p_prep = run_avm(["--lang", "en", "--workspace", ws_path, "halt", "p"])
     if not wait_for_extra_vz_count(0, timeout_sec=30.0):
-        raise RuntimeError("Parent VM 'p' process did not exit within 30s after halt")
+        record_failure(failures, "parentVM.haltAfterPrep", "Parent VM 'p' process did not exit within 30s after halt")
     emit(f"  halt p: {halt_p_prep['wallMs']:.1f} ms")
 
     ps_initial = json.loads(run_avm(["--lang", "en", "--workspace", ws_path, "ps", "--json"])["stdout"])
@@ -629,8 +814,10 @@ try:
     p_root_disk_path = p_rec_initial["spec"]["blockDevices"][0]["imagePath"]
     p_disk_space_before = read_apfs_space(p_root_disk_path)
     if p_disk_space_before["logicalBytes"] != EXPECTED_DISK_VIRTUAL_BYTES:
-        raise RuntimeError(
-            f"Expected 8 GiB virtual disk ({EXPECTED_DISK_VIRTUAL_BYTES} B), got {p_disk_space_before['logicalBytes']}"
+        record_failure(
+            failures,
+            "parentVM.virtualDiskBytes",
+            f"Expected 8 GiB virtual disk ({EXPECTED_DISK_VIRTUAL_BYTES} B), got {p_disk_space_before['logicalBytes']}",
         )
     emit(
         f"  parent root disk before forks: virtual={p_disk_space_before['logicalBytes']} B, "
@@ -639,12 +826,16 @@ try:
 
     branch_re = re.compile(r"in\s+([0-9]+(?:\.[0-9]+)?)\s+ms\s+from\s+snapshot\s+(snap-[a-zA-Z0-9-]+)")
 
-    def inspect_fork_new_files(child_name: str, fork_snap_id: str) -> dict:
+    def inspect_fork_new_files(child_name: str, fork_snap_id: str, mode_prefix: str) -> dict:
         vms = json.loads(run_avm(["--lang", "en", "--workspace", ws_path, "ps", "--json"])["stdout"])
         snaps = json.loads(run_avm(["--lang", "en", "--workspace", ws_path, "snapshot", "list", "--json"])["stdout"])
         child = next(v for v in vms if v["spec"]["name"] == child_name)
         if child["telemetry"]["state"] != "stopped":
-            raise RuntimeError(f"Expected newly forked child '{child_name}' to be stopped, got {child['telemetry']['state']}")
+            record_failure(
+                failures,
+                f"{mode_prefix}.childStoppedState.{child_name}",
+                f"Expected newly forked child '{child_name}' to be stopped, got {child['telemetry']['state']}",
+            )
         child_disk = child["spec"]["blockDevices"][0]["imagePath"]
         child_head_id = child["currentHeadSnapshotID"]
         child_head_snap = next(s for s in snaps if s["id"] == child_head_id)
@@ -681,9 +872,9 @@ try:
         }
 
     # 4. 16 stopped forks (`sc1` .. `sc16`)
+    current_stage = "stoppedForks"
     emit(f"\n[2/5] Running {STOPPED_FORK_COUNT} stopped forks (sc1..sc{STOPPED_FORK_COUNT})...")
     stopped_df_before_kb = df_available_kb(tmp_root)
-    stopped_records = []
     for i in range(1, STOPPED_FORK_COUNT + 1):
         cname = f"sc{i}"
         df_b = df_available_kb(tmp_root)
@@ -691,15 +882,23 @@ try:
         df_a = df_available_kb(tmp_root)
         check_vm_cap(2)
         if len(extra_vz_pids()) != 0:
-            raise RuntimeError(f"Stopped fork '{cname}' unexpectedly started a VM process")
+            record_failure(
+                failures,
+                f"stoppedFork.noVMProcess.{cname}",
+                f"Stopped fork '{cname}' unexpectedly started a VM process",
+            )
         m = branch_re.search(res["stdout"])
         if not m:
             raise RuntimeError(f"Could not parse branch timing/snapshot from stdout: {res['stdout']!r}")
         rep_ms = float(m.group(1))
         fsnap_id = m.group(2)
-        finfo = inspect_fork_new_files(cname, fsnap_id)
+        finfo = inspect_fork_new_files(cname, fsnap_id, "stoppedFork")
         if finfo["totalClonedFilesPrivateBytes"] != 0:
-            raise RuntimeError(f"Stopped fork '{cname}' created cloned files with non-zero private bytes: {finfo}")
+            record_failure(
+                failures,
+                f"stoppedFork.newClonedFilesPrivateBytes.{cname}",
+                f"Stopped fork '{cname}' created cloned files with non-zero private bytes: {finfo['clonedFilesPrivateBytes']}",
+            )
         stopped_records.append({
             "index": i,
             "childName": cname,
@@ -711,19 +910,27 @@ try:
             **finfo,
         })
     stopped_df_after_kb = df_available_kb(tmp_root)
-    stopped_wall_stats = summarize_samples([r["wallClockMs"] for r in stopped_records])
-    stopped_rep_stats = summarize_samples([r["selfReportedMs"] for r in stopped_records])
+    stopped_wall_tmp = summarize_samples([r["wallClockMs"] for r in stopped_records])
+    stopped_rep_tmp = summarize_samples([r["selfReportedMs"] for r in stopped_records])
     emit(
-        f"  stopped forks (n={STOPPED_FORK_COUNT}): wall median={stopped_wall_stats['median']:.2f} ms, "
-        f"p95={stopped_wall_stats['p95NearestRank']:.2f} ms, max={stopped_wall_stats['max']:.2f} ms; "
-        f"self-reported median={stopped_rep_stats['median']:.2f} ms; cloned private bytes=0 B"
+        f"  stopped forks (n={STOPPED_FORK_COUNT}): wall median={stopped_wall_tmp['median']:.2f} ms, "
+        f"p95={stopped_wall_tmp['p95NearestRank']:.2f} ms, max={stopped_wall_tmp['max']:.2f} ms; "
+        f"self-reported median={stopped_rep_tmp['median']:.2f} ms; "
+        f"all cloned private bytes zero={all(r['totalClonedFilesPrivateBytes'] == 0 for r in stopped_records)}"
     )
+    if stopped_wall_tmp["median"] > STOPPED_MEDIAN_THRESHOLD_MS:
+        record_failure(
+            failures,
+            "stoppedFork.provisionalThresholdMedianMs",
+            f"Stopped fork wall-clock median {stopped_wall_tmp['median']:.2f} ms exceeded provisional threshold {STOPPED_MEDIAN_THRESHOLD_MS:.1f} ms",
+        )
 
     # 5. Boot `p`, read `p` identity + boot_id, and run 16 live forks (`lc1` .. `lc16`)
+    current_stage = "liveForks"
     emit(f"\n[3/5] Booting 'p' and running {LIVE_FORK_COUNT} live forks (lc1..lc{LIVE_FORK_COUNT})...")
     run_avm(["--lang", "en", "--workspace", ws_path, "up", "p"])
     if check_vm_cap(2) != 1:
-        raise RuntimeError("Expected exactly 1 running VM ('p') before live forks")
+        record_failure(failures, "liveFork.parentRunningCount", "Expected exactly 1 running VM ('p') before live forks")
 
     ident_probe = (
         "python3 -c '"
@@ -750,24 +957,34 @@ try:
 
     p_ident = json.loads(run_avm(["--lang", "en", "--workspace", ws_path, "exec", "p", "--", "sh", "-c", ident_probe])["stdout"].strip())
     p_boot_id_before = p_ident["boot_id"]
+    p_ipv4_while_running = p_ident["ipv4"].split("/")[0] if p_ident.get("ipv4") else ""
+    if p_ipv4_while_running:
+        active_running_ipv4["p"] = p_ipv4_while_running
 
     live_df_before_kb = df_available_kb(tmp_root)
-    live_records = []
     for i in range(1, LIVE_FORK_COUNT + 1):
         cname = f"lc{i}"
         df_b = df_available_kb(tmp_root)
         res = run_avm(["--lang", "en", "--workspace", ws_path, "branch", "p", cname])
         df_a = df_available_kb(tmp_root)
         if check_vm_cap(2) != 1:
-            raise RuntimeError(f"Live fork '{cname}' changed active VM count from 1")
+            record_failure(
+                failures,
+                f"liveFork.activeVMCount.{cname}",
+                f"Live fork '{cname}' changed active VM count from 1",
+            )
         m = branch_re.search(res["stdout"])
         if not m:
             raise RuntimeError(f"Could not parse live branch timing/snapshot from stdout: {res['stdout']!r}")
         rep_ms = float(m.group(1))
         fsnap_id = m.group(2)
-        finfo = inspect_fork_new_files(cname, fsnap_id)
+        finfo = inspect_fork_new_files(cname, fsnap_id, "liveFork")
         if finfo["totalClonedFilesPrivateBytes"] != 0:
-            raise RuntimeError(f"Live fork '{cname}' created cloned files with non-zero private bytes: {finfo}")
+            record_failure(
+                failures,
+                f"liveFork.newClonedFilesPrivateBytes.{cname}",
+                f"Live fork '{cname}' created cloned files with non-zero private bytes: {finfo['clonedFilesPrivateBytes']}",
+            )
         live_records.append({
             "index": i,
             "childName": cname,
@@ -776,6 +993,8 @@ try:
             "dfBeforeKB": df_b,
             "dfAfterKB": df_a,
             "dfDeltaKB": df_b - df_a,
+            "vmPauseMs": None,
+            "guestPrePauseSyncMs": None,
             **finfo,
         })
     live_df_after_kb = df_available_kb(tmp_root)
@@ -784,7 +1003,11 @@ try:
         ["--lang", "en", "--workspace", ws_path, "exec", "p", "--", "cat", "/proc/sys/kernel/random/boot_id"]
     )["stdout"].strip()
     if p_boot_id_after != p_boot_id_before:
-        raise RuntimeError(f"Parent 'p' boot_id changed across live forks: {p_boot_id_before} -> {p_boot_id_after}")
+        record_failure(
+            failures,
+            "liveFork.parentBootIDUnchanged",
+            f"Parent 'p' boot_id changed across live forks: {p_boot_id_before} -> {p_boot_id_after}",
+        )
 
     events_p = json.loads(run_avm(["--lang", "en", "--workspace", ws_path, "events", "--vm", "p", "--json"])["stdout"])
     pause_by_snap = {
@@ -795,56 +1018,112 @@ try:
     for rec in live_records:
         meta = pause_by_snap.get(rec["forkSnapshotID"])
         if not meta:
-            raise RuntimeError(f"Missing VM_PAUSED_FOR_SNAPSHOT event for live fork {rec['childName']} ({rec['forkSnapshotID']})")
-        rec["vmPauseMs"] = round(float(meta["pauseMs"]), 3)
-        rec["guestPrePauseSyncMs"] = round(float(meta["syncMs"]), 3)
+            record_failure(
+                failures,
+                f"liveFork.vmPausedForSnapshotEvent.{rec['childName']}",
+                f"Missing VM_PAUSED_FOR_SNAPSHOT event for live fork {rec['childName']} ({rec['forkSnapshotID']})",
+            )
+        else:
+            rec["vmPauseMs"] = round(float(meta["pauseMs"]), 3)
+            rec["guestPrePauseSyncMs"] = round(float(meta["syncMs"]), 3)
 
-    live_wall_stats = summarize_samples([r["wallClockMs"] for r in live_records])
-    live_rep_stats = summarize_samples([r["selfReportedMs"] for r in live_records])
-    live_pause_stats = summarize_samples([r["vmPauseMs"] for r in live_records], ndigits=3)
-    live_sync_stats = summarize_samples([r["guestPrePauseSyncMs"] for r in live_records], ndigits=3)
+    live_wall_tmp = summarize_samples([r["wallClockMs"] for r in live_records])
+    live_pause_vals = [r["vmPauseMs"] for r in live_records if r["vmPauseMs"] is not None]
+    live_pause_tmp = summarize_samples_safe(live_pause_vals, ndigits=3)
+    pause_med_str = f"{live_pause_tmp['median']:.3f} ms" if live_pause_tmp else "n/a"
+    pause_p95_str = f"{live_pause_tmp['p95NearestRank']:.3f} ms" if live_pause_tmp else "n/a"
     emit(
-        f"  live forks (n={LIVE_FORK_COUNT}): wall median={live_wall_stats['median']:.2f} ms, "
-        f"p95={live_wall_stats['p95NearestRank']:.2f} ms; VM pause median={live_pause_stats['median']:.3f} ms "
-        f"(p95={live_pause_stats['p95NearestRank']:.3f} ms); cloned private bytes=0 B"
+        f"  live forks (n={LIVE_FORK_COUNT}): wall median={live_wall_tmp['median']:.2f} ms, "
+        f"p95={live_wall_tmp['p95NearestRank']:.2f} ms; VM pause median={pause_med_str} "
+        f"(p95={pause_p95_str}); all cloned private bytes zero={all(r['totalClonedFilesPrivateBytes'] == 0 for r in live_records)}"
     )
 
     run_avm(["--lang", "en", "--workspace", ws_path, "halt", "p"])
+    active_running_ipv4.pop("p", None)
     if not wait_for_extra_vz_count(0, timeout_sec=30.0):
-        raise RuntimeError("Parent 'p' did not stop within 30s after live forks")
+        record_failure(failures, "liveFork.parentHalt", "Parent 'p' did not stop within 30s after live forks")
 
     # 6. Sequentially boot all 32 children (`sc1..sc16`, `lc1..lc16`), verify identity + marker + payload, halt
+    current_stage = "verifyChildren"
     all_fork_records = [("stopped", r) for r in stopped_records] + [("live", r) for r in live_records]
     emit(f"\n[4/5] Sequentially booting, verifying guest identity & marker, and halting all {len(all_fork_records)} children...")
 
-    verified_children = []
-    post_boot_priv_samples = []
     sha_spot_names = {"sc1", f"sc{STOPPED_FORK_COUNT}", "lc1", f"lc{LIVE_FORK_COUNT}"}
 
     for idx_all, (mode_label, frec) in enumerate(all_fork_records, start=1):
         cname = frec["childName"]
+        current_stage = f"verifyChildren.{cname}"
         up_res = run_avm(["--lang", "en", "--workspace", ws_path, "up", cname])
         if check_vm_cap(2) != 1:
-            raise RuntimeError(f"Expected 1 active VM while verifying '{cname}'")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.activeVMCount",
+                f"Expected 1 active VM while verifying '{cname}'",
+            )
         id_res = run_avm(["--lang", "en", "--workspace", ws_path, "exec", cname, "--", "sh", "-c", ident_probe])
         cid = json.loads(id_res["stdout"].strip())
+        ipv4_bare = cid["ipv4"].split("/")[0] if cid.get("ipv4") else ""
+
+        if ipv4_bare:
+            for other_vm, other_ip in list(active_running_ipv4.items()):
+                if other_vm != cname and other_ip == ipv4_bare:
+                    col = {"activeVM": other_vm, "concurrentVM": cname, "ipv4Address": ipv4_bare}
+                    concurrent_ipv4_collisions.append(col)
+                    record_failure(
+                        failures,
+                        f"childIdentity.{cname}.concurrentIPv4Unique",
+                        f"Simultaneously running VMs '{other_vm}' and '{cname}' shared IPv4 {ipv4_bare}",
+                    )
+            active_running_ipv4[cname] = ipv4_bare
 
         if cid["hostname"] != cname:
-            raise RuntimeError(f"Child '{cname}' hostname mismatch: {cid['hostname']!r}")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.hostname",
+                f"Child '{cname}' hostname mismatch: {cid['hostname']!r}",
+            )
         if cid["machine_id"] != cid["dbus_machine_id"] or len(cid["machine_id"]) != 32:
-            raise RuntimeError(f"Child '{cname}' invalid machine-id: {cid}")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.machineID",
+                f"Child '{cname}' invalid machine-id: {cid['machine_id']!r} / dbus={cid['dbus_machine_id']!r}",
+            )
         if cid["instance_id"] != frec["childVMID"]:
-            raise RuntimeError(f"Child '{cname}' instance-id {cid['instance_id']!r} != {frec['childVMID']!r}")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.instanceID",
+                f"Child '{cname}' instance-id {cid['instance_id']!r} != {frec['childVMID']!r}",
+            )
         if cid["mac"] != frec["childExpectedMAC"]:
-            raise RuntimeError(f"Child '{cname}' MAC {cid['mac']!r} != spec {frec['childExpectedMAC']!r}")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.mac",
+                f"Child '{cname}' MAC {cid['mac']!r} != spec {frec['childExpectedMAC']!r}",
+            )
         if not cid["ipv4"]:
-            raise RuntimeError(f"Child '{cname}' received empty IPv4 address")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.ipv4NonEmpty",
+                f"Child '{cname}' received empty IPv4 address",
+            )
         if cid["marker"] != bench_marker:
-            raise RuntimeError(f"Child '{cname}' marker mismatch: {cid['marker']!r}")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.marker",
+                f"Child '{cname}' marker mismatch: {cid['marker']!r}",
+            )
         if int(cid["payloadBytes"]) != EXPECTED_PAYLOAD_BYTES:
-            raise RuntimeError(f"Child '{cname}' payload size {cid['payloadBytes']} != {EXPECTED_PAYLOAD_BYTES}")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.payloadBytes",
+                f"Child '{cname}' payload size {cid['payloadBytes']} != {EXPECTED_PAYLOAD_BYTES}",
+            )
         if cid["workspace"] != "directory:755":
-            raise RuntimeError(f"Child '{cname}' /workspace missing or wrong mode: {cid['workspace']!r}")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.workspaceMount",
+                f"Child '{cname}' /workspace missing or wrong mode: {cid['workspace']!r}",
+            )
 
         sha_verified = False
         if cname in sha_spot_names:
@@ -852,16 +1131,25 @@ try:
                 ["--lang", "en", "--workspace", ws_path, "exec", cname, "--", "sha256sum", "/var/tmp/bench-data.bin"]
             )["stdout"].strip().split()[0]
             if sha_out != payload_sha256:
-                raise RuntimeError(f"Child '{cname}' 1 GiB SHA-256 mismatch: {sha_out} != {payload_sha256}")
-            sha_verified = True
+                record_failure(
+                    failures,
+                    f"childIdentity.{cname}.payloadSHA256",
+                    f"Child '{cname}' 1 GiB SHA-256 mismatch: {sha_out} != {payload_sha256}",
+                )
+            else:
+                sha_verified = True
 
         halt_res = run_avm(["--lang", "en", "--workspace", ws_path, "halt", cname])
+        active_running_ipv4.pop(cname, None)
         if not wait_for_extra_vz_count(0, timeout_sec=30.0):
-            raise RuntimeError(f"Child '{cname}' VM process did not exit within 30s")
+            record_failure(
+                failures,
+                f"childIdentity.{cname}.halt",
+                f"Child '{cname}' VM process did not exit within 30s",
+            )
 
         post_space = read_apfs_space(frec["childRootDiskPath"])
         post_boot_priv_samples.append(post_space["privateBytes"])
-        ipv4_bare = cid["ipv4"].split("/")[0]
 
         verified_children.append({
             "order": idx_all,
@@ -887,274 +1175,333 @@ try:
         )
 
     # Stop workspace daemon before final checks
+    current_stage = "daemonStop"
     run_avm(["--lang", "en", "--workspace", ws_path, "daemon", "stop"])
 
-    # Pairwise uniqueness check across parent `p` + all 32 children (33 distinct VMs)
-    p_ipv4_bare = p_ident["ipv4"].split("/")[0]
-    all_identities = [
-        {
-            "name": "p",
-            "hostname": p_ident["hostname"],
-            "machineID": p_ident["machine_id"],
-            "instanceID": p_ident["instance_id"],
-            "mac": p_ident["mac"],
-            "ipv4Address": p_ipv4_bare,
-            "sshEd25519Fingerprint": p_ident["ssh_ed25519"],
-        }
-    ] + [
-        {
-            "name": c["name"],
-            "hostname": c["hostname"],
-            "machineID": c["machineID"],
-            "instanceID": c["instanceID"],
-            "mac": c["mac"],
-            "ipv4Address": c["ipv4Address"],
-            "sshEd25519Fingerprint": c["sshEd25519Fingerprint"],
-        }
-        for c in verified_children
-    ]
-
-    expected_unique = len(all_identities)  # 33
-    for field in ("hostname", "machineID", "instanceID", "mac", "ipv4Address", "sshEd25519Fingerprint"):
-        vals = [item[field] for item in all_identities]
-        if len(set(vals)) != expected_unique:
-            seen = {}
-            dups = []
-            for it in all_identities:
-                v = it[field]
-                if v in seen:
-                    dups.append((seen[v], it["name"], v))
-                else:
-                    seen[v] = it["name"]
-            raise RuntimeError(f"Identity collision across 33 VMs on {field}: {dups}")
-
-    post_boot_priv_stats = summarize_int_samples(post_boot_priv_samples)
-
-    # 7. Host metadata & JSON / Markdown report generation
-    def sysctl_str(key: str) -> str:
-        p = subprocess.run(["/usr/sbin/sysctl", "-n", key], capture_output=True, text=True)
-        return p.stdout.strip() if p.returncode == 0 else "unknown"
-
-    hw_model = sysctl_str("hw.model")
-    cpu_brand = sysctl_str("machdep.cpu.brand_string")
-    phys_cores = int(sysctl_str("hw.physicalcpu") or "0")
-    log_cores = int(sysctl_str("hw.logicalcpu") or "0")
-    mem_bytes = int(sysctl_str("hw.memsize") or "0")
-    macos_ver = subprocess.check_output(["/usr/bin/sw_vers", "-productVersion"], text=True).strip()
-    macos_build = subprocess.check_output(["/usr/bin/sw_vers", "-buildVersion"], text=True).strip()
-    git_rev_proc = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root_dir, capture_output=True, text=True)
-    git_commit = git_rev_proc.stdout.strip() if git_rev_proc.returncode == 0 else "unknown"
-    today_local = datetime.date.today().isoformat()
-    utc_now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    passed_threshold = stopped_wall_stats["median"] <= STOPPED_MEDIAN_THRESHOLD_MS
-    total_elapsed_sec = round(time.perf_counter() - bench_start, 2)
-
-    # Strip temp paths from per-fork records before serializing
-    def clean_fork_sample(rec: dict, include_pause: bool) -> dict:
-        d = {
-            "index": rec["index"],
-            "childName": rec["childName"],
-            "childVMID": rec["childVMID"],
-            "forkSnapshotID": rec["forkSnapshotID"],
-            "childHeadSnapshotID": rec["childHeadSnapshotID"],
-            "wallClockMs": rec["wallClockMs"],
-            "selfReportedMs": rec["selfReportedMs"],
-            "clonedFilesPrivateBytes": rec["clonedFilesPrivateBytes"],
-            "totalClonedFilesPrivateBytes": rec["totalClonedFilesPrivateBytes"],
-            "synthesizedNonCloneBytes": rec["synthesizedNonCloneBytes"],
-            "dfBeforeKB": rec["dfBeforeKB"],
-            "dfAfterKB": rec["dfAfterKB"],
-            "dfDeltaKB": rec["dfDeltaKB"],
-        }
-        if include_pause:
-            d["vmPauseMs"] = rec["vmPauseMs"]
-            d["guestPrePauseSyncMs"] = rec["guestPrePauseSyncMs"]
-        return d
-
-    bench_doc = {
-        "schemaVersion": 1,
-        "date": today_local,
-        "measuredAtUTC": utc_now_iso,
-        "script": "Scripts/acceptance/m3-branch-bench.sh",
-        "gitCommit": git_commit,
-        "totalElapsedSeconds": total_elapsed_sec,
-        "host": {
-            "hwModel": hw_model,
-            "cpuBrand": cpu_brand,
-            "physicalCores": phys_cores,
-            "logicalCores": log_cores,
-            "memoryBytes": mem_bytes,
-            "memoryGiB": round(mem_bytes / (1024 ** 3)),
-            "macOSProductVersion": macos_ver,
-            "macOSBuildVersion": macos_build,
-            "arch": platform.machine(),
-            "filesystem": "APFS",
-        },
-        "parentVM": {
-            "name": "p",
-            "imageID": "debian-12-bookworm-arm64",
-            "cpus": 2,
-            "memoryMB": 2048,
-            "virtualDiskBytes": EXPECTED_DISK_VIRTUAL_BYTES,
-            "virtualDiskGiB": 8,
-            "guestPayloadBytes": EXPECTED_PAYLOAD_BYTES,
-            "guestPayloadGiB": 1,
-            "guestPayloadDescription": "Debian 12 (bookworm) arm64 genericcloud rootfs expanded to 8 GiB + 1 GiB (/var/tmp/bench-data.bin) random bytes + marker file, synced",
-            "guestPayloadSHA256": payload_sha256,
-            "rootDiskAllocatedBytesBeforeFork": p_disk_space_before["allocatedBytes"],
-            "rootDiskPrivateBytesBeforeFork": p_disk_space_before["privateBytes"],
-            "ipv4CIDR": p_ident["ipv4"],
-        },
-        "headlineMetrics": {
-            "X_stoppedForkWallClockMedianMs": stopped_wall_stats["median"],
-            "stoppedForkWallClockP95NearestRankMs": stopped_wall_stats["p95NearestRank"],
-            "liveForkWallClockMedianMs": live_wall_stats["median"],
-            "liveForkWallClockP95NearestRankMs": live_wall_stats["p95NearestRank"],
-            "liveForkVMPauseMedianMs": live_pause_stats["median"],
-            "liveForkVMPauseP95NearestRankMs": live_pause_stats["p95NearestRank"],
-            "Y_newClonedFilesAPFSPrivateBytes": 0,
-            "postFirstBootAndHaltChildPrivateBytesMedian": post_boot_priv_stats["medianBytes"],
-        },
-        "stoppedFork": {
-            "count": STOPPED_FORK_COUNT,
-            "wallClockMs": stopped_wall_stats,
-            "selfReportedMs": stopped_rep_stats,
-            "newClonedFilesPrivateBytes": {
-                "measurementMethod": "Darwin getattrlist(2) ATTR_CMNEXT_PRIVATESIZE with FSOPT_ATTR_CMN_EXTENDED via /usr/bin/python3 ctypes (independent of product code); excludes APFS B-tree/inode metadata and newly synthesized cidata ISO / .machineid files",
-                "perForkTotalPrivateBytesSamples": [r["totalClonedFilesPrivateBytes"] for r in stopped_records],
-                "allZero": all(r["totalClonedFilesPrivateBytes"] == 0 for r in stopped_records),
-                "totalPrivateBytesAcross16Forks": sum(r["totalClonedFilesPrivateBytes"] for r in stopped_records),
-            },
-            "dfAvailableKB": {
-                "beforeKB": stopped_df_before_kb,
-                "afterKB": stopped_df_after_kb,
-                "deltaKB": stopped_df_before_kb - stopped_df_after_kb,
-                "note": "Host-wide APFS volume df -k delta across 16 stopped forks; upper bound only when concurrent processes run on the host",
-            },
-            "provisionalThresholdMedianMs": STOPPED_MEDIAN_THRESHOLD_MS,
-            "passedProvisionalThreshold": passed_threshold,
-            "forks": [clean_fork_sample(r, include_pause=False) for r in stopped_records],
-        },
-        "liveFork": {
-            "count": LIVE_FORK_COUNT,
-            "parentBootIDBefore": p_boot_id_before,
-            "parentBootIDAfter": p_boot_id_after,
-            "parentBootIDUnchanged": p_boot_id_after == p_boot_id_before,
-            "wallClockMs": live_wall_stats,
-            "selfReportedMs": live_rep_stats,
-            "vmPauseMs": live_pause_stats,
-            "guestPrePauseSyncMs": live_sync_stats,
-            "newClonedFilesPrivateBytes": {
-                "perForkTotalPrivateBytesSamples": [r["totalClonedFilesPrivateBytes"] for r in live_records],
-                "allZero": all(r["totalClonedFilesPrivateBytes"] == 0 for r in live_records),
-                "totalPrivateBytesAcross16Forks": sum(r["totalClonedFilesPrivateBytes"] for r in live_records),
-            },
-            "dfAvailableKB": {
-                "beforeKB": live_df_before_kb,
-                "afterKB": live_df_after_kb,
-                "deltaKB": live_df_before_kb - live_df_after_kb,
-                "note": "Host-wide APFS volume df -k delta across 16 live forks; upper bound only when concurrent processes run on the host",
-            },
-            "forks": [clean_fork_sample(r, include_pause=True) for r in live_records],
-        },
-        "childIdentityAndBootVerification": {
-            "totalChildrenBooted": len(verified_children),
-            "totalVMsComparedIncludingParent": expected_unique,
-            "maxConcurrentVMsObserved": max_concurrent_vms_seen,
-            "allHostnamesPairwiseDistinct": True,
-            "allMachineIDsPairwiseDistinct": True,
-            "allInstanceIDsPairwiseDistinct": True,
-            "allMACsPairwiseDistinct": True,
-            "allIPv4sPairwiseDistinct": True,
-            "allSSHEd25519FingerprintsPairwiseDistinct": True,
-            "postFirstBootAndHaltRootDiskPrivateBytes": post_boot_priv_stats,
-            "children": verified_children,
-        },
-    }
-
-    json_text = scrub(json.dumps(bench_doc, indent=2, ensure_ascii=False) + "\n")
-
-    md_lines = [
-        "# AgentVM M3 APFS CoW Branch Benchmark (`m3-branch-bench`)",
-        "",
-        f"- **Date**: `{today_local}` (`{utc_now_iso}`)",
-        f"- **Script**: `Scripts/acceptance/m3-branch-bench.sh` (commit `{git_commit}`)",
-        f"- **Host**: `{hw_model}` (`{cpu_brand}`, {phys_cores} cores, {round(mem_bytes / (1024 ** 3))} GiB RAM), macOS `{macos_ver}` (`{macos_build}`), APFS",
-        f"- **Parent VM (`p`)**: `debian-12-bookworm-arm64` expanded to `8 GiB` (`{EXPECTED_DISK_VIRTUAL_BYTES}` B), 2 vCPU, 2048 MiB RAM, populated with `1 GiB` (`{EXPECTED_PAYLOAD_BYTES}` B) random file `/var/tmp/bench-data.bin` + marker `/root/bench-marker`, `sync`ed",
-        f"- **Max concurrent VMs observed**: `{max_concurrent_vms_seen}` (cap `<= 2`)",
-        "",
-        "## Summary Metrics",
-        "",
-        "| Metric | Value | Notes |",
-        "|---|---:|---|",
-        f"| **Stopped fork wall-clock median (`X`)** | **`{stopped_wall_stats['median']:.2f} ms`** | 16 runs of `agentvm branch p sc<i>` (min `{stopped_wall_stats['min']:.2f} ms`, nearest-rank p95 `{stopped_wall_stats['p95NearestRank']:.2f} ms`, max `{stopped_wall_stats['max']:.2f} ms`; provisional threshold `<= {STOPPED_MEDIAN_THRESHOLD_MS:.0f} ms`) |",
-        f"| Stopped fork CLI self-reported median | `{stopped_rep_stats['median']:.2f} ms` | Lock acquired to SQLite commit (p95 `{stopped_rep_stats['p95NearestRank']:.2f} ms`) |",
-        f"| **Live running fork wall-clock median** | **`{live_wall_stats['median']:.2f} ms`** | 16 runs of `agentvm branch p lc<i>` via workspace daemon (min `{live_wall_stats['min']:.2f} ms`, nearest-rank p95 `{live_wall_stats['p95NearestRank']:.2f} ms`) |",
-        f"| Live running fork VM pause median | `{live_pause_stats['median']:.3f} ms` | `VM_PAUSED_FOR_SNAPSHOT` (`pause` -> `clonefile` root disk & NVRAM -> `resume`; min `{live_pause_stats['min']:.3f} ms`, p95 `{live_pause_stats['p95NearestRank']:.3f} ms`) |",
-        f"| Live running fork guest pre-pause `sync` median | `{live_sync_stats['median']:.3f} ms` | Guest `/bin/sync` via vsock before `pause` (p95 `{live_sync_stats['p95NearestRank']:.3f} ms`) |",
-        f"| **New cloned files APFS private bytes (`Y`)** | **`0 B`** | `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` across all 32 forks (parent fork-point `.raw`, child root `.raw`, child head `.raw`, child `.nvram`); excludes APFS filesystem metadata & synthesized `cidata` ISO (`{stopped_records[0]['synthesizedNonCloneBytes']['cidataISOBytes']} B`) / `.machineid` (`{stopped_records[0]['synthesizedNonCloneBytes']['machineIDBytes']} B`) |",
-        f"| Volume `df -k` delta (16 stopped / 16 live forks) | `{stopped_df_before_kb - stopped_df_after_kb} KB` / `{live_df_before_kb - live_df_after_kb} KB` | Host-wide volume available-space delta (`dfBefore - dfAfter`); upper bound under concurrent host activity |",
-        f"| Child root disk APFS private bytes after 1st boot + halt | `{post_boot_priv_stats['medianBytes']} B` (`{post_boot_priv_stats['medianBytes'] / (1024 * 1024):.2f} MiB`) | Median across 32 booted children (min `{post_boot_priv_stats['minBytes']} B`, p95 `{post_boot_priv_stats['p95NearestRankBytes']} B`) |",
-        f"| 32 children + parent 6-item identity uniqueness | `33 / 33 unique` | `hostname`, `/etc/machine-id`, `instance-id`, NIC MAC, DHCP IPv4, SSH ED25519 fingerprint all pairwise distinct |",
-        "",
-    ]
-    md_text = scrub("\n".join(md_lines))
-
-    if real_home and (real_home in json_text or real_home in md_text):
-        raise RuntimeError("Refusing to write benchmark output containing host home-directory path")
-
-    target_dirs = []
-    if out_dir_arg:
-        os.makedirs(out_dir_arg, exist_ok=True)
-        target_dirs.append(out_dir_arg)
-    if record_reports:
-        rep_dir = os.path.join(root_dir, "reports")
-        os.makedirs(rep_dir, exist_ok=True)
-        target_dirs.append(rep_dir)
-
-    for tdir in target_dirs:
-        jpath = os.path.join(tdir, "m3-branch-bench.json")
-        mpath = os.path.join(tdir, "m3-branch-bench.md")
-        with open(jpath, "w", encoding="utf-8") as jf:
-            jf.write(json_text)
-        with open(mpath, "w", encoding="utf-8") as mf:
-            mf.write(md_text)
-        emit(f"[5/5] Wrote benchmark artifacts: {jpath} and {mpath}")
-
-    if not target_dirs:
-        emit("[5/5] Benchmark run completed in dry mode (pass --record to write reports/m3-branch-bench.{json,md}).")
-
-    if not passed_threshold:
-        emit_err(
-            f"FAIL [Row 20]: Stopped fork wall-clock median {stopped_wall_stats['median']:.2f} ms "
-            f"exceeded provisional threshold {STOPPED_MEDIAN_THRESHOLD_MS:.1f} ms"
-        )
-        exit_code = 1
-
+except Exception as exc:
+    record_failure(failures, current_stage, str(exc))
 finally:
     cleanup()
 
-# Post-cleanup host verification
+load_at_end = read_host_loadavg()
+emit(f"Host load average at end (1m/5m/15m): {format_load_triplet(load_at_end)}")
+
+# Post-cleanup host verification (recorded into failures before writing JSON)
 leftover_links = sweep_darwin_temp_symlinks([tmp_root, raw_tmp_root], remove=False)
 extra_vz_after = extra_vz_pids()
 daemons_after = set(list_host_agentvm_daemons(resolved_bin)) - set(baseline_daemons)
 cache_after = snapshot_cache_dir(source_cache_dir)
 
 if leftover_links or extra_vz_after or daemons_after or cache_after != cache_before:
-    emit_err(
-        f"FAIL [Row 20 cleanup]: links={leftover_links}, extra_vz={sorted(extra_vz_after)}, "
-        f"new_daemons={sorted(daemons_after)}, cache_unchanged={cache_after == cache_before}"
+    record_failure(
+        failures,
+        "postRunCleanupHygiene",
+        f"links={leftover_links}, extra_vz={sorted(extra_vz_after)}, "
+        f"new_daemons={sorted(daemons_after)}, cache_unchanged={cache_after == cache_before}",
     )
-    sys.exit(1)
 
-if exit_code != 0:
-    sys.exit(exit_code)
+stopped_wall_stats = summarize_samples_safe([r["wallClockMs"] for r in stopped_records])
+stopped_rep_stats = summarize_samples_safe([r["selfReportedMs"] for r in stopped_records])
+live_wall_stats = summarize_samples_safe([r["wallClockMs"] for r in live_records])
+live_rep_stats = summarize_samples_safe([r["selfReportedMs"] for r in live_records])
+live_pause_stats = summarize_samples_safe(
+    [r["vmPauseMs"] for r in live_records if r.get("vmPauseMs") is not None], ndigits=3
+)
+live_sync_stats = summarize_samples_safe(
+    [r["guestPrePauseSyncMs"] for r in live_records if r.get("guestPrePauseSyncMs") is not None], ndigits=3
+)
+post_boot_priv_stats = summarize_int_samples_safe(post_boot_priv_samples)
+
+identity_verification = verify_identities_across_fleet(
+    p_ident=p_ident,
+    verified_children=verified_children,
+    concurrent_ipv4_collisions=concurrent_ipv4_collisions,
+    max_concurrent_seen=max_concurrent_vms_seen,
+    post_boot_priv_stats=post_boot_priv_stats,
+    failures=failures,
+)
+
+
+def sysctl_str(key: str) -> str:
+    p = subprocess.run(["/usr/sbin/sysctl", "-n", key], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else "unknown"
+
+
+hw_model = sysctl_str("hw.model")
+cpu_brand = sysctl_str("machdep.cpu.brand_string")
+phys_cores = int(sysctl_str("hw.physicalcpu") or "0")
+log_cores = int(sysctl_str("hw.logicalcpu") or "0")
+mem_bytes = int(sysctl_str("hw.memsize") or "0")
+macos_ver = subprocess.check_output(["/usr/bin/sw_vers", "-productVersion"], text=True).strip()
+macos_build = subprocess.check_output(["/usr/bin/sw_vers", "-buildVersion"], text=True).strip()
+git_rev_proc = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root_dir, capture_output=True, text=True)
+git_commit = git_rev_proc.stdout.strip() if git_rev_proc.returncode == 0 else "unknown"
+today_local = datetime.date.today().isoformat()
+utc_now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+passed_threshold = (
+    stopped_wall_stats is not None
+    and len(stopped_records) == STOPPED_FORK_COUNT
+    and stopped_wall_stats["median"] <= STOPPED_MEDIAN_THRESHOLD_MS
+)
+total_elapsed_sec = round(time.perf_counter() - bench_start, 2)
+
+
+def clean_fork_sample(rec: dict, include_pause: bool) -> dict:
+    d = {
+        "index": rec["index"],
+        "childName": rec["childName"],
+        "childVMID": rec["childVMID"],
+        "forkSnapshotID": rec["forkSnapshotID"],
+        "childHeadSnapshotID": rec["childHeadSnapshotID"],
+        "wallClockMs": rec["wallClockMs"],
+        "selfReportedMs": rec["selfReportedMs"],
+        "clonedFilesPrivateBytes": rec["clonedFilesPrivateBytes"],
+        "totalClonedFilesPrivateBytes": rec["totalClonedFilesPrivateBytes"],
+        "synthesizedNonCloneBytes": rec["synthesizedNonCloneBytes"],
+        "dfBeforeKB": rec["dfBeforeKB"],
+        "dfAfterKB": rec["dfAfterKB"],
+        "dfDeltaKB": rec["dfDeltaKB"],
+    }
+    if include_pause:
+        d["vmPauseMs"] = rec.get("vmPauseMs")
+        d["guestPrePauseSyncMs"] = rec.get("guestPrePauseSyncMs")
+    return d
+
+
+all_clones_zero = (
+    bool(stopped_records)
+    and bool(live_records)
+    and all(r["totalClonedFilesPrivateBytes"] == 0 for r in stopped_records)
+    and all(r["totalClonedFilesPrivateBytes"] == 0 for r in live_records)
+)
+max_private_bytes_observed = max(
+    [r["totalClonedFilesPrivateBytes"] for r in (stopped_records + live_records)],
+    default=None,
+)
+
+bench_doc = {
+    "schemaVersion": 1,
+    "passed": len(failures) == 0,
+    "failures": failures,
+    "date": today_local,
+    "measuredAtUTC": utc_now_iso,
+    "script": "Scripts/acceptance/m3-branch-bench.sh",
+    "gitCommit": git_commit,
+    "totalElapsedSeconds": total_elapsed_sec,
+    "host": {
+        "hwModel": hw_model,
+        "cpuBrand": cpu_brand,
+        "physicalCores": phys_cores,
+        "logicalCores": log_cores,
+        "memoryBytes": mem_bytes,
+        "memoryGiB": round(mem_bytes / (1024 ** 3)),
+        "macOSProductVersion": macos_ver,
+        "macOSBuildVersion": macos_build,
+        "arch": platform.machine(),
+        "filesystem": "APFS",
+        "loadAverage": {
+            "atStart": load_at_start,
+            "atEnd": load_at_end,
+        },
+    },
+    "parentVM": {
+        "name": "p",
+        "imageID": "debian-12-bookworm-arm64",
+        "cpus": 2,
+        "memoryMB": 2048,
+        "virtualDiskBytes": EXPECTED_DISK_VIRTUAL_BYTES,
+        "virtualDiskGiB": 8,
+        "guestPayloadBytes": EXPECTED_PAYLOAD_BYTES,
+        "guestPayloadGiB": 1,
+        "guestPayloadDescription": "Debian 12 (bookworm) arm64 genericcloud rootfs expanded to 8 GiB + 1 GiB (/var/tmp/bench-data.bin) random bytes + marker file, synced",
+        "guestPayloadSHA256": payload_sha256,
+        "rootDiskAllocatedBytesBeforeFork": p_disk_space_before["allocatedBytes"] if p_disk_space_before else None,
+        "rootDiskPrivateBytesBeforeFork": p_disk_space_before["privateBytes"] if p_disk_space_before else None,
+        "ipv4CIDR": p_ident["ipv4"] if p_ident else None,
+    },
+    "headlineMetrics": {
+        "X_stoppedForkWallClockMedianMs": stopped_wall_stats["median"] if stopped_wall_stats else None,
+        "stoppedForkWallClockP95NearestRankMs": stopped_wall_stats["p95NearestRank"] if stopped_wall_stats else None,
+        "liveForkWallClockMedianMs": live_wall_stats["median"] if live_wall_stats else None,
+        "liveForkWallClockP95NearestRankMs": live_wall_stats["p95NearestRank"] if live_wall_stats else None,
+        "liveForkVMPauseMedianMs": live_pause_stats["median"] if live_pause_stats else None,
+        "liveForkVMPauseP95NearestRankMs": live_pause_stats["p95NearestRank"] if live_pause_stats else None,
+        "Y_newClonedFilesAPFSPrivateBytes": 0 if all_clones_zero else max_private_bytes_observed,
+        "postFirstBootAndHaltChildPrivateBytesMedian": post_boot_priv_stats["medianBytes"] if post_boot_priv_stats else None,
+    },
+    "stoppedFork": {
+        "count": len(stopped_records),
+        "expectedCount": STOPPED_FORK_COUNT,
+        "wallClockMs": stopped_wall_stats,
+        "selfReportedMs": stopped_rep_stats,
+        "newClonedFilesPrivateBytes": {
+            "measurementMethod": "Darwin getattrlist(2) ATTR_CMNEXT_PRIVATESIZE with FSOPT_ATTR_CMN_EXTENDED via /usr/bin/python3 ctypes (independent of product code); excludes APFS B-tree/inode metadata and newly synthesized cidata ISO / .machineid files",
+            "perForkTotalPrivateBytesSamples": [r["totalClonedFilesPrivateBytes"] for r in stopped_records],
+            "allZero": bool(stopped_records) and all(r["totalClonedFilesPrivateBytes"] == 0 for r in stopped_records),
+            "totalPrivateBytesAcross16Forks": sum(r["totalClonedFilesPrivateBytes"] for r in stopped_records),
+        },
+        "dfAvailableKB": {
+            "beforeKB": stopped_df_before_kb,
+            "afterKB": stopped_df_after_kb,
+            "deltaKB": (stopped_df_before_kb - stopped_df_after_kb) if (stopped_df_before_kb is not None and stopped_df_after_kb is not None) else None,
+            "note": "Host-wide APFS volume df -k delta across 16 stopped forks; upper bound only when concurrent processes run on the host",
+        },
+        "provisionalThresholdMedianMs": STOPPED_MEDIAN_THRESHOLD_MS,
+        "passedProvisionalThreshold": passed_threshold,
+        "forks": [clean_fork_sample(r, include_pause=False) for r in stopped_records],
+    },
+    "liveFork": {
+        "count": len(live_records),
+        "expectedCount": LIVE_FORK_COUNT,
+        "parentBootIDBefore": p_boot_id_before or None,
+        "parentBootIDAfter": p_boot_id_after or None,
+        "parentBootIDUnchanged": bool(p_boot_id_before and p_boot_id_after and p_boot_id_after == p_boot_id_before),
+        "wallClockMs": live_wall_stats,
+        "selfReportedMs": live_rep_stats,
+        "vmPauseMs": live_pause_stats,
+        "guestPrePauseSyncMs": live_sync_stats,
+        "newClonedFilesPrivateBytes": {
+            "perForkTotalPrivateBytesSamples": [r["totalClonedFilesPrivateBytes"] for r in live_records],
+            "allZero": bool(live_records) and all(r["totalClonedFilesPrivateBytes"] == 0 for r in live_records),
+            "totalPrivateBytesAcross16Forks": sum(r["totalClonedFilesPrivateBytes"] for r in live_records),
+        },
+        "dfAvailableKB": {
+            "beforeKB": live_df_before_kb,
+            "afterKB": live_df_after_kb,
+            "deltaKB": (live_df_before_kb - live_df_after_kb) if (live_df_before_kb is not None and live_df_after_kb is not None) else None,
+            "note": "Host-wide APFS volume df -k delta across 16 live forks; upper bound only when concurrent processes run on the host",
+        },
+        "forks": [clean_fork_sample(r, include_pause=True) for r in live_records],
+    },
+    "childIdentityAndBootVerification": identity_verification,
+}
+
+json_text = scrub(json.dumps(bench_doc, indent=2, ensure_ascii=False) + "\n")
+
+
+def fmt_stat(stats_obj, key: str, spec: str = ".2f", suffix: str = " ms") -> str:
+    if not stats_obj or stats_obj.get(key) is None:
+        return "n/a"
+    return f"{stats_obj[key]:{spec}}{suffix}"
+
+
+iso_b_sample = stopped_records[0]["synthesizedNonCloneBytes"]["cidataISOBytes"] if stopped_records else "n/a"
+mid_b_sample = stopped_records[0]["synthesizedNonCloneBytes"]["machineIDBytes"] if stopped_records else "n/a"
+stopped_df_delta_str = (
+    f"{stopped_df_before_kb - stopped_df_after_kb} KB"
+    if (stopped_df_before_kb is not None and stopped_df_after_kb is not None)
+    else "n/a"
+)
+live_df_delta_str = (
+    f"{live_df_before_kb - live_df_after_kb} KB"
+    if (live_df_before_kb is not None and live_df_after_kb is not None)
+    else "n/a"
+)
+post_priv_str = (
+    f"{post_boot_priv_stats['medianBytes']} B ({post_boot_priv_stats['medianBytes'] / (1024 * 1024):.2f} MiB)"
+    if post_boot_priv_stats
+    else "n/a"
+)
+post_priv_notes = (
+    f"Median across {post_boot_priv_stats['count']} booted children (min `{post_boot_priv_stats['minBytes']} B`, p95 `{post_boot_priv_stats['p95NearestRankBytes']} B`)"
+    if post_boot_priv_stats
+    else "Not collected"
+)
+five_item_ok = all(
+    identity_verification.get(k, False)
+    for k in (
+        "allHostnamesPairwiseDistinct",
+        "allMachineIDsPairwiseDistinct",
+        "allInstanceIDsPairwiseDistinct",
+        "allMACsPairwiseDistinct",
+        "allSSHEd25519FingerprintsPairwiseDistinct",
+    )
+)
+ident_summary_val = (
+    f"`{identity_verification['totalVMsComparedIncludingParent']} / 33 unique (5 items)`"
+    if five_item_ok
+    else "`FAILED`"
+)
+reuse_cnt = len(identity_verification["sequentialIPv4LeaseReuses"])
+ident_notes = (
+    f"`hostname`, `/etc/machine-id`, `instance-id`, NIC MAC, SSH ED25519 fingerprint pairwise distinct across 33 VMs; "
+    f"concurrent IPv4 collisions `{len(identity_verification['concurrentIPv4Collisions'])}` "
+    f"(unique sequential DHCP IPv4s `{identity_verification['uniqueIPv4CountAcrossAllBootedVMs']}/33`, sequential lease reuses `{reuse_cnt}`)"
+)
+
+md_lines = [
+    "# AgentVM M3 APFS CoW Branch Benchmark (`m3-branch-bench`)",
+    "",
+    f"- **Status**: `{'PASS' if not failures else 'FAIL'}` (`{len(failures)}` failure(s))",
+    f"- **Date**: `{today_local}` (`{utc_now_iso}`)",
+    f"- **Script**: `Scripts/acceptance/m3-branch-bench.sh` (commit `{git_commit}`)",
+    f"- **Host**: `{hw_model}` (`{cpu_brand}`, {phys_cores} cores, {round(mem_bytes / (1024 ** 3))} GiB RAM), macOS `{macos_ver}` (`{macos_build}`), APFS",
+    f"- **Host load average (`1m 5m 15m`)**: start `{format_load_triplet(load_at_start)}` -> end `{format_load_triplet(load_at_end)}`",
+    f"- **Parent VM (`p`)**: `debian-12-bookworm-arm64` expanded to `8 GiB` (`{EXPECTED_DISK_VIRTUAL_BYTES}` B), 2 vCPU, 2048 MiB RAM, populated with `1 GiB` (`{EXPECTED_PAYLOAD_BYTES}` B) random file `/var/tmp/bench-data.bin` + marker `/root/bench-marker`, `sync`ed",
+    f"- **Max concurrent VMs observed**: `{max_concurrent_vms_seen}` (cap `<= 2`)",
+    "",
+    "## Summary Metrics",
+    "",
+    "| Metric | Value | Notes |",
+    "|---|---:|---|",
+    f"| **Stopped fork wall-clock median (`X`)** | **`{fmt_stat(stopped_wall_stats, 'median')}`** | {len(stopped_records)} runs of `agentvm branch p sc<i>` (min `{fmt_stat(stopped_wall_stats, 'min')}`, nearest-rank p95 `{fmt_stat(stopped_wall_stats, 'p95NearestRank')}`, max `{fmt_stat(stopped_wall_stats, 'max')}`; provisional threshold `<= {STOPPED_MEDIAN_THRESHOLD_MS:.0f} ms`) |",
+    f"| Stopped fork CLI self-reported median | `{fmt_stat(stopped_rep_stats, 'median')}` | Lock acquired to SQLite commit (p95 `{fmt_stat(stopped_rep_stats, 'p95NearestRank')}`) |",
+    f"| **Live running fork wall-clock median** | **`{fmt_stat(live_wall_stats, 'median')}`** | {len(live_records)} runs of `agentvm branch p lc<i>` via workspace daemon (min `{fmt_stat(live_wall_stats, 'min')}`, nearest-rank p95 `{fmt_stat(live_wall_stats, 'p95NearestRank')}`) |",
+    f"| Live running fork VM pause median | `{fmt_stat(live_pause_stats, 'median', '.3f')}` | `VM_PAUSED_FOR_SNAPSHOT` (`pause` -> `clonefile` root disk & NVRAM -> `resume`; min `{fmt_stat(live_pause_stats, 'min', '.3f')}`, p95 `{fmt_stat(live_pause_stats, 'p95NearestRank', '.3f')}`) |",
+    f"| Live running fork guest pre-pause `sync` median | `{fmt_stat(live_sync_stats, 'median', '.3f')}` | Guest `/bin/sync` via vsock before `pause` (p95 `{fmt_stat(live_sync_stats, 'p95NearestRank', '.3f')}`) |",
+    f"| **New cloned files APFS private bytes (`Y`)** | **`{bench_doc['headlineMetrics']['Y_newClonedFilesAPFSPrivateBytes']} B`** | `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` across all {len(stopped_records) + len(live_records)} forks (parent fork-point `.raw`, child root `.raw`, child head `.raw`, child `.nvram`); excludes APFS filesystem metadata & synthesized `cidata` ISO (`{iso_b_sample} B`) / `.machineid` (`{mid_b_sample} B`) |",
+    f"| Volume `df -k` delta (16 stopped / 16 live forks) | `{stopped_df_delta_str}` / `{live_df_delta_str}` | Host-wide volume available-space delta (`dfBefore - dfAfter`); upper bound under concurrent host activity |",
+    f"| Child root disk APFS private bytes after 1st boot + halt | `{post_priv_str}` | {post_priv_notes} |",
+    f"| 32 children + parent identity verification | {ident_summary_val} | {ident_notes} |",
+    "",
+]
+if failures:
+    md_lines += [
+        "## Failures",
+        "",
+        *[f"- **`{f['check']}`**: {f['reason']}" for f in failures],
+        "",
+    ]
+md_text = scrub("\n".join(md_lines))
+
+if real_home and (real_home in json_text or real_home in md_text):
+    record_failure(failures, "outputPrivacyScrub", "Benchmark output still contained host home-directory path")
+    bench_doc["passed"] = False
+    bench_doc["failures"] = failures
+    json_text = scrub(json.dumps(bench_doc, indent=2, ensure_ascii=False) + "\n")
+
+target_dirs = []
+if out_dir_arg:
+    resolved_out_dir = out_dir_arg if os.path.isabs(out_dir_arg) else os.path.abspath(os.path.join(caller_pwd, out_dir_arg))
+    os.makedirs(resolved_out_dir, exist_ok=True)
+    target_dirs.append(resolved_out_dir)
+if record_reports:
+    rep_dir = os.path.join(root_dir, "reports")
+    os.makedirs(rep_dir, exist_ok=True)
+    target_dirs.append(rep_dir)
+
+for tdir in target_dirs:
+    jpath = os.path.join(tdir, "m3-branch-bench.json")
+    mpath = os.path.join(tdir, "m3-branch-bench.md")
+    with open(jpath, "w", encoding="utf-8") as jf:
+        jf.write(json_text)
+    with open(mpath, "w", encoding="utf-8") as mf:
+        mf.write(md_text)
+    emit(f"[5/5] Wrote benchmark artifacts: {jpath} and {mpath}")
+
+if not target_dirs:
+    emit("[5/5] Benchmark run completed in dry mode (pass --record to write reports/m3-branch-bench.{json,md}).")
+
+if failures:
+    for f in failures:
+        emit_err(f"FAIL [Row 20] ({f['check']}): {f['reason']}")
+    sys.exit(1)
 
 emit(
     f"PASS [Row 20]: stopped median={stopped_wall_stats['median']:.2f} ms (p95={stopped_wall_stats['p95NearestRank']:.2f} ms), "
     f"live median={live_wall_stats['median']:.2f} ms (pause median={live_pause_stats['median']:.3f} ms), "
-    f"cloned private bytes=0 B, 32/32 children booted & verified unique ({total_elapsed_sec:.1f}s)."
+    f"cloned private bytes=0 B, 32/32 children booted & verified ({total_elapsed_sec:.1f}s)."
 )
 sys.exit(0)
 PY

@@ -591,7 +591,7 @@ PY
 )"
 ISOLATED_HOME="$TMP_ROOT/home"
 WS="$TMP_ROOT/ws.agentvm"
-mkdir -p "$ISOLATED_HOME"
+mkdir -p "$ISOLATED_HOME/Library/Preferences"
 TRACKED_WORKSPACES+=("$WS")
 
 emit_out "=================================================================="

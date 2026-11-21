@@ -800,13 +800,14 @@ struct CLIAndMCPDaemonStage3aTests {
             let dbRecAfterCoord = try #require(try await inspectStore.fetchVM(vmID))
             #expect(dbRecAfterCoord.telemetry.state == .running)
 
-            // 3. MCP JSON-RPC server (`AgentVMMCPServer`): in M3 Stage 3b, `snapshot`, `branch`, and `restore` all route through daemon RPC and succeed,
-            //    while `exec` still rejects with ERR_VM_LOCKED mentioning M4.
+            // 3. MCP JSON-RPC server (`AgentVMMCPServer`): in M4 Stage 3, `snapshot`, `branch`, `restore`, and `exec` all route through daemon RPC and succeed
+            //    (while direct non-daemon coordinator calls above continue to reject with ERR_VM_LOCKED).
             let mcp = AgentVMMCPServer(coordinator: externalCoordinator)
             let mcpSuccessCalls: [(String, [String: Any])] = [
                 ("agentvm_capture_snapshot", ["vmID": vmID.rawValue, "title": "mcp-snap"]),
                 ("agentvm_fork_cow_branch", ["parentVMID": vmID.rawValue, "branchName": "mcp-child", "bootImmediately": false]),
-                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue])
+                ("agentvm_restore_snapshot", ["snapshotID": baseSnapID.rawValue]),
+                ("agentvm_exec_command", ["vmID": vmID.rawValue, "executable": "uname", "arguments": ["-r"]])
             ]
             for (idx, item) in mcpSuccessCalls.enumerated() {
                 let reqObj: [String: Any] = [
@@ -823,34 +824,6 @@ struct CLIAndMCPDaemonStage3aTests {
                 let respObj = try #require(try JSONSerialization.jsonObject(with: Data(respLine.utf8)) as? [String: Any])
                 let resultObj = try #require(respObj["result"] as? [String: Any])
                 #expect((resultObj["isError"] as? Bool) == false, "Expected MCP \(item.0) to route via daemon and succeed: \(respLine)")
-            }
-
-            let mcpErrorCalls: [(String, [String: Any], String, String?)] = [
-                ("agentvm_exec_command", ["vmID": vmID.rawValue, "executable": "uname", "arguments": ["-r"]], "ERR_VM_LOCKED", "M4")
-            ]
-            for (idx, item) in mcpErrorCalls.enumerated() {
-                let reqObj: [String: Any] = [
-                    "jsonrpc": "2.0",
-                    "id": idx + 10,
-                    "method": "tools/call",
-                    "params": [
-                        "name": item.0,
-                        "arguments": item.1
-                    ]
-                ]
-                let reqLine = String(decoding: try JSONSerialization.data(withJSONObject: reqObj), as: UTF8.self)
-                let respLine = try #require(await mcp.handleJSONRPCLine(reqLine))
-                let respObj = try #require(try JSONSerialization.jsonObject(with: Data(respLine.utf8)) as? [String: Any])
-                let resultObj = try #require(respObj["result"] as? [String: Any])
-                #expect((resultObj["isError"] as? Bool) == true, "Expected MCP \(item.0) to return isError=true")
-                let contentArr = try #require(resultObj["content"] as? [[String: Any]])
-                let text = contentArr.compactMap { $0["text"] as? String }.joined(separator: "\n")
-                #expect(text.contains(item.2), "MCP \(item.0) missing \(item.2): \(text)")
-                if let expectedMilestone = item.3 {
-                    #expect(text.contains(expectedMilestone), "MCP \(item.0) missing \(expectedMilestone): \(text)")
-                } else {
-                    #expect(!text.contains("M3"), "MCP \(item.0) must not contain outdated M3 wording: \(text)")
-                }
             }
 
             // Daemon still holds `t1` in `running` state and halts it cleanly.

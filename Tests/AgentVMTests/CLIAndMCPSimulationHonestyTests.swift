@@ -454,15 +454,27 @@ struct CLIAndMCPSimulationHonestyTests {
         let restored = await run(["--lang", "en", "policy"], in: bundleURL)
         #expect(restored.stdout.contains("Strict Coding-Agent Allowlist"))
 
-        // Same through MCP: set in one server, read in a new process.
+        // Through MCP: on the default backend M5 firewall tool returns isError=true (not implemented before M5)
+        // without mutating persisted policy; under --backend simulation it persists with SIMULATED: marker.
         do {
             let coordinator = try AgentVMFleetCoordinator(bundleURL: bundleURL)
             let mcp = AgentVMMCPServer(coordinator: coordinator)
-            let set = try await callTool(mcp, id: 7, name: "agentvm_set_firewall_preset", arguments: ["preset": "airgap"])
-            #expect(set.isError == false)
+            let setDefault = try await callTool(mcp, id: 7, name: "agentvm_set_firewall_preset", arguments: ["preset": "airgap"])
+            #expect(setDefault.isError == true)
+            #expect(setDefault.joinedText.contains("M5"))
+        }
+        let afterDefaultMCP = await run(["--lang", "en", "policy"], in: bundleURL)
+        #expect(afterDefaultMCP.stdout.contains("Strict Coding-Agent Allowlist"))
+
+        do {
+            let simCoordinator = try AgentVMFleetCoordinator(bundleURL: bundleURL, executionBackend: .deterministicSimulation)
+            let simMCP = AgentVMMCPServer(coordinator: simCoordinator)
+            let setSim = try await callTool(simMCP, id: 8, name: "agentvm_set_firewall_preset", arguments: ["preset": "airgap"])
+            #expect(setSim.isError == false)
+            #expect(setSim.joinedText.hasPrefix("SIMULATED:"))
         }
         let afterMCP = await run(["--lang", "en", "policy"], in: bundleURL)
-        #expect(afterMCP.stdout.contains("Total Air-Gap"), "MCP preset did not persist:\n\(afterMCP.stdout)")
+        #expect(afterMCP.stdout.contains("Total Air-Gap"), "Simulated MCP preset did not persist:\n\(afterMCP.stdout)")
     }
 
     // MARK: - Smaller CLI items from the review

@@ -531,7 +531,7 @@ struct CLIAndMCPTests {
         #expect(res["isError"] as? Bool == true)
         let content = try #require(res["content"] as? [[String: Any]])
         let text = (content.first?["text"] as? String) ?? ""
-        #expect(text.contains("ERR_NO_BOOTABLE_SYSTEM"))
+        #expect(text.contains("ERR_LIFECYCLE_STATE"))
         #expect(!text.contains("Linux 6."))
     }
 

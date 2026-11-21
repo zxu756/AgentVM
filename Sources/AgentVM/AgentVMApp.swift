@@ -36,11 +36,17 @@ enum AgentVMEntryPoint {
         // 2. JSON-RPC 2.0 Model Context Protocol Server (`agentvm mcp`)
         if let mcpInvocation = extractMCPServerInvocation(from: rawArgs) {
             do {
+                let processEnv = ProcessInfo.processInfo.environment
+                let mcpLanguage = AppLanguage.extractCLILanguage(from: rawArgs) ?? .en
                 let coordinator = try AgentVMFleetCoordinator(
                     bundleURL: mcpInvocation.bundleURL,
                     executionBackend: mcpInvocation.backend
                 )
-                let server = AgentVMMCPServer(coordinator: coordinator)
+                let server = AgentVMMCPServer(
+                    coordinator: coordinator,
+                    language: mcpLanguage,
+                    environment: processEnv
+                )
                 await server.runStdioLoop()
                 Darwin.exit(0)
             } catch {

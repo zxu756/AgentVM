@@ -2558,9 +2558,7 @@ public struct AgentVMCLIRunner: Sendable {
         let helpHintEn = "Run 'agentvm help' for usage."
         let helpHintZh = "运行 'agentvm help' 查看用法。"
 
-        var results: [VirtioFSMountSpec] = []
-        var seenGuestPaths = Set<String>()
-        var seenTags = Set<String>()
+        var parsedEntries: [(rawLabel: String, hostPath: String, guestPath: String, readOnly: Bool)] = []
 
         for raw in rawSpecs {
             let parts = raw.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
@@ -2577,16 +2575,6 @@ public struct AgentVMCLIRunner: Sendable {
             }
             let rawHost = parts[0]
             let rawGuest = parts[1]
-            if rawHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return .failure(SubcommandUsageError(message: isZh
-                    ? "无效的「--mount」参数「\(raw)」（宿主机目录路径不能为空）。\(helpHintZh)"
-                    : "Invalid '--mount' value '\(raw)' (host directory path must not be empty). \(helpHintEn)"))
-            }
-            if rawGuest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return .failure(SubcommandUsageError(message: isZh
-                    ? "无效的「--mount」参数「\(raw)」（客户机挂载路径不能为空）。\(helpHintZh)"
-                    : "Invalid '--mount' value '\(raw)' (guest mount path must not be empty). \(helpHintEn)"))
-            }
             let readOnly: Bool
             if parts.count == 3 {
                 let suffix = parts[2]
@@ -2599,7 +2587,43 @@ public struct AgentVMCLIRunner: Sendable {
             } else {
                 readOnly = false
             }
+            parsedEntries.append((rawLabel: raw, hostPath: rawHost, guestPath: rawGuest, readOnly: readOnly))
+        }
 
+        return validateAndBuildMountSpecs(parsedEntries, language: language)
+    }
+
+    /// Validates pre-split `(rawLabel, hostPath, guestPath, readOnly)` VirtioFS mount entries (shared by CLI
+    /// `create --mount` and MCP `agentvm_create_vm`), canonicalizing `hostDirectoryPath`, normalizing and
+    /// deduplicating `guestMountPoint`, and assigning unique `1...36` byte `mountTag`s.
+    public static func validateAndBuildMountSpecs(
+        _ entries: [(rawLabel: String, hostPath: String, guestPath: String, readOnly: Bool)],
+        language: AppLanguage
+    ) -> Result<[VirtioFSMountSpec], SubcommandUsageError> {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+
+        var results: [VirtioFSMountSpec] = []
+        var seenGuestPaths = Set<String>()
+        var seenTags = Set<String>()
+
+        for entry in entries {
+            let raw = entry.rawLabel
+            let rawHost = entry.hostPath
+            let rawGuest = entry.guestPath
+            let readOnly = entry.readOnly
+
+            if rawHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数「\(raw)」（宿主机目录路径不能为空）。\(helpHintZh)"
+                    : "Invalid '--mount' value '\(raw)' (host directory path must not be empty). \(helpHintEn)"))
+            }
+            if rawGuest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .failure(SubcommandUsageError(message: isZh
+                    ? "无效的「--mount」参数「\(raw)」（客户机挂载路径不能为空）。\(helpHintZh)"
+                    : "Invalid '--mount' value '\(raw)' (guest mount path must not be empty). \(helpHintEn)"))
+            }
             guard rawGuest.hasPrefix("/") else {
                 return .failure(SubcommandUsageError(message: isZh
                     ? "无效的「--mount」参数「\(raw)」（客户机路径「\(rawGuest)」必须是绝对路径，以 '/' 开头）。\(helpHintZh)"
@@ -2676,7 +2700,7 @@ public struct AgentVMCLIRunner: Sendable {
     }
 
     /// Parses `<N>G` / `<N>GiB` / `<N>GB` (`N * 1024^3`) or `<N>M` / `<N>MiB` / `<N>MB` (`N * 1024^2`) for `N >= 1`.
-    static func parseDiskSizeBytes(_ raw: String) -> UInt64? {
+    public static func parseDiskSizeBytes(_ raw: String) -> UInt64? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let upper = trimmed.uppercased()

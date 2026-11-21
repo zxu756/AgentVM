@@ -57,6 +57,7 @@ map_module_to_filters() {
             echo "M3Stage4AutoCheckpointTests"
             echo "M4Stage1VirtioFSMountTests"
             echo "M4Stage2PortForwardTests"
+            echo "M4Stage3MCPDaemonTests"
             ;;
         AgentVMStore|Store)
             echo "StoreMigrationsAndUndoTests"
@@ -116,6 +117,7 @@ map_module_to_filters() {
             echo "M3Stage4AutoCheckpointTests"
             echo "M4Stage1VirtioFSMountTests"
             echo "M4Stage2PortForwardTests"
+            echo "M4Stage3MCPDaemonTests"
             ;;
         AgentVMCLIAndMCP|CLIAndMCP)
             echo "CLIAndMCPTests"
@@ -136,6 +138,7 @@ map_module_to_filters() {
             echo "M3Stage4AutoCheckpointTests"
             echo "M4Stage1VirtioFSMountTests"
             echo "M4Stage2PortForwardTests"
+            echo "M4Stage3MCPDaemonTests"
             ;;
         AgentVMWorkbenchShell|WorkbenchShell)
             echo "WorkbenchShellTests"
@@ -163,6 +166,7 @@ map_module_to_filters() {
             echo "M3Stage4AutoCheckpointTests"
             echo "M4Stage1VirtioFSMountTests"
             echo "M4Stage2PortForwardTests"
+            echo "M4Stage3MCPDaemonTests"
             ;;
         *)
             echo "ERROR: Unknown module '$mod'" >&2

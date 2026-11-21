@@ -599,6 +599,15 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
 
             case let .restore(params):
                 await handleRestoreCall(id: envelope.id, params: params, conn: conn)
+
+            case let .forwardAdd(params):
+                await handleForwardAddCall(id: envelope.id, params: params, conn: conn)
+
+            case let .forwardList(params):
+                await handleForwardListCall(id: envelope.id, params: params, conn: conn)
+
+            case let .forwardStop(params):
+                await handleForwardStopCall(id: envelope.id, params: params, conn: conn)
             }
         } catch {
             conn.close()
@@ -777,6 +786,131 @@ public final class WorkspaceDaemonServer: @unchecked Sendable {
                 message: error.localizedDescription
             )
             let resp = DaemonRPCResponse<DaemonRPCRestoreResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        }
+    }
+
+    private func handleForwardAddCall(
+        id: DaemonRPCID,
+        params: DaemonRPCForwardAddParams,
+        conn: DaemonSocketConnection
+    ) async {
+        do {
+            let vmID = try await resolveVMID(params.vm)
+            let entry = try await coordinator.addPortForwardInDaemon(
+                vmID: vmID,
+                hostPort: params.hostPort,
+                guestPort: params.guestPort
+            )
+            let resp = DaemonRPCResponse<DaemonRPCForwardAddResult>.success(
+                id: id,
+                result: DaemonRPCForwardAddResult(forward: entry)
+            )
+            try conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+
+            if params.foreground {
+                let waiter = DaemonSocketEOFWaiter(fd: conn.fd)
+                await waiter.waitUntilEOFOrCancelled()
+                _ = try? await coordinator.removePortForwardInDaemon(
+                    vmID: vmID,
+                    hostPort: entry.hostPort
+                )
+            }
+            conn.close()
+        } catch let err as AgentVMError {
+            let resp = DaemonRPCResponse<DaemonRPCForwardAddResult>.failure(
+                id: id,
+                agentVMError: err,
+                language: params.lang
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+            conn.close()
+        } catch {
+            let rpcErr = DaemonRPCError(
+                code: DaemonRPCError.internalErrorCode,
+                errorCode: "ERR_DAEMON_INTERNAL",
+                message: error.localizedDescription
+            )
+            let resp = DaemonRPCResponse<DaemonRPCForwardAddResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+            conn.close()
+        }
+    }
+
+    private func handleForwardListCall(
+        id: DaemonRPCID,
+        params: DaemonRPCForwardListParams,
+        conn: DaemonSocketConnection
+    ) async {
+        defer { conn.close() }
+        do {
+            let filterVMID: VMID?
+            if let rawVM = params.vm?.trimmingCharacters(in: .whitespacesAndNewlines), !rawVM.isEmpty {
+                filterVMID = try await resolveVMID(rawVM)
+            } else {
+                filterVMID = nil
+            }
+            let forwards = try await coordinator.listPortForwardsInDaemon(vmID: filterVMID)
+            let resp = DaemonRPCResponse<DaemonRPCForwardListResult>.success(
+                id: id,
+                result: DaemonRPCForwardListResult(forwards: forwards)
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch let err as AgentVMError {
+            let resp = DaemonRPCResponse<DaemonRPCForwardListResult>.failure(
+                id: id,
+                agentVMError: err,
+                language: params.lang
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch {
+            let rpcErr = DaemonRPCError(
+                code: DaemonRPCError.internalErrorCode,
+                errorCode: "ERR_DAEMON_INTERNAL",
+                message: error.localizedDescription
+            )
+            let resp = DaemonRPCResponse<DaemonRPCForwardListResult>.failure(id: id, error: rpcErr)
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        }
+    }
+
+    private func handleForwardStopCall(
+        id: DaemonRPCID,
+        params: DaemonRPCForwardStopParams,
+        conn: DaemonSocketConnection
+    ) async {
+        defer { conn.close() }
+        do {
+            let vmID = try await resolveVMID(params.vm)
+            let (vmName, removed) = try await coordinator.removePortForwardInDaemon(
+                vmID: vmID,
+                hostPort: params.hostPort
+            )
+            let resp = DaemonRPCResponse<DaemonRPCForwardStopResult>.success(
+                id: id,
+                result: DaemonRPCForwardStopResult(
+                    vmID: vmID,
+                    vmName: vmName,
+                    removedRuleID: removed.id,
+                    hostPort: removed.hostPort,
+                    guestPort: removed.guestPort
+                )
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch let err as AgentVMError {
+            let resp = DaemonRPCResponse<DaemonRPCForwardStopResult>.failure(
+                id: id,
+                agentVMError: err,
+                language: params.lang
+            )
+            try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
+        } catch {
+            let rpcErr = DaemonRPCError(
+                code: DaemonRPCError.internalErrorCode,
+                errorCode: "ERR_DAEMON_INTERNAL",
+                message: error.localizedDescription
+            )
+            let resp = DaemonRPCResponse<DaemonRPCForwardStopResult>.failure(id: id, error: rpcErr)
             try? conn.writeLineData(try DaemonRPCCodec.encodeResponseLine(resp))
         }
     }
@@ -1206,6 +1340,79 @@ private actor DaemonAsyncStopGate {
     }
 }
 
+public final class DaemonSocketEOFWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let fd: Int32
+    private var source: DispatchSourceRead?
+    private var finished = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    public init(fd: Int32) {
+        self.fd = fd
+    }
+
+    public func waitUntilEOFOrCancelled() async {
+        guard fd >= 0 else { return }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                let queue = DispatchQueue(label: "io.zxu756.agentvm.daemon.fwd-eof.\(fd)", qos: .userInitiated)
+                let readSource = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+                let descriptor = fd
+
+                readSource.setEventHandler {
+                    var scratch = [UInt8](repeating: 0, count: 64)
+                    let n = Darwin.recv(descriptor, &scratch, scratch.count, MSG_DONTWAIT)
+                    if n == 0 {
+                        readSource.cancel()
+                    } else if n < 0 {
+                        let code = Darwin.errno
+                        if code != EAGAIN && code != EWOULDBLOCK && code != EINTR {
+                            readSource.cancel()
+                        }
+                    }
+                }
+
+                readSource.setCancelHandler { [weak self] in
+                    guard let self else {
+                        cont.resume()
+                        return
+                    }
+                    let toResume = self.lock.withLock { () -> CheckedContinuation<Void, Never>? in
+                        let cur = self.continuation
+                        self.continuation = nil
+                        self.finished = true
+                        return cur
+                    }
+                    toResume?.resume()
+                }
+
+                let cancelImmediately = lock.withLock { () -> Bool in
+                    if finished {
+                        return true
+                    }
+                    continuation = cont
+                    source = readSource
+                    return false
+                }
+                readSource.resume()
+                if cancelImmediately {
+                    readSource.cancel()
+                }
+            }
+        } onCancel: {
+            self.cancel()
+        }
+    }
+
+    public func cancel() {
+        let src = lock.withLock { () -> DispatchSourceRead? in
+            finished = true
+            return source
+        }
+        src?.cancel()
+    }
+}
+
 // MARK: - Daemon Unix Socket RPC Client (Connect-Only & Handshake Verification)
 
 public enum DaemonClientConnectionResult<Payload: Sendable>: Sendable {
@@ -1351,6 +1558,100 @@ public enum DaemonClient {
             }
             throw framingErr
         }
+    }
+
+    public static func performForegroundForwardCall(
+        workspaceURL: URL,
+        params: DaemonRPCForwardAddParams,
+        enforceVersionMatch: Bool = true,
+        clientHelloOverride: DaemonRPCHello? = nil,
+        userTempDirectoryOverride: URL? = nil,
+        onBound: (@Sendable (ManagedPortForwardEntry) -> Void)? = nil,
+        registerSignalHook: ((@escaping @Sendable () -> Void) -> Void)? = nil,
+        clearSignalHook: (() -> Void)? = nil
+    ) async throws -> DaemonClientConnectionResult<ManagedPortForwardEntry> {
+        let conn: DaemonSocketConnection
+        do {
+            conn = try DaemonSocketClient.connectWorkspace(
+                workspaceURL: workspaceURL,
+                userTempDirectoryOverride: userTempDirectoryOverride
+            )
+        } catch let sockErr as DaemonSocketError {
+            if isDaemonAbsentSocketError(sockErr) {
+                return .daemonNotRunning
+            }
+            throw sockErr
+        }
+
+        let clientHello = clientHelloOverride ?? DaemonRPCHello(
+            executablePath: DaemonExecutableLocator.resolveCurrentExecutablePath()
+        )
+        let reader = conn.makeLineReader()
+
+        let forwardEntry: ManagedPortForwardEntry
+        do {
+            try conn.writeLineData(try DaemonRPCCodec.encodeHelloLine(clientHello))
+            guard let daemonHelloLine = try reader.readLineData() else {
+                conn.close()
+                return .daemonNotRunning
+            }
+            let daemonHello = try DaemonRPCCodec.decodeHelloLine(daemonHelloLine)
+            if enforceVersionMatch {
+                try clientHello.verifyCompatibility(withDaemon: daemonHello, language: params.lang)
+            }
+
+            var fgParams = params
+            fgParams.foreground = true
+            let envelope = DaemonRPCRequestEnvelope(id: .int(1), call: .forwardAdd(fgParams))
+            try conn.writeLineData(try DaemonRPCCodec.encodeRequestLine(envelope))
+
+            guard let respLine = try reader.readLineData() else {
+                conn.close()
+                throw DaemonSocketError.syscallFailed(
+                    operation: "read(response)",
+                    path: DaemonWorkspacePaths(workspaceURL: workspaceURL).directSocketPath,
+                    errnoCode: ECONNRESET,
+                    detail: "Daemon closed connection before sending forward response."
+                )
+            }
+            let decoded = try DaemonRPCCodec.decodeResponseLine(DaemonRPCForwardAddResult.self, from: respLine)
+            forwardEntry = try decoded.resultOrThrow().forward
+        } catch let framingErr as DaemonRPCLineFramingError {
+            conn.close()
+            if case let .ioError(code, _) = framingErr, code == ECONNRESET || code == EPIPE {
+                return .daemonNotRunning
+            }
+            throw framingErr
+        } catch {
+            conn.close()
+            throw error
+        }
+
+        onBound?(forwardEntry)
+
+        let eofWaiter = DaemonSocketEOFWaiter(fd: conn.fd)
+        registerSignalHook? {
+            eofWaiter.cancel()
+        }
+        await eofWaiter.waitUntilEOFOrCancelled()
+        clearSignalHook?()
+        conn.close()
+
+        // Explicitly ensure the port is unbound synchronously before returning to the caller.
+        _ = try? performUnaryCall(
+            workspaceURL: workspaceURL,
+            call: .forwardStop(DaemonRPCForwardStopParams(
+                vm: params.vm,
+                hostPort: forwardEntry.hostPort,
+                lang: params.lang
+            )),
+            resultType: DaemonRPCForwardStopResult.self,
+            enforceVersionMatch: enforceVersionMatch,
+            clientHelloOverride: clientHelloOverride,
+            userTempDirectoryOverride: userTempDirectoryOverride
+        )
+
+        return .connected(forwardEntry)
     }
 
     public static func queryStatus(

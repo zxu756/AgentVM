@@ -135,6 +135,7 @@ public final class OneShotRunSignalController: @unchecked Sendable {
     private var activeCoordinator: AgentVMFleetCoordinator?
     private var activeVMID: VMID?
     private var activeDaemonConnection: DaemonSocketConnection?
+    private var activeCancelCallback: (@Sendable () -> Void)?
 
     public init() {}
 
@@ -199,13 +200,30 @@ public final class OneShotRunSignalController: @unchecked Sendable {
         }
     }
 
+    func registerCancelCallback(_ callback: @escaping @Sendable () -> Void) {
+        let shouldFireImmediately = lock.withLock { () -> Bool in
+            activeCancelCallback = callback
+            return recordedSignal != nil
+        }
+        if shouldFireImmediately {
+            callback()
+        }
+    }
+
+    func clearCancelCallback() {
+        lock.withLock {
+            activeCancelCallback = nil
+        }
+    }
+
     public func deliver(signal: Int32) {
-        let snapshot: (Task<GuestExecResult, Error>?, AgentVMFleetCoordinator?, VMID?, DaemonSocketConnection?) = lock.withLock {
+        let snapshot: (Task<GuestExecResult, Error>?, AgentVMFleetCoordinator?, VMID?, DaemonSocketConnection?, (@Sendable () -> Void)?) = lock.withLock {
             if recordedSignal == nil {
                 recordedSignal = signal
             }
-            return (activeTask, activeCoordinator, activeVMID, activeDaemonConnection)
+            return (activeTask, activeCoordinator, activeVMID, activeDaemonConnection, activeCancelCallback)
         }
+        snapshot.4?()
         snapshot.3?.shutdownReadWrite()
         snapshot.0?.cancel()
         if let coordinator = snapshot.1, let vmID = snapshot.2 {
@@ -233,6 +251,24 @@ public final class OneShotRunSignalController: @unchecked Sendable {
         sigtermSource.resume()
 
         return [sigintSource, sigtermSource]
+    }
+}
+
+private final class ForegroundResumeOnceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    func resumeOnce() {
+        let cont = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            let cur = continuation
+            continuation = nil
+            return cur
+        }
+        cont?.resume()
     }
 }
 
@@ -268,7 +304,7 @@ public struct AgentVMCLIRunner: Sendable {
         "daemon", "events",
         "up", "boot", "start", "pause", "resume", "halt", "stop",
         "branch", "fork", "snapshot", "restore",
-        "exec", "pcap", "policy", "plugin",
+        "exec", "forward", "pcap", "policy", "plugin",
         "export-hcl", "export-html",
         "help", "--help", "-h", "version", "--version", "-v"
     ]
@@ -557,6 +593,15 @@ public struct AgentVMCLIRunner: Sendable {
                 )
             }
         }
+        if subcommand == "forward" {
+            if let usageErr = Self.validateForwardSubcommandUsage(parsed: parsed, language: language) {
+                let rawStderr = usageErr + "\n"
+                return CLIExecutionOutcome(
+                    exitCode: Self.usageErrorExitCode,
+                    stderr: isSimulationFlagged ? Self.prefixSimulatedLines(rawStderr) : rawStderr
+                )
+            }
+        }
         var parsedRun: ParsedRunArguments?
         if subcommand == "run" {
             switch Self.parseRunArguments(rest, language: language) {
@@ -812,6 +857,18 @@ public struct AgentVMCLIRunner: Sendable {
                     liveStdoutDataHandler: isSimulationFlagged ? nil : liveStdoutDataHandler,
                     liveStderrDataHandler: isSimulationFlagged ? nil : liveStderrDataHandler
                 )
+            case "forward":
+                if parsed.flags.contains("--json"), parsed.positionals.first == "list" {
+                    stdoutFormat = .json
+                }
+                rawOutcome = try await runForward(
+                    coordinator: coordinator,
+                    parsed: parsed,
+                    language: language,
+                    isSimulation: isSimulationFlagged,
+                    signalController: signalController,
+                    liveStdoutDataHandler: isSimulationFlagged ? nil : liveStdoutDataHandler
+                )
             case "pcap":
                 rawOutcome = try await runPCAP(
                     coordinator: coordinator,
@@ -882,6 +939,14 @@ public struct AgentVMCLIRunner: Sendable {
                     }
                 } else if case let .invalidSharedDirectory(path, _, _) = err {
                     hintLine = "提示：请确认宿主机路径「\(path)」已存在且为目录后再创建或启动虚拟机。"
+                } else if case .portForwardBindFailed = err {
+                    hintLine = "提示：请改用未被占用的非特权空闲 TCP 端口（>= 1024）。"
+                } else if case let .portForwardRequiresRunningVM(vmName, _, currentState) = err {
+                    hintLine = (currentState == .paused)
+                        ? "提示：请先运行 'agentvm resume \(vmName)' 恢复虚拟机运行。"
+                        : "提示：请先运行 'agentvm up \(vmName)' 启动虚拟机。"
+                } else if case .portForwardRuleNotFound = err {
+                    hintLine = "提示：运行 'agentvm forward list' 查看当前活动的端口转发规则。"
                 } else {
                     hintLine = "提示：查看审计日志抽屉或运行 'agentvm doctor' 进行环境自检。"
                 }
@@ -1021,6 +1086,7 @@ public struct AgentVMCLIRunner: Sendable {
         let seedDemo = parsed.flags.contains("--seed-demo")
         if seedDemo {
             try await coordinator.seedIndustrialDemonstrationFleetIfEmpty()
+            await coordinator.portForwardManager.stopAllRules()
         }
         let manifest = try await coordinator.store.loadManifest()
         let pathStr = ByteMetricsFormatter.scrubHomePath(coordinator.store.bundleURL.path)
@@ -1818,6 +1884,208 @@ public struct AgentVMCLIRunner: Sendable {
         )
     }
 
+    private func runForward(
+        coordinator: AgentVMFleetCoordinator,
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage,
+        isSimulation: Bool,
+        signalController: OneShotRunSignalController?,
+        liveStdoutDataHandler: (@Sendable (Data) -> Void)?
+    ) async throws -> CLIExecutionOutcome {
+        let isZh = (language == .zhHans)
+        let first = parsed.positionals[0]
+
+        if first == "list" {
+            let asJSON = parsed.flags.contains("--json")
+            let filterVMID: VMID?
+            if let rawVM = parsed.options["--vm"]?.trimmingCharacters(in: .whitespacesAndNewlines), !rawVM.isEmpty {
+                filterVMID = try await resolveVMID(rawVM, coordinator: coordinator)
+            } else {
+                filterVMID = nil
+            }
+
+            let entries: [ManagedPortForwardEntry]
+            if isSimulation {
+                entries = try await coordinator.listPortForwardsInDaemon(vmID: filterVMID)
+            } else {
+                let rpcOutcome = try DaemonClient.performUnaryCall(
+                    workspaceURL: coordinator.store.bundleURL,
+                    call: .forwardList(DaemonRPCForwardListParams(vm: filterVMID?.rawValue, lang: language)),
+                    resultType: DaemonRPCForwardListResult.self
+                )
+                switch rpcOutcome {
+                case let .connected((_, res)):
+                    entries = res.forwards
+                case .daemonNotRunning:
+                    entries = []
+                }
+            }
+
+            if asJSON {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                let data = try encoder.encode(entries)
+                return CLIExecutionOutcome(exitCode: 0, stdout: String(decoding: data, as: UTF8.self) + "\n")
+            }
+
+            if entries.isEmpty {
+                let emptyMsg = isZh ? "当前没有活动的端口转发。\n" : "No active port forwards.\n"
+                return CLIExecutionOutcome(exitCode: 0, stdout: emptyMsg)
+            }
+
+            var lines: [String] = []
+            if isZh {
+                lines.append("虚拟机\t宿主机监听\t客户机目标\t活动连接\t上行/下行字节")
+            } else {
+                lines.append("VM\tHOST BIND\tGUEST TARGET\tCONNS\tTX/RX BYTES")
+            }
+            for e in entries {
+                lines.append(
+                    "\(e.vmName) (\(e.vmID.rawValue))\t127.0.0.1:\(e.hostPort)\t127.0.0.1:\(e.guestPort)\t\(e.activeConnections)\t\(e.bytesHostToGuest)/\(e.bytesGuestToHost)"
+                )
+            }
+            return CLIExecutionOutcome(exitCode: 0, stdout: lines.joined(separator: "\n") + "\n")
+        }
+
+        if first == "stop" {
+            let vmToken = parsed.positionals[1]
+            let hostPort = try Self.parseSingleNonZeroPort(parsed.positionals[2], language: language).get()
+            let vmID = try await resolveVMID(vmToken, coordinator: coordinator)
+
+            let stoppedVMName: String
+            let stoppedGuestPort: UInt16
+            if isSimulation {
+                let (vmName, removed) = try await coordinator.removePortForwardInDaemon(vmID: vmID, hostPort: hostPort)
+                stoppedVMName = vmName
+                stoppedGuestPort = removed.guestPort
+            } else {
+                let rpcOutcome = try DaemonClient.performUnaryCall(
+                    workspaceURL: coordinator.store.bundleURL,
+                    call: .forwardStop(DaemonRPCForwardStopParams(vm: vmID.rawValue, hostPort: hostPort, lang: language)),
+                    resultType: DaemonRPCForwardStopResult.self
+                )
+                switch rpcOutcome {
+                case let .connected((_, stopRes)):
+                    stoppedVMName = stopRes.vmName
+                    stoppedGuestPort = stopRes.guestPort
+                case .daemonNotRunning:
+                    _ = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: language)
+                    let (vmName, removed) = try await coordinator.removePortForwardInDaemon(vmID: vmID, hostPort: hostPort)
+                    stoppedVMName = vmName
+                    stoppedGuestPort = removed.guestPort
+                }
+            }
+
+            let out = isZh
+                ? "已停止端口转发 127.0.0.1:\(hostPort) -> \(stoppedVMName):\(stoppedGuestPort)（\(vmID.rawValue)）\n"
+                : "Stopped port forward 127.0.0.1:\(hostPort) -> \(stoppedVMName):\(stoppedGuestPort) (\(vmID.rawValue))\n"
+            return CLIExecutionOutcome(exitCode: 0, stdout: out)
+        }
+
+        // Default mode: `forward <vm> <hostPort>:<guestPort> [--foreground]`
+        let vmToken = first
+        let (hostPort, guestPort) = try Self.parseForwardPortSpec(parsed.positionals[1], language: language).get()
+        let foreground = parsed.flags.contains("--foreground")
+        let vmID = try await resolveVMID(vmToken, coordinator: coordinator)
+
+        let formatBoundLine: @Sendable (ManagedPortForwardEntry) -> String = { entry in
+            isZh
+                ? "已绑定端口转发 127.0.0.1:\(entry.hostPort) -> \(entry.vmName):\(entry.guestPort)（\(entry.vmID.rawValue)）\n"
+                : "Forwarding 127.0.0.1:\(entry.hostPort) -> \(entry.vmName):\(entry.guestPort) (\(entry.vmID.rawValue))\n"
+        }
+
+        if isSimulation {
+            let entry = try await coordinator.addPortForwardInDaemon(
+                vmID: vmID,
+                hostPort: hostPort,
+                guestPort: guestPort
+            )
+            let line = formatBoundLine(entry)
+            if foreground, let signalController {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    let once = ForegroundResumeOnceBox(continuation: cont)
+                    signalController.registerCancelCallback {
+                        once.resumeOnce()
+                    }
+                }
+                signalController.clearCancelCallback()
+                _ = try? await coordinator.removePortForwardInDaemon(vmID: vmID, hostPort: entry.hostPort)
+            } else {
+                await coordinator.portForwardManager.stopAllRules()
+            }
+            return CLIExecutionOutcome(exitCode: 0, stdout: line)
+        }
+
+        if !foreground {
+            let rpcOutcome = try DaemonClient.performUnaryCall(
+                workspaceURL: coordinator.store.bundleURL,
+                call: .forwardAdd(DaemonRPCForwardAddParams(
+                    vm: vmID.rawValue,
+                    hostPort: hostPort,
+                    guestPort: guestPort,
+                    foreground: false,
+                    lang: language
+                )),
+                resultType: DaemonRPCForwardAddResult.self
+            )
+            switch rpcOutcome {
+            case let .connected((_, addRes)):
+                return CLIExecutionOutcome(exitCode: 0, stdout: formatBoundLine(addRes.forward))
+            case .daemonNotRunning:
+                let rec = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: language)
+                throw AgentVMError.portForwardRequiresRunningVM(
+                    vmName: rec.spec.name,
+                    vmID: rec.id,
+                    currentState: rec.telemetry.state
+                )
+            }
+        }
+
+        if signalController?.terminationExitCode != nil {
+            return CLIExecutionOutcome(exitCode: 0)
+        }
+
+        let collector = StreamedBinaryOutputCollector()
+        let fgOutcome = try await DaemonClient.performForegroundForwardCall(
+            workspaceURL: coordinator.store.bundleURL,
+            params: DaemonRPCForwardAddParams(
+                vm: vmID.rawValue,
+                hostPort: hostPort,
+                guestPort: guestPort,
+                foreground: true,
+                lang: language
+            ),
+            onBound: { entry in
+                let data = Data(formatBoundLine(entry).utf8)
+                if let liveStdoutDataHandler {
+                    liveStdoutDataHandler(data)
+                } else {
+                    collector.appendStdout(data)
+                }
+            },
+            registerSignalHook: { cancelFn in
+                signalController?.registerCancelCallback(cancelFn)
+            },
+            clearSignalHook: {
+                signalController?.clearCancelCallback()
+            }
+        )
+
+        switch fgOutcome {
+        case .connected:
+            let snap = collector.snapshot()
+            return CLIExecutionOutcome(exitCode: 0, stdoutData: snap.stdout, stderrData: snap.stderr)
+        case .daemonNotRunning:
+            let rec = try await coordinator.prepareDisconnectedVMForClientOperation(vmID, language: language)
+            throw AgentVMError.portForwardRequiresRunningVM(
+                vmName: rec.spec.name,
+                vmID: rec.id,
+                currentState: rec.telemetry.state
+            )
+        }
+    }
+
     private func runEvents(
         coordinator: AgentVMFleetCoordinator,
         parsed: ParsedSubcommandArguments,
@@ -2078,6 +2346,11 @@ public struct AgentVMCLIRunner: Sendable {
         let seededNow = parsed.flags.contains("--seed-demo")
         if seededNow {
             try await coordinator.seedIndustrialDemonstrationFleetIfEmpty()
+        }
+        defer {
+            if seededNow {
+                Task { await coordinator.portForwardManager.stopAllRules() }
+            }
         }
         let manifest = try await coordinator.store.loadManifest()
         let isDemo = seededNow || manifest.isDemonstrationWorkspace
@@ -2945,6 +3218,147 @@ public struct AgentVMCLIRunner: Sendable {
         return nil
     }
 
+    private static func validateForwardSubcommandUsage(
+        parsed: ParsedSubcommandArguments,
+        language: AppLanguage
+    ) -> String? {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+        let usageEn = "Usage: agentvm forward <vm> <host-port>:<guest-port> [--foreground] | agentvm forward list [--vm <vm>] [--json] | agentvm forward stop <vm> <host-port>. \(helpHintEn)"
+        let usageZh = "用法：agentvm forward <虚拟机> <宿主机端口>:<客户机端口> [--foreground] | agentvm forward list [--vm <虚拟机>] [--json] | agentvm forward stop <虚拟机> <宿主机端口>。\(helpHintZh)"
+
+        guard let first = parsed.positionals.first else {
+            return isZh ? usageZh : usageEn
+        }
+
+        if first == "list" {
+            if parsed.positionals.count > 1 {
+                return isZh
+                    ? "子命令「forward list」不接受多余的参数「\(parsed.positionals[1])」。\(helpHintZh)"
+                    : "Unexpected argument '\(parsed.positionals[1])' for 'forward list'. \(helpHintEn)"
+            }
+            if parsed.flags.contains("--foreground") {
+                return isZh
+                    ? "选项「--foreground」仅用于「agentvm forward <vm> <宿主机端口>:<客户机端口>」。\(helpHintZh)"
+                    : "Option '--foreground' is not valid for 'forward list'. \(helpHintEn)"
+            }
+            if let rawVM = parsed.options["--vm"], rawVM.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return isZh
+                    ? "选项「--vm」需要非空的虚拟机名称或 ID。\(helpHintZh)"
+                    : "Option '--vm' requires a non-empty VM name or ID. \(helpHintEn)"
+            }
+            return nil
+        }
+
+        if first == "stop" {
+            if parsed.flags.contains("--json") {
+                return isZh
+                    ? "选项「--json」仅用于「agentvm forward list」。\(helpHintZh)"
+                    : "Option '--json' is only valid for 'forward list'. \(helpHintEn)"
+            }
+            if parsed.flags.contains("--foreground") {
+                return isZh
+                    ? "子命令「forward stop」不接受选项「--foreground」。\(helpHintZh)"
+                    : "Option '--foreground' is not valid for 'forward stop'. \(helpHintEn)"
+            }
+            if parsed.options["--vm"] != nil {
+                return isZh
+                    ? "选项「--vm」仅用于「agentvm forward list」。\(helpHintZh)"
+                    : "Option '--vm' is only valid for 'forward list'. \(helpHintEn)"
+            }
+            guard parsed.positionals.count == 3 else {
+                return isZh
+                    ? "用法：agentvm forward stop <虚拟机> <宿主机端口>。\(helpHintZh)"
+                    : "Usage: agentvm forward stop <vm> <host-port>. \(helpHintEn)"
+            }
+            if parsed.positionals[1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return isZh ? usageZh : usageEn
+            }
+            if case let .failure(err) = parseSingleNonZeroPort(parsed.positionals[2], language: language) {
+                return err.message
+            }
+            return nil
+        }
+
+        // Add mode: `forward <vm> <host-port>:<guest-port> [--foreground]`
+        if parsed.flags.contains("--json") {
+            return isZh
+                ? "选项「--json」仅用于「agentvm forward list」。\(helpHintZh)"
+                : "Option '--json' is only valid for 'forward list'. \(helpHintEn)"
+        }
+        if parsed.options["--vm"] != nil {
+            return isZh
+                ? "选项「--vm」仅用于「agentvm forward list」。\(helpHintZh)"
+                : "Option '--vm' is only valid for 'forward list'. \(helpHintEn)"
+        }
+        if parsed.positionals.count < 2 {
+            return isZh ? usageZh : usageEn
+        }
+        if parsed.positionals.count > 2 {
+            return isZh
+                ? "子命令「forward」不接受多余的参数「\(parsed.positionals[2])」。\(helpHintZh)"
+                : "Unexpected argument '\(parsed.positionals[2])' for 'forward'. \(helpHintEn)"
+        }
+        if first.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return isZh ? usageZh : usageEn
+        }
+        if case let .failure(err) = parseForwardPortSpec(parsed.positionals[1], language: language) {
+            return err.message
+        }
+        return nil
+    }
+
+    static func parseForwardPortSpec(
+        _ raw: String,
+        language: AppLanguage
+    ) -> Result<(hostPort: UInt16, guestPort: UInt16), SubcommandUsageError> {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+        let parts = raw.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        if parts.count != 2 {
+            let msg: String
+            if parts.count > 2 {
+                msg = isZh
+                    ? "无效的端口转发规格「\(raw)」（期望 <宿主机端口>:<客户机端口>，仅绑定 127.0.0.1）。\(helpHintZh)"
+                    : "Invalid port-forward specification '\(raw)' (expected '<host-port>:<guest-port>'; binds 127.0.0.1 only). \(helpHintEn)"
+            } else {
+                msg = isZh
+                    ? "无效的端口转发规格「\(raw)」（缺少冒号，期望 <宿主机端口>:<客户机端口>）。\(helpHintZh)"
+                    : "Invalid port-forward specification '\(raw)' (missing ':', expected '<host-port>:<guest-port>'). \(helpHintEn)"
+            }
+            return .failure(SubcommandUsageError(message: msg))
+        }
+        switch (parseSingleNonZeroPort(parts[0], language: language), parseSingleNonZeroPort(parts[1], language: language)) {
+        case let (.success(hp), .success(gp)):
+            return .success((hp, gp))
+        case let (.failure(e), _):
+            return .failure(e)
+        case let (_, .failure(e)):
+            return .failure(e)
+        }
+    }
+
+    static func parseSingleNonZeroPort(
+        _ raw: String,
+        language: AppLanguage
+    ) -> Result<UInt16, SubcommandUsageError> {
+        let isZh = (language == .zhHans)
+        let helpHintEn = "Run 'agentvm help' for usage."
+        let helpHintZh = "运行 'agentvm help' 查看用法。"
+        guard !raw.isEmpty,
+              raw.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let port = UInt16(raw),
+              port >= 1 else {
+            let msg = isZh
+                ? "无效的 TCP 端口号「\(raw)」（需要 1 到 65535 之间的整数）。\(helpHintZh)"
+                : "Invalid TCP port '\(raw)' (expected integer in 1...65535). \(helpHintEn)"
+            return .failure(SubcommandUsageError(message: msg))
+        }
+        return .success(port)
+    }
+
     // MARK: - Formatting & Resolution Helpers
 
     private func resolveVMID(_ token: String, coordinator: AgentVMFleetCoordinator) async throws -> VMID {
@@ -3028,6 +3442,11 @@ public struct AgentVMCLIRunner: Sendable {
             "restore": SubcommandGrammar(maxPositionals: 1),
             "run": SubcommandGrammar(maxPositionals: nil),
             "exec": SubcommandGrammar(maxPositionals: nil),
+            "forward": SubcommandGrammar(
+                flags: ["--json", "--foreground"],
+                valueOptions: ["--vm"],
+                maxPositionals: 3
+            ),
             "pcap": SubcommandGrammar(valueOptions: ["--filter", "--export"]),
             "policy": SubcommandGrammar(maxPositionals: 1, allowedFirstPositional: ["strict", "airgap"]),
             "plugin": SubcommandGrammar(),
@@ -3272,6 +3691,11 @@ public struct AgentVMCLIRunner: Sendable {
                                               标准输出为空，原因写到标准错误（靠标准错误有无 AgentVM 报错与客户机退出码 125 区分）；
                                               收到 SIGINT / SIGTERM 停机放锁后返回 130 / 143
               exec <vm> -- <命令> [参数...]   在已连接客户机代理的虚拟机中执行命令（或配合 --backend simulation 演练协议栈）
+              forward <vm> <宿主机端口>:<客户机端口> [--foreground]
+                                              由守护进程在 127.0.0.1:<宿主机端口> 绑定并经 vsock 转发至客户机端口（客户机重启自动恢复，halt 释放端口；加 --foreground 留在前台直至 Ctrl-C / SIGTERM 解绑退出）
+              forward list [--vm <vm>] [--json]
+                                              列出当前活动的宿主机本地端口转发规则（可按虚拟机过滤或输出 JSON）
+              forward stop <vm> <宿主机端口>  解绑并移除指定虚拟机的宿主机端口转发规则
               pcap [--filter <表达式>] [--export <文件.pcapng>]
               policy [strict | airgap]        查看或选择工作区的防火墙规则预设（选择会保存到工作区；M5 之前不作用于任何客户机流量）
               plugin                          列出 JavaScriptCore 扩展模块状态
@@ -3323,6 +3747,11 @@ public struct AgentVMCLIRunner: Sendable {
                                           return 125 with empty stdout and an AgentVM error on stderr (distinguishing them from guest exit 125);
                                           SIGINT / SIGTERM shut down the VM, release the lock, and return 130 / 143
           exec <vm> -- <cmd> [args...]    Execute command over AVM1 VirtioSocket (requires live guest agent or --backend simulation)
+          forward <vm> <host-port>:<guest-port> [--foreground]
+                                          Bind 127.0.0.1:<host-port> in the workspace daemon and relay over vsock to <guest-port> (restored across guest reboots, released on halt; pass --foreground to stay in foreground and unbind on Ctrl-C / SIGTERM)
+          forward list [--vm <vm>] [--json]
+                                          List active localhost port-forward bindings (optionally filtered by VM or as JSON)
+          forward stop <vm> <host-port>   Unbind and remove a localhost port-forward rule on <vm>
           pcap [--filter <expr>] [--export <file.pcapng>]
           policy [strict | airgap]        Inspect or select the workspace firewall preset (saved to the workspace; not enforced on guest traffic before M5)
           plugin                          List JavaScriptCore security & automation extensions

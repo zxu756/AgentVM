@@ -59,7 +59,7 @@ enum AgentVMEntryPoint {
             var signalSources: [any DispatchSourceSignal] = []
 
             let subcmd = extractCLISubcommand(rawArgs)
-            if subcmd == "run" || subcmd == "exec" {
+            if subcmd == "run" || subcmd == "exec" || subcmd == "forward" {
                 let controller = OneShotRunSignalController()
                 signalController = controller
                 signalSources = controller.installPOSIXSignalSources()

@@ -24,6 +24,9 @@ public enum DaemonRPCMethod: String, Codable, Hashable, CaseIterable, Sendable {
     case snapshot
     case branch
     case restore
+    case forwardAdd = "forward.add"
+    case forwardList = "forward.list"
+    case forwardStop = "forward.stop"
 }
 
 public enum DaemonRPCID: Codable, Hashable, Sendable, ExpressibleByIntegerLiteral, ExpressibleByStringLiteral {
@@ -614,6 +617,131 @@ public struct DaemonRPCRestoreResult: Codable, Hashable, Sendable {
     }
 }
 
+// MARK: - Port-Forward Management RPC Payloads (`forward.add`, `forward.list`, `forward.stop`)
+
+public struct DaemonRPCForwardAddParams: Codable, Hashable, Sendable {
+    public var vm: String
+    public var hostPort: UInt16
+    public var guestPort: UInt16
+    public var foreground: Bool
+    public var lang: AppLanguage
+
+    public init(
+        vm: String,
+        hostPort: UInt16,
+        guestPort: UInt16,
+        foreground: Bool = false,
+        lang: AppLanguage = .en
+    ) {
+        self.vm = vm
+        self.hostPort = hostPort
+        self.guestPort = guestPort
+        self.foreground = foreground
+        self.lang = lang
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case vm
+        case hostPort
+        case guestPort
+        case foreground
+        case lang
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.vm = try container.decode(String.self, forKey: .vm)
+        self.hostPort = try container.decode(UInt16.self, forKey: .hostPort)
+        self.guestPort = try container.decode(UInt16.self, forKey: .guestPort)
+        self.foreground = try container.decodeIfPresent(Bool.self, forKey: .foreground) ?? false
+        self.lang = try container.decodeIfPresent(AppLanguage.self, forKey: .lang) ?? .en
+    }
+}
+
+public struct DaemonRPCForwardAddResult: Codable, Hashable, Sendable {
+    public var forward: ManagedPortForwardEntry
+
+    public init(forward: ManagedPortForwardEntry) {
+        self.forward = forward
+    }
+}
+
+public struct DaemonRPCForwardListParams: Codable, Hashable, Sendable {
+    public var vm: String?
+    public var lang: AppLanguage
+
+    public init(vm: String? = nil, lang: AppLanguage = .en) {
+        self.vm = vm
+        self.lang = lang
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case vm
+        case lang
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.vm = try container.decodeIfPresent(String.self, forKey: .vm)
+        self.lang = try container.decodeIfPresent(AppLanguage.self, forKey: .lang) ?? .en
+    }
+}
+
+public struct DaemonRPCForwardListResult: Codable, Hashable, Sendable {
+    public var forwards: [ManagedPortForwardEntry]
+
+    public init(forwards: [ManagedPortForwardEntry]) {
+        self.forwards = forwards
+    }
+}
+
+public struct DaemonRPCForwardStopParams: Codable, Hashable, Sendable {
+    public var vm: String
+    public var hostPort: UInt16
+    public var lang: AppLanguage
+
+    public init(vm: String, hostPort: UInt16, lang: AppLanguage = .en) {
+        self.vm = vm
+        self.hostPort = hostPort
+        self.lang = lang
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case vm
+        case hostPort
+        case lang
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.vm = try container.decode(String.self, forKey: .vm)
+        self.hostPort = try container.decode(UInt16.self, forKey: .hostPort)
+        self.lang = try container.decodeIfPresent(AppLanguage.self, forKey: .lang) ?? .en
+    }
+}
+
+public struct DaemonRPCForwardStopResult: Codable, Hashable, Sendable {
+    public var vmID: VMID
+    public var vmName: String
+    public var removedRuleID: PortForwardID
+    public var hostPort: UInt16
+    public var guestPort: UInt16
+
+    public init(
+        vmID: VMID,
+        vmName: String,
+        removedRuleID: PortForwardID,
+        hostPort: UInt16,
+        guestPort: UInt16
+    ) {
+        self.vmID = vmID
+        self.vmName = vmName
+        self.removedRuleID = removedRuleID
+        self.hostPort = hostPort
+        self.guestPort = guestPort
+    }
+}
+
 // MARK: - Strongly-Typed Request Envelopes
 
 public struct DaemonRPCRequest<Params: Codable & Sendable>: Codable, Sendable {
@@ -647,6 +775,9 @@ public enum DaemonRPCCall: Hashable, Sendable {
     case snapshot(DaemonRPCSnapshotParams)
     case branch(DaemonRPCBranchParams)
     case restore(DaemonRPCRestoreParams)
+    case forwardAdd(DaemonRPCForwardAddParams)
+    case forwardList(DaemonRPCForwardListParams)
+    case forwardStop(DaemonRPCForwardStopParams)
 
     public var method: DaemonRPCMethod {
         switch self {
@@ -661,6 +792,9 @@ public enum DaemonRPCCall: Hashable, Sendable {
         case .snapshot: return .snapshot
         case .branch: return .branch
         case .restore: return .restore
+        case .forwardAdd: return .forwardAdd
+        case .forwardList: return .forwardList
+        case .forwardStop: return .forwardStop
         }
     }
 
@@ -677,6 +811,9 @@ public enum DaemonRPCCall: Hashable, Sendable {
         case let .snapshot(p): return p.lang
         case let .branch(p): return p.lang
         case let .restore(p): return p.lang
+        case let .forwardAdd(p): return p.lang
+        case let .forwardList(p): return p.lang
+        case let .forwardStop(p): return p.lang
         }
     }
 }
@@ -741,6 +878,13 @@ public struct DaemonRPCRequestEnvelope: Codable, Hashable, Sendable {
             self.call = .branch(try container.decode(DaemonRPCBranchParams.self, forKey: .params))
         case .restore:
             self.call = .restore(try container.decode(DaemonRPCRestoreParams.self, forKey: .params))
+        case .forwardAdd:
+            self.call = .forwardAdd(try container.decode(DaemonRPCForwardAddParams.self, forKey: .params))
+        case .forwardList:
+            let p = try container.decodeIfPresent(DaemonRPCForwardListParams.self, forKey: .params) ?? DaemonRPCForwardListParams()
+            self.call = .forwardList(p)
+        case .forwardStop:
+            self.call = .forwardStop(try container.decode(DaemonRPCForwardStopParams.self, forKey: .params))
         }
     }
 
@@ -761,6 +905,9 @@ public struct DaemonRPCRequestEnvelope: Codable, Hashable, Sendable {
         case let .snapshot(p): try container.encode(p, forKey: .params)
         case let .branch(p): try container.encode(p, forKey: .params)
         case let .restore(p): try container.encode(p, forKey: .params)
+        case let .forwardAdd(p): try container.encode(p, forKey: .params)
+        case let .forwardList(p): try container.encode(p, forKey: .params)
+        case let .forwardStop(p): try container.encode(p, forKey: .params)
         }
     }
 }

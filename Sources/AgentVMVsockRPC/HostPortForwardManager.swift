@@ -78,8 +78,13 @@ public actor HostPortForwardManager {
     }
 
     private var activeListeners: [PortForwardID: ManagedListenerEntry] = [:]
+    private let teardownRegistry = ListenerTeardownRegistry()
 
     public init() {}
+
+    deinit {
+        teardownRegistry.teardownAll()
+    }
 
     // MARK: Lifecycle API
 
@@ -92,8 +97,14 @@ public actor HostPortForwardManager {
         targetLoopbackPortOverride: UInt16? = nil,
         vsockSession: VsockMultiplexSession? = nil
     ) async throws -> ActivePortForwardBinding {
+        if rule.hostPort > 0,
+           activeListeners.values.contains(where: { $0.id != rule.id && $0.actualBoundPort == rule.hostPort }) {
+            throw AgentVMError.portForwardBindFailed(port: rule.hostPort, errnoCode: EADDRINUSE)
+        }
+
         // Tear down any existing binding sharing the same PortForwardID before re-binding.
         if let existing = activeListeners.removeValue(forKey: rule.id) {
+            teardownRegistry.unregister(id: rule.id)
             existing.teardown()
         }
 
@@ -127,6 +138,13 @@ public actor HostPortForwardManager {
         guard ptonRC == 1 else {
             listenSocket.requestClose()
             throw AgentVMError.portForwardBindFailed(port: rule.hostPort, errnoCode: EINVAL)
+        }
+
+        if effectiveHost == "127.0.0.1" && rule.hostPort > 0 {
+            if let wildcardConflictErrno = Self.probeWildcardListenerConflict(port: rule.hostPort) {
+                listenSocket.requestClose()
+                throw AgentVMError.portForwardBindFailed(port: rule.hostPort, errnoCode: wildcardConflictErrno)
+            }
         }
 
         let bindRC: Int32 = withUnsafePointer(to: &bindAddr) { addrPtr in
@@ -218,12 +236,16 @@ public actor HostPortForwardManager {
             relayCoordinator: coordinator
         )
         activeListeners[rule.id] = entry
+        teardownRegistry.register(id: rule.id) {
+            entry.teardown()
+        }
         return entry.snapshot()
     }
 
     /// Stops and unbinds a single port-forward rule, closing its listener and any in-flight TCP relays.
     public func stopForwardRule(_ id: PortForwardID) {
         guard let removed = activeListeners.removeValue(forKey: id) else { return }
+        teardownRegistry.unregister(id: id)
         removed.teardown()
     }
 
@@ -234,6 +256,7 @@ public actor HostPortForwardManager {
             .map(\.id)
         for id in matchingIDs {
             if let removed = activeListeners.removeValue(forKey: id) {
+                teardownRegistry.unregister(id: id)
                 removed.teardown()
             }
         }
@@ -243,6 +266,7 @@ public actor HostPortForwardManager {
     public func stopAllRules() {
         let allEntries = Array(activeListeners.values)
         activeListeners.removeAll()
+        teardownRegistry.clearAll()
         for entry in allEntries {
             entry.teardown()
         }
@@ -270,6 +294,27 @@ public actor HostPortForwardManager {
     }
 
     // MARK: Static Socket Configuration Helpers
+
+    fileprivate static func probeWildcardListenerConflict(port: UInt16) -> Int32? {
+        let probeFD = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard probeFD >= 0 else { return nil }
+        defer { _ = Darwin.close(probeFD) }
+        configureStandardStreamSocketOptions(fd: probeFD)
+        var anyAddr = sockaddr_in()
+        anyAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        anyAddr.sin_family = sa_family_t(AF_INET)
+        anyAddr.sin_port = port.bigEndian
+        anyAddr.sin_addr.s_addr = INADDR_ANY.bigEndian
+        let rc = withUnsafePointer(to: &anyAddr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                Darwin.bind(probeFD, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if rc != 0 && Darwin.errno == EADDRINUSE {
+            return EADDRINUSE
+        }
+        return nil
+    }
 
     fileprivate static func configureStandardStreamSocketOptions(fd: Int32) {
         var yes: Int32 = 1
@@ -678,41 +723,68 @@ private final class BindingRelayCoordinator: @unchecked Sendable {
         await withTaskGroup(of: Void.self) { group in
             // Host TCP Client -> Vsock Stream
             group.addTask {
-                let hostReads = Self.makeAsyncReadStream(socket: clientSocket, queue: self.ioQueue)
+                let outcomeBox = SocketReadOutcomeBox()
+                let hostReads = Self.makeAsyncReadStream(
+                    socket: clientSocket,
+                    queue: self.ioQueue,
+                    outcomeBox: outcomeBox
+                )
+                var sendFailed = false
                 for await chunk in hostReads {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled {
+                        sendFailed = true
+                        break
+                    }
                     do {
                         try await vsockSession.sendPortForwardData(streamID: streamID, payload: chunk)
                         self.recordHostToGuest(chunk.count)
                     } catch {
+                        sendFailed = true
                         break
                     }
+                }
+                if sendFailed || Task.isCancelled || outcomeBox.readErrorOccurred {
+                    clientSocket.requestClose()
+                    try? await vsockSession.closePortForwardStream(streamID: streamID)
+                } else if outcomeBox.didSeeCleanEOF {
+                    try? await vsockSession.halfClosePortForwardWrite(streamID: streamID)
                 }
             }
 
             // Vsock Stream -> Host TCP Client
             group.addTask {
+                var writeFailed = false
                 for await chunk in inboundFromGuest {
-                    if Task.isCancelled { break }
-                    guard Self.writeAll(socket: clientSocket, data: chunk) else { break }
+                    if Task.isCancelled {
+                        writeFailed = true
+                        break
+                    }
+                    guard Self.writeAll(socket: clientSocket, data: chunk) else {
+                        writeFailed = true
+                        break
+                    }
                     self.recordGuestToHost(chunk.count)
                 }
-                clientSocket.shutdownWrite()
+                if writeFailed || Task.isCancelled {
+                    clientSocket.requestClose()
+                    try? await vsockSession.closePortForwardStream(streamID: streamID)
+                } else {
+                    clientSocket.shutdownWrite()
+                }
             }
 
-            // Wait for host->guest upload to finish; give brief window for guest reply before closing Vsock stream.
-            await group.next()
-            try? await Task.sleep(nanoseconds: 25_000_000)
-            try? await vsockSession.closePortForwardStream(streamID: streamID)
             await group.waitForAll()
         }
+
+        try? await vsockSession.closePortForwardStream(streamID: streamID)
     }
 
     // MARK: Non-Blocking GCD Socket Read / Write Primitives
 
     private static func makeAsyncReadStream(
         socket: SafePOSIXSocket,
-        queue: DispatchQueue
+        queue: DispatchQueue,
+        outcomeBox: SocketReadOutcomeBox? = nil
     ) -> AsyncStream<Data> {
         AsyncStream { continuation in
             guard socket.isUsable else {
@@ -730,12 +802,14 @@ private final class BindingRelayCoordinator: @unchecked Sendable {
                     if n > 0 {
                         continuation.yield(Data(buffer.prefix(n)))
                     } else if n == 0 {
+                        outcomeBox?.recordCleanEOF()
                         continuation.finish()
                         readSource.cancel()
                         break
                     } else {
                         if errno == EINTR { continue }
                         if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                        outcomeBox?.recordReadError(errno)
                         continuation.finish()
                         readSource.cancel()
                         break
@@ -780,6 +854,69 @@ private final class BindingRelayCoordinator: @unchecked Sendable {
             }
             return offset == total
         }
+    }
+}
+
+private final class ListenerTeardownRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handlers: [PortForwardID: () -> Void] = [:]
+
+    func register(id: PortForwardID, handler: @escaping () -> Void) {
+        lock.lock()
+        handlers[id] = handler
+        lock.unlock()
+    }
+
+    func unregister(id: PortForwardID) {
+        lock.lock()
+        handlers.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    func clearAll() {
+        lock.lock()
+        handlers.removeAll()
+        lock.unlock()
+    }
+
+    func teardownAll() {
+        lock.lock()
+        let copy = Array(handlers.values)
+        handlers.removeAll()
+        lock.unlock()
+        for fn in copy {
+            fn()
+        }
+    }
+}
+
+private final class SocketReadOutcomeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sawEOF = false
+    private var recordedErrno: Int32?
+
+    var didSeeCleanEOF: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return sawEOF
+    }
+
+    var readErrorOccurred: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedErrno != nil
+    }
+
+    func recordCleanEOF() {
+        lock.lock()
+        sawEOF = true
+        lock.unlock()
+    }
+
+    func recordReadError(_ code: Int32) {
+        lock.lock()
+        recordedErrno = code
+        lock.unlock()
     }
 }
 

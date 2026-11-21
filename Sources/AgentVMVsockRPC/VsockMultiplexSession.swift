@@ -1057,7 +1057,20 @@ public actor VsockMultiplexSession {
         )
     }
 
-    /// Half-closes / terminates a `.tcpPortForward` stream and notifies the guest bridge.
+    /// Signals TCP write half-close (`SHUT_WR`) to the guest bridge without closing the inbound guest->host stream.
+    public func halfClosePortForwardWrite(streamID: UInt32) async throws {
+        guard portForwardStreams[streamID] != nil, openStreams[streamID] != nil else { return }
+        try await sendSingleStreamFrame(
+            streamID: streamID,
+            channel: .tcpPortForward,
+            flags: [.ack, .fin],
+            payload: Data(),
+            compressIfBeneficial: false,
+            consumesWindow: false
+        )
+    }
+
+    /// Aborts / terminates a `.tcpPortForward` stream and notifies the guest bridge to close immediately.
     public func closePortForwardStream(streamID: UInt32) async throws {
         if let pf = portForwardStreams.removeValue(forKey: streamID) {
             pf.inboundContinuation.finish()
@@ -1066,7 +1079,7 @@ public actor VsockMultiplexSession {
         try? await sendSingleStreamFrame(
             streamID: streamID,
             channel: .tcpPortForward,
-            flags: [.fin, .endOfMessage],
+            flags: [.rst, .endOfMessage],
             payload: Data(),
             compressIfBeneficial: false,
             consumesWindow: false
@@ -2090,15 +2103,7 @@ public actor VsockMultiplexSession {
             )
             return
         }
-        if header.flags.contains(.fin) || header.flags.contains(.rst) {
-            try await sendSingleStreamFrame(
-                streamID: streamID,
-                channel: .tcpPortForward,
-                flags: [.fin, .endOfMessage],
-                payload: Data(),
-                compressIfBeneficial: false,
-                consumesWindow: false
-            )
+        if header.flags.contains(.rst) {
             closeStreamState(streamID: streamID)
             return
         }
@@ -2112,6 +2117,17 @@ public actor VsockMultiplexSession {
                 payload: reply,
                 compressIfBeneficial: false
             )
+        }
+        if header.flags.contains(.fin) {
+            try await sendSingleStreamFrame(
+                streamID: streamID,
+                channel: .tcpPortForward,
+                flags: [.fin, .endOfMessage],
+                payload: Data(),
+                compressIfBeneficial: false,
+                consumesWindow: false
+            )
+            closeStreamState(streamID: streamID)
         }
     }
 
@@ -2643,16 +2659,7 @@ private actor SimulatedGuestWirePeer {
             )
             return
         }
-        if header.flags.contains(.fin) || header.flags.contains(.rst) {
-            emitToHost(
-                try nextFrame(
-                    channel: .tcpPortForward,
-                    flags: [.fin, .endOfMessage],
-                    streamID: streamID,
-                    payload: Data(),
-                    compress: false
-                )
-            )
+        if header.flags.contains(.rst) {
             return
         }
         if !payload.isEmpty {
@@ -2663,6 +2670,17 @@ private actor SimulatedGuestWirePeer {
                     flags: [.ack],
                     streamID: streamID,
                     payload: reply,
+                    compress: false
+                )
+            )
+        }
+        if header.flags.contains(.fin) {
+            emitToHost(
+                try nextFrame(
+                    channel: .tcpPortForward,
+                    flags: [.fin, .endOfMessage],
+                    streamID: streamID,
+                    payload: Data(),
                     compress: false
                 )
             )

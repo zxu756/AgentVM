@@ -1473,12 +1473,16 @@ public struct GuestAgentBootstrapGenerator: Sendable, Hashable {
                     except OSError:
                         pass
 
-                if flags & (FLAG_FIN | FLAG_RST):
+                if flags & FLAG_RST:
                     with self.state_lock:
                         self.tcp_bridges.pop(stream_id, None)
                     try:
-                        tcp_sock.shutdown(socket.SHUT_WR)
                         tcp_sock.close()
+                    except OSError:
+                        pass
+                elif flags & FLAG_FIN:
+                    try:
+                        tcp_sock.shutdown(socket.SHUT_WR)
                     except OSError:
                         pass
 

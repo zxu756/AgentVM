@@ -1,22 +1,22 @@
 ==================================================================
  AgentVM Milestone M4 Acceptance Suite (AGENTVM_REAL_VM=1)
- Host: Mac16,10 (Apple M4, 10 cores, 16.0 GiB), macOS 27.0.1 (26A434), commit f6b264a
+ Host: Mac16,10 (Apple M4, 10 cores, 16.0 GiB), macOS 27.0.1 (26A434), commit 209f2f6
 ==================================================================
 PASS [Row 1]: 6 invalid --mount cases exited [1, 1, 2, 2, 2, 2] with diagnostic stderr; 0 orphan VM records or disk/ISO files
 PASS [Row 2]: m1 & branched m2 cidata user-data have /workspace + /mnt/ro bootcmd & rw/ro virtiofs mounts (x-systemd.before=local-fs.target); m3 (--no-mounts) stripped virtioFSMounts & mounts:
 PASS [Row 3]: agentvm_query_wiretap & agentvm_set_firewall_preset returned isError=true (ERR_UNIMPLEMENTED_BEFORE_M5); stopped-VM agentvm_exec_command returned isError=true (ERR_LIFECYCLE_STATE), 0 simulated lines, 0 VMs
-PASS [Row 4]: up t1=5479ms; findmnt /workspace='/workspace workspace virtiofs rw,relatime', /mnt/ro='/mnt/ro mnt-ro virtiofs ro,relatime'
+PASS [Row 4]: up t1=5506ms; findmnt /workspace='/workspace workspace virtiofs rw,relatime', /mnt/ro='/mnt/ro mnt-ro virtiofs ro,relatime'
 PASS [Row 5]: tools/list=9 tools, list_fleet t1=running (simulated=false), MCP exec uname -r='6.1.0-54-cloud-arm64' == CLI exec
-PASS [Row 6]: MCP capture_snapshot (snap-d0120bc3b65d) -> fork_cow_branch(bootImmediately=true, 4.30s, 2 VMs) -> child exec (v2 + virtiofs) -> restore_snapshot (6.18s, reverted to v1) all isError=false
-PASS [Row 7]: x_root & x_agent host uid=501 (== id -u), x_root mode=0751; 64 MiB SHA-256 exact (write 15.4 MiB/s, read 1659.2 MiB/s)
+PASS [Row 6]: MCP capture_snapshot (snap-c628f6541250) -> fork_cow_branch(bootImmediately=true, 5.45s, 2 VMs) -> child exec (v2 + virtiofs) -> restore_snapshot (7.52s, reverted to v1) all isError=false
+PASS [Row 7]: x_root & x_agent host uid=501 (== id -u), x_root mode=0751; 64 MiB SHA-256 exact (write 898.1 MiB/s, read 1731.5 MiB/s)
 PASS [Row 8]: touch/append/rm/remount-rw/explicit-rw all failed (exit codes [1, 2, 1, 1, 1]); ro_dir unchanged
 PASS [Row 9]: up t9 after deleting shared dir exited 1 (ERR_SHARED_DIR_INVALID naming missing path); t9 remained stopped
-PASS [Row 10]: curl listing ok; 64 MiB SHA-256 exact (70.41 MiB/s) with 5/5 concurrent exec ok; 50x GET median=0.777 ms (p95=0.948 ms); SHUT_WR + 100ms delayed reply received intact ('DELAYED_REPLY_OK:PING_M4'); duplicate port exited 1 (ERR_PORT_FORWARD_BIND)
+PASS [Row 10]: curl listing ok; 64 MiB SHA-256 exact (79.53 MiB/s) with 5/5 concurrent exec ok; 50x GET median=0.683 ms (p95=0.864 ms); SHUT_WR + 100ms delayed reply received intact ('DELAYED_REPLY_OK:PING_M4'); duplicate port exited 1 (ERR_PORT_FORWARD_BIND)
 PASS [Row 11]: copied code-review/evals to fresh mktemp -d; host & guest both exited 0 with 60/60 passed tests identical
 PASS [Row 12]: relay.sh verify positive exited 0 & negative propagated exit 7; .relay/LOG.md recorded 01-verify (passed) and 02-verify (failed exit 7); relay.sh untouched
-PASS [Row 13]: guest rebooted (8.25s, boot_id changed); /workspace & /mnt/ro remained virtiofs and original forward port 60904 served directory listing without re-forwarding; halt released port
+PASS [Row 13]: guest rebooted (4.12s, boot_id changed); /workspace & /mnt/ro remained virtiofs and original forward port 50068 served directory listing without re-forwarding; halt released port
 PASS [Row 14]: 0 extra com.apple.Virtualization.VirtualMachine processes; 0 leaked daemons/MCP processes; temp dirs & avm-* symlinks removed; 0 new ~/Library items or launchctl entries; image cache SHA-256 unchanged
 INFO [Rows 15-17]: source-mutation checks skipped by default (pass --mutation 1|2|3 with AGENTVM_REAL_VM=1 to run)
 ==================================================================
- Summary: 14 passed, 0 failed, 0 unrun (total 83.24s)
+ Summary: 14 passed, 0 failed, 0 unrun (total 72.53s)
 ==================================================================

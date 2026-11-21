@@ -19,11 +19,11 @@ Usage:
 
   milestone <N> writes the acceptance logs to a temporary directory and leaves the working tree untouched.
   Pass --record to copy them into reports/ (the committed evidence the README refers to).
-  milestone 1, milestone 2, and milestone 3 require AGENTVM_REAL_VM=1 for real-VM rows; without it, real-VM rows are reported unrun and exit 2.
+  milestone 1, milestone 2, milestone 3, and milestone 4 require AGENTVM_REAL_VM=1 for real-VM rows; without it, real-VM rows are reported unrun and exit 2.
   No mode of this script launches the desktop UI.
 
 Environment:
-  AGENTVM_REAL_VM=1      enable real Virtualization.framework guest VM acceptance (m1-real-boot.sh, m2-daemon.sh, m3-fork.sh, m3-branch-bench.sh)
+  AGENTVM_REAL_VM=1      enable real Virtualization.framework guest VM acceptance (m1-real-boot.sh, m2-daemon.sh, m3-fork.sh, m3-branch-bench.sh, m4-agent.sh)
   AGENTVM_BUILD_JOBS=N   pass `-j N` to swift build / swift test
 
 Modules:
@@ -468,8 +468,75 @@ run_milestone() {
                 echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
             fi
             ;;
-        4|5|6)
-            echo "SKIPPED: Milestone M${m} acceptance script is scheduled for M${m} (current branch is M3)."
+        4)
+            if [[ $record -eq 1 ]]; then
+                local pre_status
+                pre_status="$(git -C "$ROOT_DIR" --no-optional-locks status --porcelain)"
+                if [[ -n "$pre_status" ]]; then
+                    echo "ERROR: --record requires a clean git working tree before writing reports/:" >&2
+                    echo "$pre_status" >&2
+                    exit 1
+                fi
+            fi
+
+            echo "==> [AgentVM] Milestone M4: touched module unit scopes"
+            run_scope \
+                AgentVMModels \
+                AgentVMStorageCoW \
+                AgentVMVsockRPC \
+                AgentVMHypervisor \
+                AgentVMCLIAndMCP \
+                AgentVM
+
+            echo "==> [AgentVM] Milestone M4: swift build --product AgentVM"
+            swift build "${SWIFT_JOBS_ARGS[@]+"${SWIFT_JOBS_ARGS[@]}"}" --product AgentVM
+
+            local log_dir
+            log_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentvm-m4-logs.XXXXXX")"
+            echo "==> [AgentVM] Milestone M4: readme-commands.sh"
+            run_logged "$ROOT_DIR/Scripts/acceptance/readme-commands.sh" "$log_dir/readme-commands.txt"
+
+            echo "==> [AgentVM] Milestone M4: m4-agent.sh"
+            if [[ ! -x "$ROOT_DIR/Scripts/acceptance/m4-agent.sh" ]]; then
+                echo "ERROR: $ROOT_DIR/Scripts/acceptance/m4-agent.sh not found or not executable" >&2
+                exit 1
+            fi
+            set +e
+            "$ROOT_DIR/Scripts/acceptance/m4-agent.sh" --out-dir "$log_dir" 2>&1 | tee "$log_dir/m4-agent-console.txt"
+            local m4_rc=${PIPESTATUS[0]}
+            set -e
+
+            if [[ "${AGENTVM_REAL_VM:-}" != "1" ]]; then
+                if [[ $m4_rc -ne 0 && $m4_rc -ne 2 ]]; then
+                    echo "ERROR: m4-agent.sh failed (exit $m4_rc); log kept at $log_dir/m4-agent.txt" >&2
+                    exit "$m4_rc"
+                fi
+                echo "UNRUN: Milestone M4 real-VM rows in m4-agent.sh did not run because AGENTVM_REAL_VM=1 is not set; milestone 4 exits 2 (logs at $log_dir)." >&2
+                exit 2
+            fi
+
+            if [[ $m4_rc -ne 0 ]]; then
+                echo "ERROR: m4-agent.sh failed or left mandatory rows unrun (exit $m4_rc); log kept at $log_dir/m4-agent.txt" >&2
+                exit "$m4_rc"
+            fi
+            if grep -qE '没跑 \[Row ([1-9]|1[0-4])\]' "$log_dir/m4-agent.txt"; then
+                echo "ERROR: m4-agent.sh left mandatory rows (1-14) unrun despite AGENTVM_REAL_VM=1; log kept at $log_dir/m4-agent.txt" >&2
+                exit 2
+            fi
+
+            if [[ $record -eq 1 ]]; then
+                mkdir -p "$ROOT_DIR/reports"
+                cp "$log_dir/m4-agent.txt" "$ROOT_DIR/reports/m4-agent.txt"
+                cp "$log_dir/m4-agent.json" "$ROOT_DIR/reports/m4-agent.json"
+                cp "$log_dir/readme-commands.txt" "$ROOT_DIR/reports/readme-commands.txt"
+                rm -rf "$log_dir"
+                echo "==> [AgentVM] Recorded reports/m4-agent.txt, reports/m4-agent.json, and reports/readme-commands.txt"
+            else
+                echo "==> [AgentVM] Acceptance logs: $log_dir (reports/ left untouched; pass --record to update it)"
+            fi
+            ;;
+        5|6)
+            echo "SKIPPED: Milestone M${m} acceptance script is scheduled for M${m} (current branch is M4)."
             exit 1
             ;;
         *)

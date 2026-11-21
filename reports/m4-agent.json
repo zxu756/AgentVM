@@ -1,0 +1,114 @@
+{
+  "milestone": "M4",
+  "script": "Scripts/acceptance/m4-agent.sh",
+  "realVMEnabled": true,
+  "hostStart": {
+    "date": "2026-11-21",
+    "commit": "f6b264a",
+    "hwModel": "Mac16,10",
+    "cpuBrand": "Apple M4",
+    "logicalCores": 10,
+    "memoryGiB": 16.0,
+    "macOSVersion": "27.0.1",
+    "macOSBuild": "26A434",
+    "arch": "arm64",
+    "uptime": "21:41  up 11 days, 12:11, 2 users, load averages: 2.64 4.27 4.44"
+  },
+  "hostEndUptime": "21:42  up 11 days, 12:13, 2 users, load averages: 4.24 4.46 4.49",
+  "elapsedSeconds": 83.24,
+  "summary": {
+    "passed": 14,
+    "failed": 0,
+    "unrun": 0
+  },
+  "metrics": {
+    "guestKernel": "6.1.0-54-cloud-arm64",
+    "row6": {
+      "mcpForkBootSec": 4.3,
+      "mcpRestoreSec": 6.18
+    },
+    "row7VirtioFS": {
+      "write64MiBSec": 4.1461,
+      "write64MiBPerSec": 15.4,
+      "read64MiBSec": 0.0386,
+      "read64MiBPerSec": 1659.2
+    },
+    "row10PortForward": {
+      "latency50Count": 50,
+      "latencyMinMs": 0.669,
+      "latencyMedianMs": 0.777,
+      "latencyP95Ms": 0.948,
+      "latencyMaxMs": 29.164,
+      "download64MiBSec": 0.909,
+      "download64MiBPerSec": 70.41,
+      "concurrentExecPassed": 5
+    },
+    "row11RealProject": {
+      "project": "code-review/evals (tests/test_cases.py + tests/test_score.py)",
+      "hostExitCode": 0,
+      "guestExitCode": 0,
+      "passedTests": 60
+    },
+    "row13Reboot": {
+      "reconnectSec": 8.25
+    }
+  },
+  "rows": {
+    "1": {
+      "status": "PASS",
+      "detail": "6 invalid --mount cases exited [1, 1, 2, 2, 2, 2] with diagnostic stderr; 0 orphan VM records or disk/ISO files"
+    },
+    "2": {
+      "status": "PASS",
+      "detail": "m1 & branched m2 cidata user-data have /workspace + /mnt/ro bootcmd & rw/ro virtiofs mounts (x-systemd.before=local-fs.target); m3 (--no-mounts) stripped virtioFSMounts & mounts:"
+    },
+    "3": {
+      "status": "PASS",
+      "detail": "agentvm_query_wiretap & agentvm_set_firewall_preset returned isError=true (ERR_UNIMPLEMENTED_BEFORE_M5); stopped-VM agentvm_exec_command returned isError=true (ERR_LIFECYCLE_STATE), 0 simulated lines, 0 VMs"
+    },
+    "4": {
+      "status": "PASS",
+      "detail": "up t1=5479ms; findmnt /workspace='/workspace workspace virtiofs rw,relatime', /mnt/ro='/mnt/ro mnt-ro virtiofs ro,relatime'"
+    },
+    "5": {
+      "status": "PASS",
+      "detail": "tools/list=9 tools, list_fleet t1=running (simulated=false), MCP exec uname -r='6.1.0-54-cloud-arm64' == CLI exec"
+    },
+    "6": {
+      "status": "PASS",
+      "detail": "MCP capture_snapshot (snap-d0120bc3b65d) -> fork_cow_branch(bootImmediately=true, 4.30s, 2 VMs) -> child exec (v2 + virtiofs) -> restore_snapshot (6.18s, reverted to v1) all isError=false"
+    },
+    "7": {
+      "status": "PASS",
+      "detail": "x_root & x_agent host uid=501 (== id -u), x_root mode=0751; 64 MiB SHA-256 exact (write 15.4 MiB/s, read 1659.2 MiB/s)"
+    },
+    "8": {
+      "status": "PASS",
+      "detail": "touch/append/rm/remount-rw/explicit-rw all failed (exit codes [1, 2, 1, 1, 1]); ro_dir unchanged"
+    },
+    "9": {
+      "status": "PASS",
+      "detail": "up t9 after deleting shared dir exited 1 (ERR_SHARED_DIR_INVALID naming missing path); t9 remained stopped"
+    },
+    "10": {
+      "status": "PASS",
+      "detail": "curl listing ok; 64 MiB SHA-256 exact (70.41 MiB/s) with 5/5 concurrent exec ok; 50x GET median=0.777 ms (p95=0.948 ms); SHUT_WR + 100ms delayed reply received intact ('DELAYED_REPLY_OK:PING_M4'); duplicate port exited 1 (ERR_PORT_FORWARD_BIND)"
+    },
+    "11": {
+      "status": "PASS",
+      "detail": "copied code-review/evals to fresh mktemp -d; host & guest both exited 0 with 60/60 passed tests identical"
+    },
+    "12": {
+      "status": "PASS",
+      "detail": "relay.sh verify positive exited 0 & negative propagated exit 7; .relay/LOG.md recorded 01-verify (passed) and 02-verify (failed exit 7); relay.sh untouched"
+    },
+    "13": {
+      "status": "PASS",
+      "detail": "guest rebooted (8.25s, boot_id changed); /workspace & /mnt/ro remained virtiofs and original forward port 60904 served directory listing without re-forwarding; halt released port"
+    },
+    "14": {
+      "status": "PASS",
+      "detail": "0 extra com.apple.Virtualization.VirtualMachine processes; 0 leaked daemons/MCP processes; temp dirs & avm-* symlinks removed; 0 new ~/Library items or launchctl entries; image cache SHA-256 unchanged"
+    }
+  }
+}
